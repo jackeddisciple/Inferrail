@@ -7,7 +7,7 @@ license = "MIT"
 dependencies = []
 
 [dependency-groups]
-dev = ["pytest>=8.3"]
+dev = ["openai>=3.30", "pytest>=8.3"]
 
 [build-system]
 requires = ["uv_build>=0.11,<0.12"]
@@ -15,4 +15,8 @@ build-backend = "uv_build"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-ra"
+addopts = "-ra -m 'not e2e and not stress'"
+markers = [
+    "e2e: drives a real inferrail-sim binary through the official OpenAI SDK",
+    "stress: heavy concurrent load through the OpenAI SDK",
+]

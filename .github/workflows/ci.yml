@@ -44,3 +44,20 @@ jobs:
           working-directory: bench
       - name: Tests
         run: uv run --frozen pytest -q
+
+  e2e:
+    name: OpenAI SDK against the simulator
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+      - name: Build simulator
+        run: cargo build -p inferrail-sim
+      - uses: astral-sh/setup-uv@v10.3.0
+        with:
+          working-directory: bench
+      - name: SDK suite
+        working-directory: bench
+        env:
+          INFERRAIL_SIM_BIN: ${{ github.workspace }}/target/debug/inferrail-sim
+        run: uv run --frozen pytest -q -m e2e
