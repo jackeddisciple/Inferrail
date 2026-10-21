@@ -16,16 +16,31 @@ name = "inferrail-gateway"
 path = "src/main.rs"
 
 [dependencies]
+anyhow.workspace = true
+clap.workspace = true
+http-body-util.workspace = true
 hyper.workspace = true
+hyper-util.workspace = true
+inferrail-control.workspace = true
 inferrail-core.workspace = true
+inferrail-policy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
 xxhash-rust.workspace = true
 
 [dev-dependencies]
+axum.workspace = true
 criterion.workspace = true
+futures.workspace = true
+inferrail-sim.workspace = true
 proptest.workspace = true
+reqwest.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+tower.workspace = true
 
 [[bench]]
 name = "inspect"

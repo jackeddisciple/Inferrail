@@ -11,7 +11,10 @@ repository = "https://github.com/jackeddisciple/Inferrail"
 publish = false
 
 [workspace.dependencies]
+inferrail-control = { path = "crates/inferrail-control" }
 inferrail-core = { path = "crates/inferrail-core" }
+inferrail-policy = { path = "crates/inferrail-policy" }
+inferrail-sim = { path = "crates/inferrail-sim" }
 anyhow = "1.0.104"
 arc-swap = "1.9.3"
 async-stream = "0.3.6"
