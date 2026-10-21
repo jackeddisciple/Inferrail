@@ -8,4 +8,4 @@ pub mod replica;
 pub use checker::{CheckerConfig, Probe, run_checker};
 pub use fleet::{Fleet, MembershipChange, Registry};
 pub use health::{Clock, Ejection, Health, HealthPolicy, Nanos};
-pub use replica::{Endpoint, Lease, Limits, Origin, Replica, ReplicaSpec};
+pub use replica::{Cards, Endpoint, Lease, Limits, Origin, Replica, ReplicaSpec};

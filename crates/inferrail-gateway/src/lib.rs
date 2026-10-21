@@ -144,6 +144,7 @@ impl Gateway {
             Arc::clone(&shared.registry),
             upstream::HttpProbe {
                 client: shared.client.clone(),
+                cards_every: health.interval.saturating_mul(10),
             },
             CheckerConfig {
                 interval: health.interval,

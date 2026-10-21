@@ -237,6 +237,7 @@ impl Default for Script {
 /// exactly the chunks it is given.
 pub struct RawUpstream {
     pub addr: SocketAddr,
+    model_fetches: Arc<AtomicU64>,
     recorded: Arc<Mutex<Vec<Recorded>>>,
     script: Arc<Mutex<Script>>,
     task: AbortHandle,
@@ -248,18 +249,32 @@ impl RawUpstream {
         let addr = listener.local_addr().expect("addr");
         let recorded: Arc<Mutex<Vec<Recorded>>> = Arc::default();
         let script: Arc<Mutex<Script>> = Arc::default();
-        let (rec, scr) = (Arc::clone(&recorded), Arc::clone(&script));
+        let model_fetches: Arc<AtomicU64> = Arc::default();
+        let (rec, scr, fetches) = (
+            Arc::clone(&recorded),
+            Arc::clone(&script),
+            Arc::clone(&model_fetches),
+        );
         let task = tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
                     continue;
                 };
-                let (rec, scr) = (Arc::clone(&rec), Arc::clone(&scr));
+                let (rec, scr, fetches) =
+                    (Arc::clone(&rec), Arc::clone(&scr), Arc::clone(&fetches));
                 let service = service_fn(move |request: Request<Incoming>| {
-                    let (rec, scr) = (Arc::clone(&rec), Arc::clone(&scr));
+                    let (rec, scr, fetches) =
+                        (Arc::clone(&rec), Arc::clone(&scr), Arc::clone(&fetches));
                     async move {
-                        if request.uri().path() == "/health" {
-                            return Ok::<_, Infallible>(Response::new(Body::empty()));
+                        match request.uri().path() {
+                            "/health" => {
+                                return Ok::<_, Infallible>(Response::new(Body::empty()));
+                            }
+                            "/v1/models" => {
+                                fetches.fetch_add(1, Ordering::SeqCst);
+                                return Ok(Response::new(Body::from("not a model list")));
+                            }
+                            _ => {}
                         }
                         let (parts, body) = request.into_parts();
                         let body = body
@@ -300,6 +315,7 @@ impl RawUpstream {
         });
         Self {
             addr,
+            model_fetches,
             recorded,
             script,
             task: task.abort_handle(),
@@ -312,6 +328,10 @@ impl RawUpstream {
 
     pub fn script(&self, script: Script) {
         *self.script.lock().expect("script") = script;
+    }
+
+    pub fn model_fetches(&self) -> u64 {
+        self.model_fetches.load(Ordering::SeqCst)
     }
 
     pub fn take(&self) -> Vec<Recorded> {

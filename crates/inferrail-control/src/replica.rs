@@ -1,8 +1,11 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use arc_swap::ArcSwapOption;
 use inferrail_core::config::{Config, ReplicaConfig};
 use inferrail_core::ids::{ModelId, ReplicaId};
+use inferrail_core::openai::ModelCard;
+use tokio::time::Instant;
 use url::Url;
 
 use crate::health::{Health, Nanos};
@@ -100,6 +103,14 @@ pub struct Replica {
     in_flight: AtomicU32,
     pending: AtomicU32,
     health: Health,
+    cards: ArcSwapOption<Cards>,
+}
+
+/// The engine's own `/v1/models` answer, as last fetched.
+#[derive(Debug)]
+pub struct Cards {
+    pub fetched: Instant,
+    pub cards: Vec<ModelCard>,
 }
 
 impl Replica {
@@ -110,7 +121,19 @@ impl Replica {
             in_flight: AtomicU32::new(0),
             pending: AtomicU32::new(0),
             health: Health::default(),
+            cards: ArcSwapOption::empty(),
         }
+    }
+
+    pub fn cards(&self) -> Option<Arc<Cards>> {
+        self.cards.load_full()
+    }
+
+    pub fn set_cards(&self, cards: Vec<ModelCard>) {
+        self.cards.store(Some(Arc::new(Cards {
+            fetched: Instant::now(),
+            cards,
+        })));
     }
 
     pub fn health(&self) -> &Health {
@@ -342,6 +365,17 @@ pub(crate) mod tests {
         assert!(high_in_flight.load(Ordering::Relaxed) <= 4);
         assert!(high_pending.load(Ordering::Relaxed) <= 3);
         assert_eq!((replica.in_flight(), replica.pending()), (0, 0));
+    }
+
+    #[test]
+    fn cards_are_stored_and_replaced() {
+        let replica = capped(None, None);
+        assert!(replica.cards().is_none());
+        replica.set_cards(Vec::new());
+        let first = replica.cards().unwrap();
+        assert!(first.cards.is_empty());
+        replica.set_cards(Vec::new());
+        assert!(!Arc::ptr_eq(&first, &replica.cards().unwrap()));
     }
 
     #[test]
