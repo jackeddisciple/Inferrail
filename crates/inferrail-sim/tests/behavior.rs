@@ -354,3 +354,40 @@ async fn hundreds_of_concurrent_streams_complete_cleanly() {
     let snap = sim.sim.engine().snapshot();
     assert_eq!((snap.running, snap.waiting, snap.kv_blocks_used), (0, 0, 0));
 }
+
+#[tokio::test]
+async fn a_request_finishes_at_its_last_token_not_at_done() {
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    let sim = inferrail_sim::server::Sim::new(config(LatencyModel {
+        decode_token_secs: 2e-3,
+        ..LatencyModel::ZERO
+    }))
+    .unwrap();
+    let mut body = chat("finish me", 6);
+    body["stream"] = json!(true);
+    body["stream_options"] = json!({"include_usage": true});
+    let request = Request::post("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let response = sim.router().oneshot(request).await.unwrap();
+    let mut frames = response.into_body().into_data_stream();
+    loop {
+        let frame = frames.next().await.expect("more frames").expect("ok");
+        if String::from_utf8_lossy(&frame).contains("\"finish_reason\":\"length\"") {
+            break;
+        }
+    }
+    let snap = sim.engine().snapshot();
+    assert_eq!(
+        (snap.running, snap.kv_blocks_used),
+        (0, 0),
+        "slot held after last token"
+    );
+    assert_eq!(sim.metrics().finished("length"), 1);
+    drop(frames);
+    assert_eq!(sim.metrics().finished("abort"), 0);
+}

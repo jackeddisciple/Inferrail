@@ -41,7 +41,7 @@ pub fn config(latency: LatencyModel) -> SimConfig {
 pub async fn spawn(config: SimConfig) -> TestSim {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local addr");
-    let sim = Sim::new(config);
+    let sim = Sim::new(config).expect("valid simulator config");
     tokio::spawn(sim.clone().serve(listener, std::future::pending()));
     TestSim {
         base: format!("http://{addr}"),

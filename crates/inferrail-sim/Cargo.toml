@@ -16,9 +16,7 @@ path = "src/main.rs"
 anyhow.workspace = true
 async-stream.workspace = true
 axum.workspace = true
-bytes.workspace = true
 clap.workspace = true
-futures.workspace = true
 inferrail-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -30,8 +28,10 @@ xxhash-rust.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
+futures.workspace = true
 proptest.workspace = true
 reqwest.workspace = true
+tower.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 
 [[bench]]

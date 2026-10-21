@@ -24,6 +24,18 @@ pub struct EngineConfig {
     pub latency: LatencyModel,
 }
 
+impl EngineConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.block_size == 0 {
+            return Err("block_size must be positive".to_owned());
+        }
+        if self.max_num_seqs == 0 {
+            return Err("max_num_seqs must be positive".to_owned());
+        }
+        self.latency.validate()
+    }
+}
+
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
@@ -285,6 +297,8 @@ impl Sequence {
         let deadline = self.deadline(self.generated);
         if deadline > Instant::now() {
             sleep_until(deadline).await;
+        } else {
+            tokio::task::consume_budget().await;
         }
         self.generated += 1;
         let block_size = self.inner.config.block_size as u64;
@@ -481,6 +495,54 @@ mod tests {
         engine.reset_prefix_cache();
         assert_eq!(engine.snapshot().cached_blocks, 0);
         assert_eq!(run(&engine, &tokens, 0).await.0, 0);
+    }
+
+    #[test]
+    fn invalid_engine_configs_are_reported() {
+        assert!(EngineConfig::default().validate().is_ok());
+        for config in [
+            EngineConfig {
+                block_size: 0,
+                ..EngineConfig::default()
+            },
+            EngineConfig {
+                max_num_seqs: 0,
+                ..EngineConfig::default()
+            },
+            EngineConfig {
+                latency: LatencyModel {
+                    decode_token_secs: -1.0,
+                    ..LatencyModel::ZERO
+                },
+                ..EngineConfig::default()
+            },
+        ] {
+            assert!(config.validate().is_err(), "{config:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn zero_latency_decode_yields_to_other_tasks() {
+        let engine = Engine::start(EngineConfig {
+            latency: LatencyModel::ZERO,
+            ..EngineConfig::default()
+        });
+        let ticks = Arc::new(AtomicU64::new(0));
+        let ticker = {
+            let ticks = Arc::clone(&ticks);
+            tokio::spawn(async move {
+                loop {
+                    ticks.fetch_add(1, Ordering::Relaxed);
+                    tokio::task::yield_now().await;
+                }
+            })
+        };
+        run(&engine, &prompt(1, 64), 50_000).await;
+        ticker.abort();
+        assert!(
+            ticks.load(Ordering::Relaxed) > 10,
+            "decode loop starved the runtime"
+        );
     }
 
     #[tokio::test]

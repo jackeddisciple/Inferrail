@@ -45,11 +45,12 @@ fn token_buckets(max_model_len: usize) -> Vec<f64> {
     }
 }
 
+/// The last bucket counts values above every bound; `_count` is the sum of
+/// all buckets, so a scrape can never see a count below a cumulative bucket.
 #[derive(Debug)]
 struct Histogram {
     bounds: Vec<f64>,
     buckets: Vec<AtomicU64>,
-    count: AtomicU64,
     sum_bits: AtomicU64,
 }
 
@@ -57,17 +58,18 @@ impl Histogram {
     fn new(bounds: &[f64]) -> Self {
         Self {
             bounds: bounds.to_vec(),
-            buckets: (0..bounds.len()).map(|_| AtomicU64::new(0)).collect(),
-            count: AtomicU64::new(0),
+            buckets: (0..=bounds.len()).map(|_| AtomicU64::new(0)).collect(),
             sum_bits: AtomicU64::new(0f64.to_bits()),
         }
     }
 
     fn observe(&self, value: f64) {
-        if let Some(i) = self.bounds.iter().position(|&b| value <= b) {
-            self.buckets[i].fetch_add(1, Ordering::Relaxed);
-        }
-        self.count.fetch_add(1, Ordering::Relaxed);
+        let i = self
+            .bounds
+            .iter()
+            .position(|&b| value <= b)
+            .unwrap_or(self.bounds.len());
+        self.buckets[i].fetch_add(1, Ordering::Relaxed);
         let _ = self
             .sum_bits
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |bits| {
@@ -451,7 +453,7 @@ impl Writer {
             let labels = self.labels(&[("le", &go_float(*bound))]);
             self.sample(&bucket, &labels, cumulative as f64);
         }
-        let total = h.count.load(Ordering::Relaxed);
+        let total = cumulative + h.buckets[h.bounds.len()].load(Ordering::Relaxed);
         let labels = self.labels(&[("le", "+Inf")]);
         self.sample(&bucket, &labels, total as f64);
         let base = self.labels(&[]);
@@ -731,5 +733,64 @@ mod tests {
         assert_eq!(metrics.finished("abort"), 1);
         assert_eq!(metrics.finished("length"), 1);
         assert_eq!(metrics.finished("stop"), 0);
+    }
+}
+
+#[cfg(test)]
+mod concurrency {
+    use super::*;
+
+    #[test]
+    fn concurrent_scrapes_never_see_a_torn_histogram() {
+        let metrics = Arc::new(Metrics::new("m", 100, 16, 10));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writers: Vec<_> = (0..3)
+            .map(|_| {
+                let metrics = Arc::clone(&metrics);
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    let mut i = 0u64;
+                    while !stop.load(Ordering::Relaxed) {
+                        metrics.time_to_first_token.observe((i % 7) as f64 * 0.003);
+                        i += 1;
+                    }
+                })
+            })
+            .collect();
+        let mut torn = 0;
+        let mut scrapes = 0;
+        let started = std::time::Instant::now();
+        while started.elapsed() < Duration::from_secs(1) {
+            scrapes += 1;
+            let text = metrics.render(&EngineSnapshot::default());
+            let mut last = 0.0f64;
+            let mut count = None;
+            for line in text
+                .lines()
+                .filter(|l| l.starts_with("vllm:time_to_first_token_seconds_"))
+            {
+                let value: f64 = line.rsplit_once(' ').unwrap().1.parse().unwrap();
+                if line.contains("_bucket") {
+                    if value < last {
+                        torn += 1;
+                    }
+                    last = value;
+                } else if line.contains("_count") {
+                    count = Some(value);
+                }
+            }
+            if count.is_some_and(|c| c != last) {
+                torn += 1;
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        assert!(scrapes > 100);
+        assert_eq!(
+            torn, 0,
+            "{torn} of {scrapes} scrapes saw an inconsistent histogram"
+        );
     }
 }

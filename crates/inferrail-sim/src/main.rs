@@ -1,6 +1,6 @@
 use std::net::{IpAddr, SocketAddr};
 
-use anyhow::{Context, bail};
+use anyhow::Context;
 use clap::Parser;
 use inferrail_sim::engine::EngineConfig;
 use inferrail_sim::latency::LatencyModel;
@@ -60,10 +60,7 @@ struct Args {
 }
 
 impl Args {
-    fn sim_config(&self) -> anyhow::Result<SimConfig> {
-        if self.block_size == 0 || self.max_model_len == 0 || self.max_num_seqs == 0 {
-            bail!("--block-size, --max-model-len and --max-num-seqs must be positive");
-        }
+    fn sim_config(&self) -> SimConfig {
         let latency = if self.zero_latency {
             LatencyModel::ZERO
         } else {
@@ -74,8 +71,7 @@ impl Args {
                 decode_token_secs: self.decode_token_ms / 1e3,
             }
         };
-        latency.validate().map_err(anyhow::Error::msg)?;
-        Ok(SimConfig {
+        SimConfig {
             model: self.model.clone(),
             served_model_names: self.served_model_name.clone(),
             max_model_len: self.max_model_len,
@@ -88,7 +84,7 @@ impl Args {
                 max_num_seqs: self.max_num_seqs,
                 latency,
             },
-        })
+        }
     }
 }
 
@@ -120,7 +116,8 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_new(&args.log).context("invalid --log filter")?)
         .init();
-    let config = args.sim_config()?;
+    let config = args.sim_config();
+    let sim = Sim::new(config.clone())?;
     let addr = SocketAddr::new(args.host, args.port);
     let listener = TcpListener::bind(addr)
         .await
@@ -134,7 +131,7 @@ async fn main() -> anyhow::Result<()> {
         latency = ?config.engine.latency,
         "inferrail-sim listening"
     );
-    Sim::new(config).serve(listener, shutdown_signal()).await?;
+    sim.serve(listener, shutdown_signal()).await?;
     Ok(())
 }
 
@@ -144,7 +141,8 @@ mod tests {
 
     #[test]
     fn defaults_build_a_valid_config() {
-        let config = Args::parse_from(["inferrail-sim"]).sim_config().unwrap();
+        let config = Args::parse_from(["inferrail-sim"]).sim_config();
+        assert!(config.validate().is_ok());
         let (got, want) = (config.engine.latency, LatencyModel::GPU_24GB_8B);
         for (a, b) in [
             (got.prefill_token_secs, want.prefill_token_secs),
@@ -169,7 +167,8 @@ mod tests {
             "--enable-prompt-tokens-details",
             "--zero-latency",
         ]);
-        let config = args.sim_config().unwrap();
+        let config = args.sim_config();
+        assert!(config.validate().is_ok());
         assert_eq!(config.served_names(), ["a", "b"]);
         assert_eq!(config.engine.num_gpu_blocks, 99);
         assert!(config.enable_prompt_tokens_details);
@@ -178,15 +177,17 @@ mod tests {
 
     #[test]
     fn invalid_values_are_rejected() {
-        assert!(
-            Args::parse_from(["inferrail-sim", "--block-size", "0"])
-                .sim_config()
-                .is_err()
-        );
-        assert!(
-            Args::parse_from(["inferrail-sim", "--decode-token-ms=-1"])
-                .sim_config()
-                .is_err()
-        );
+        for args in [
+            &["inferrail-sim", "--block-size", "0"][..],
+            &["inferrail-sim", "--max-num-seqs", "0"],
+            &["inferrail-sim", "--max-model-len", "0"],
+            &["inferrail-sim", "--decode-token-ms=-1"],
+            &["inferrail-sim", "--served-model-name", "has space"],
+        ] {
+            assert!(
+                Args::parse_from(args).sim_config().validate().is_err(),
+                "{args:?}"
+            );
+        }
     }
 }

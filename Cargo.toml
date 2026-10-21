@@ -15,7 +15,6 @@ inferrail-core = { path = "crates/inferrail-core" }
 anyhow = "1.0.104"
 async-stream = "0.3.6"
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio", "tracing"] }
-bytes = "1.12.1"
 clap = { version = "4.6.7", features = ["derive", "env"] }
 criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
 futures = "0.3.34"
@@ -23,10 +22,11 @@ humantime-serde = "1.1.1"
 proptest = "1.12"
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "stream"] }
 serde = { version = "1.0.229", features = ["derive"] }
-serde-saphyr = "2.0.0"
 serde_json = { version = "1.0.154", features = ["float_roundtrip"] }
+serde-saphyr = "2.0.0"
 thiserror = "2.0.21"
 tokio = { version = "1.54.0", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tower = { version = "0.5.3", default-features = false, features = ["util"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 url = { version = "2.5.8", features = ["serde"] }

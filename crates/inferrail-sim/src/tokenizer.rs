@@ -5,7 +5,9 @@
 //! needs. Pieces average about four characters, close to real BPE on English.
 
 use inferrail_core::openai::{ChatMessage, Tool, ToolCall};
-use xxhash_rust::xxh3::xxh3_64;
+use std::fmt::Write as _;
+
+use xxhash_rust::xxh3::{xxh3_64, xxh3_64_with_seed};
 
 pub const BOS: u32 = 128_000;
 pub const START_HEADER: u32 = 128_006;
@@ -131,11 +133,12 @@ fn append_tool_calls(content: &mut String, calls: &[ToolCall]) {
         if !content.is_empty() {
             content.push('\n');
         }
-        content.push_str(&format!(
+        let _ = write!(
+            content,
             "{{\"name\":{},\"parameters\":{}}}",
             serde_json::Value::from(call.function.name.as_str()),
             call.function.arguments
-        ));
+        );
     }
 }
 
@@ -154,7 +157,7 @@ pub fn generate(seed: u64, count: usize) -> Vec<(u32, String)> {
         if i > 0 {
             text.push(' ');
         }
-        let pick = xxh3_64(&[seed.to_le_bytes(), (i as u64).to_le_bytes()].concat());
+        let pick = xxh3_64_with_seed(&(i as u64).to_le_bytes(), seed);
         text.push_str(WORDS[(pick % WORDS.len() as u64) as usize]);
     }
     pieces(&text)

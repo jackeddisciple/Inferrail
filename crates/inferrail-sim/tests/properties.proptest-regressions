@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 74643e20d825041dd597f468ead0487344739274dd592d329cd5f91aebc7282a # shrinks to case = Case { messages: [], model: Some("not-served"), max_tokens: None, stream: false, include_usage: Some(false), seed: None, tools: false }

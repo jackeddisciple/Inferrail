@@ -16,7 +16,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use inferrail_core::openai::sse::{DONE_FRAME, data_frame};
 use inferrail_core::openai::{
-    ChatCompletionRequest, CompletionRequest, ErrorResponse, FinishReason, PromptRef,
+    ChatCompletionRequest, CompletionRequest, ErrorResponse, FinishReason, Nullable, PromptRef,
+    StreamOptions,
 };
 use serde::Serialize;
 use tokio::net::TcpListener;
@@ -56,7 +57,27 @@ impl Default for SimConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("invalid simulator config: {0}")]
+pub struct InvalidConfig(String);
+
 impl SimConfig {
+    pub fn validate(&self) -> Result<(), InvalidConfig> {
+        if self.max_model_len == 0 {
+            return Err(InvalidConfig("max_model_len must be positive".to_owned()));
+        }
+        if let Some(bad) = self
+            .served_names()
+            .iter()
+            .find(|n| n.is_empty() || n.chars().any(char::is_whitespace))
+        {
+            return Err(InvalidConfig(format!(
+                "served model name {bad:?} is not usable"
+            )));
+        }
+        self.engine.validate().map_err(InvalidConfig)
+    }
+
     pub fn served_names(&self) -> Vec<String> {
         if self.served_model_names.is_empty() {
             vec![self.model.clone()]
@@ -92,7 +113,8 @@ pub struct Sim {
 
 impl Sim {
     /// Starts the engine; must be called inside a Tokio runtime.
-    pub fn new(config: SimConfig) -> Self {
+    pub fn new(config: SimConfig) -> Result<Self, InvalidConfig> {
+        config.validate()?;
         let engine = Engine::start(config.engine.clone());
         let names = config.served_names();
         let metrics = Arc::new(Metrics::new(
@@ -101,7 +123,7 @@ impl Sim {
             config.engine.block_size,
             config.engine.num_gpu_blocks,
         ));
-        Self {
+        Ok(Self {
             state: Arc::new(AppState {
                 names,
                 engine,
@@ -110,7 +132,7 @@ impl Sim {
                 requests: AtomicU64::new(0),
                 config,
             }),
-        }
+        })
     }
 
     pub fn engine(&self) -> &Engine {
@@ -135,6 +157,7 @@ impl Sim {
             .route("/version", get(version))
             .route("/reset_prefix_cache", post(reset_prefix_cache))
             .fallback(not_found)
+            .method_not_allowed_fallback(method_not_allowed)
             .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
             .with_state(Arc::clone(&self.state))
     }
@@ -167,6 +190,15 @@ impl ApiError {
         Self {
             status: StatusCode::BAD_REQUEST,
             body: Box::new(ErrorResponse::bad_request(message)),
+        }
+    }
+
+    fn bad_param(message: impl Into<String>, param: &str) -> Self {
+        let mut body = ErrorResponse::bad_request(message);
+        body.error.param = Nullable::Value(param.to_owned());
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            body: Box::new(body),
         }
     }
 
@@ -244,6 +276,56 @@ struct Common<'a> {
     stream: bool,
     include_usage: bool,
     seed: Option<i64>,
+}
+
+/// vLLM rejects a non empty `stream_options` unless `stream` is true.
+fn check_stream_options(stream: bool, options: &Nullable<StreamOptions>) -> Result<(), ApiError> {
+    let set = options.value().is_some_and(|o| {
+        !o.include_usage.is_absent() || !o.continuous_usage_stats.is_absent() || !o.extra.is_empty()
+    });
+    if set && !stream {
+        return Err(ApiError::bad_param(
+            "Stream options can only be defined when `stream=True`.",
+            "stream_options",
+        ));
+    }
+    Ok(())
+}
+
+fn unsupported(param: &str) -> ApiError {
+    ApiError::bad_param(
+        format!("`{param}` is not supported by inferrail-sim"),
+        param,
+    )
+}
+
+fn check_prompt_logprobs(extra: &inferrail_core::openai::Extra) -> Result<(), ApiError> {
+    match extra.get("prompt_logprobs") {
+        Some(value) if !value.is_null() => Err(unsupported("prompt_logprobs")),
+        _ => Ok(()),
+    }
+}
+
+fn check_chat(request: &ChatCompletionRequest) -> Result<(), ApiError> {
+    check_stream_options(request.is_stream(), &request.stream_options)?;
+    if request.logprobs.value() == Some(&true) {
+        return Err(unsupported("logprobs"));
+    }
+    check_prompt_logprobs(&request.extra)
+}
+
+fn check_completion(request: &CompletionRequest) -> Result<(), ApiError> {
+    check_stream_options(request.is_stream(), &request.stream_options)?;
+    if request.logprobs.is_value() {
+        return Err(unsupported("logprobs"));
+    }
+    if request.echo.value() == Some(&true) {
+        return Err(unsupported("echo"));
+    }
+    if request.best_of.value().is_some_and(|&n| n > 1) {
+        return Err(unsupported("best_of"));
+    }
+    check_prompt_logprobs(&request.extra)
 }
 
 fn parse<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, ApiError> {
@@ -339,6 +421,9 @@ async fn chat_completions(
         Ok(request) => request,
         Err(err) => return err.into_response(),
     };
+    if let Err(err) = check_chat(&request) {
+        return err.into_response();
+    }
     let add_generation_prompt = request
         .extra
         .get("add_generation_prompt")
@@ -372,6 +457,9 @@ async fn completions(
         Ok(request) => request,
         Err(err) => return err.into_response(),
     };
+    if let Err(err) = check_completion(&request) {
+        return err.into_response();
+    }
     let prompt = match request.prompt.value().map(|p| (p.batch_len(), p.single())) {
         None => {
             return ApiError::bad_request("Either prompt or prompt_embeds must be provided")
@@ -464,6 +552,25 @@ fn frame(value: &impl Serialize) -> Bytes {
         .unwrap_or_default()
 }
 
+fn token_frames(
+    plan: &Plan,
+    index: usize,
+    piece: &str,
+    finish: Option<&FinishReason>,
+) -> Vec<Bytes> {
+    let meta = plan.meta();
+    match plan.endpoint {
+        Endpoint::Chat if index == 0 => vec![
+            frame(&wire::chat_role_chunk(meta)),
+            frame(&wire::chat_token_chunk(meta, piece, finish)),
+        ],
+        Endpoint::Chat => vec![frame(&wire::chat_token_chunk(meta, piece, finish))],
+        Endpoint::Completion => vec![frame(&wire::completion_token_chunk(meta, piece, finish))],
+    }
+}
+
+/// The request finishes, and frees its slot, when the engine emits the last
+/// token; trailing frames only wait on the client.
 fn stream_response(state: Arc<AppState>, plan: Plan) -> Response {
     let body = async_stream::stream! {
         let mut tracker = state.metrics.tracker(plan.max_tokens);
@@ -478,38 +585,36 @@ fn stream_response(state: Arc<AppState>, plan: Plan) -> Response {
             }
         };
         tracker.admitted(&seq);
-        let meta = plan.meta();
         let pieces = tokenizer::generate(plan.seed, plan.max_tokens);
-        let last = pieces.len().saturating_sub(1);
-        for (i, (_, piece)) in pieces.iter().enumerate() {
+        let Some((last, head)) = pieces.split_last() else {
+            return;
+        };
+        for (i, (_, piece)) in head.iter().enumerate() {
             seq.next_token().await;
             tracker.token();
-            let finish = (i == last).then_some(&plan.finish);
-            match plan.endpoint {
-                Endpoint::Chat => {
-                    if i == 0 {
-                        yield Ok(frame(&wire::chat_role_chunk(meta)));
-                    }
-                    yield Ok(frame(&wire::chat_token_chunk(meta, piece, finish)));
-                }
-                Endpoint::Completion => {
-                    yield Ok(frame(&wire::completion_token_chunk(meta, piece, finish)));
-                }
+            for bytes in token_frames(&plan, i, piece, None) {
+                yield Ok(bytes);
             }
         }
+        seq.next_token().await;
+        tracker.token();
+        tracker.finish(&plan.finish);
+        let usage = wire::stream_usage(
+            plan.prompt.len() as u64,
+            seq.generated() as u64,
+            cached_detail(&state, &seq),
+        );
+        drop(seq);
+        for bytes in token_frames(&plan, head.len(), &last.1, Some(&plan.finish)) {
+            yield Ok(bytes);
+        }
         if plan.include_usage {
-            let usage = wire::stream_usage(
-                plan.prompt.len() as u64,
-                seq.generated() as u64,
-                cached_detail(&state, &seq),
-            );
+            let meta = plan.meta();
             yield Ok(match plan.endpoint {
                 Endpoint::Chat => frame(&wire::chat_usage_chunk(meta, usage)),
                 Endpoint::Completion => frame(&wire::completion_usage_chunk(meta, usage)),
             });
         }
-        tracker.finish(&plan.finish);
-        drop(seq);
         yield Ok(Bytes::from_static(DONE_FRAME));
     };
     (
@@ -564,6 +669,13 @@ async fn version() -> Response {
 async fn reset_prefix_cache(State(state): State<Arc<AppState>>) -> StatusCode {
     state.engine.reset_prefix_cache();
     StatusCode::OK
+}
+
+async fn method_not_allowed() -> Response {
+    json_response(
+        StatusCode::METHOD_NOT_ALLOWED,
+        &serde_json::json!({"detail": "Method Not Allowed"}),
+    )
 }
 
 async fn not_found() -> Response {

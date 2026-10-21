@@ -372,3 +372,158 @@ async fn prompt_details_are_optional_like_vllm() {
     let (_, reply) = sim.post_json("/v1/chat/completions", &chat("x", 1)).await;
     assert!(reply["usage"]["prompt_tokens_details"].is_null());
 }
+
+#[tokio::test]
+async fn stream_options_require_streaming_like_vllm() {
+    let sim = spawn(config(LatencyModel::ZERO)).await;
+    for (path, mut body) in [
+        ("/v1/chat/completions", chat("x", 1)),
+        ("/v1/completions", json!({"prompt": "x", "max_tokens": 1})),
+    ] {
+        body["stream_options"] = json!({"include_usage": false});
+        let (status, error) = sim.post_json(path, &body).await;
+        assert_eq!(status, 400, "{path}");
+        assert_eq!(error["error"]["param"], "stream_options");
+        assert_eq!(
+            error["error"]["message"],
+            "Stream options can only be defined when `stream=True`."
+        );
+
+        body["stream_options"] = json!({});
+        assert_eq!(
+            sim.post_json(path, &body).await.0,
+            200,
+            "empty options are falsy"
+        );
+        body["stream_options"] = Value::Null;
+        assert_eq!(
+            sim.post_json(path, &body).await.0,
+            200,
+            "null options are falsy"
+        );
+    }
+}
+
+#[tokio::test]
+async fn features_that_change_the_response_shape_are_refused() {
+    let sim = spawn(config(LatencyModel::ZERO)).await;
+    let mut chat_logprobs = chat("x", 1);
+    chat_logprobs["logprobs"] = json!(true);
+    let mut chat_prompt_logprobs = chat("x", 1);
+    chat_prompt_logprobs["prompt_logprobs"] = json!(1);
+    let cases = [
+        ("/v1/chat/completions", chat_logprobs, "logprobs"),
+        (
+            "/v1/chat/completions",
+            chat_prompt_logprobs,
+            "prompt_logprobs",
+        ),
+        (
+            "/v1/completions",
+            json!({"prompt": "x", "logprobs": 0}),
+            "logprobs",
+        ),
+        (
+            "/v1/completions",
+            json!({"prompt": "x", "echo": true}),
+            "echo",
+        ),
+        (
+            "/v1/completions",
+            json!({"prompt": "x", "best_of": 2}),
+            "best_of",
+        ),
+    ];
+    for (path, body, param) in cases {
+        let (status, error) = sim.post_json(path, &body).await;
+        assert_eq!(status, 400, "{body}");
+        assert_eq!(error["error"]["param"], param);
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("not supported")
+        );
+    }
+
+    let mut harmless = chat("x", 1);
+    harmless["logprobs"] = json!(false);
+    harmless["stop"] = json!(["\n"]);
+    harmless["prompt_logprobs"] = Value::Null;
+    assert_eq!(
+        sim.post_json("/v1/chat/completions", &harmless).await.0,
+        200
+    );
+    let ok = json!({"prompt": "x", "max_tokens": 1, "echo": false, "best_of": 1, "logprobs": null});
+    assert_eq!(sim.post_json("/v1/completions", &ok).await.0, 200);
+}
+
+#[tokio::test]
+async fn wrong_methods_get_a_json_405() {
+    let sim = spawn(config(LatencyModel::ZERO)).await;
+    for (method, path) in [
+        (reqwest::Method::GET, "/v1/chat/completions"),
+        (reqwest::Method::DELETE, "/v1/models"),
+        (reqwest::Method::GET, "/reset_prefix_cache"),
+    ] {
+        let response = sim
+            .client
+            .request(method, sim.url(path))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 405, "{path}");
+        assert_eq!(
+            response.json::<Value>().await.unwrap(),
+            json!({"detail": "Method Not Allowed"})
+        );
+    }
+}
+
+#[tokio::test]
+async fn invalid_configs_are_refused_up_front() {
+    use inferrail_sim::server::{Sim, SimConfig};
+    let mut bad = SimConfig::default();
+    bad.engine.block_size = 0;
+    assert!(Sim::new(bad).is_err());
+    let names = SimConfig {
+        served_model_names: vec![String::new()],
+        ..SimConfig::default()
+    };
+    assert!(Sim::new(names).is_err());
+    assert!(Sim::new(SimConfig::default()).is_ok());
+}
+
+#[tokio::test]
+async fn oversized_or_empty_request_ids_fall_back_to_generated_ones() {
+    let sim = spawn(config(LatencyModel::ZERO)).await;
+    for header in ["x".repeat(300), String::new()] {
+        let reply: Value = sim
+            .client
+            .post(sim.url("/v1/chat/completions"))
+            .header("x-request-id", header.as_str())
+            .json(&chat("x", 1))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let id = reply["id"].as_str().unwrap();
+        assert_eq!(id.len(), "chatcmpl-".len() + 32, "{id}");
+    }
+}
+
+#[tokio::test]
+async fn unicode_prompts_stream_valid_text() {
+    let sim = spawn(config(LatencyModel::ZERO)).await;
+    let mut body = chat("こんにちは 🌍 naïve café Ω≈ç√ \u{0}\u{7f} עברית", 24);
+    body["stream"] = json!(true);
+    let (events, _, raw) = sim.stream("/v1/chat/completions", &body).await;
+    assert!(String::from_utf8(raw).is_ok());
+    assert!(events.last().unwrap().is_done());
+    let (_, full) = sim
+        .post_json("/v1/chat/completions", &chat("🌍🌍🌍", 3))
+        .await;
+    assert!(full["usage"]["prompt_tokens"].as_u64().unwrap() > 3);
+}
