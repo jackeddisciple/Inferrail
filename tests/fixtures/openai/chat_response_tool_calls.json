@@ -1,0 +1,39 @@
+{
+  "id": "chatcmpl-abc123",
+  "object": "chat.completion",
+  "created": 1699896916,
+  "model": "gpt-4o-mini",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": null,
+        "tool_calls": [
+          {
+            "id": "call_abc123",
+            "type": "function",
+            "function": {"name": "get_current_weather", "arguments": "{\n\"location\": \"Boston, MA\"\n}"}
+          }
+        ],
+        "refusal": null,
+        "annotations": []
+      },
+      "logprobs": {
+        "content": [
+          {"token": "Hello", "logprob": -0.31725305, "bytes": [72, 101, 108, 108, 111], "top_logprobs": []}
+        ],
+        "refusal": null
+      },
+      "finish_reason": "tool_calls"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 82,
+    "completion_tokens": 17,
+    "total_tokens": 99,
+    "prompt_tokens_details": {"cached_tokens": 64, "audio_tokens": 0},
+    "completion_tokens_details": {"reasoning_tokens": 0, "audio_tokens": 0}
+  },
+  "service_tier": "default"
+}

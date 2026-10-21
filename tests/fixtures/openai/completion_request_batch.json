@@ -1,0 +1,8 @@
+{
+  "model": "meta-llama/Llama-3.1-8B-Instruct",
+  "prompt": [[128000, 791, 6864], [128000, 3923, 374, 279]],
+  "max_tokens": 4,
+  "n": 2,
+  "best_of": 2,
+  "seed": -7
+}

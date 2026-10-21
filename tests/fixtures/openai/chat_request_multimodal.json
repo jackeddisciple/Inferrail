@@ -1,0 +1,15 @@
+{
+  "messages": [
+    {"role": "system", "content": [{"type": "text", "text": "Describe images precisely."}]},
+    {
+      "role": "user",
+      "content": [
+        {"type": "text", "text": "What is in this image?"},
+        {"type": "image_url", "image_url": {"url": "https://example.com/cat.png", "detail": "low"}},
+        {"type": "input_audio", "input_audio": {"data": "UklGRiQAAABXQVZF", "format": "wav"}}
+      ]
+    }
+  ],
+  "model": "gpt-4o",
+  "max_tokens": 300
+}

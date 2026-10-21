@@ -1,0 +1,20 @@
+{
+  "model": "meta-llama/Llama-3.1-8B-Instruct",
+  "messages": [
+    {"role": "system", "content": "You are a helpful assistant."},
+    {"role": "user", "content": "Write a haiku about caches."}
+  ],
+  "max_tokens": 64,
+  "temperature": 0.0,
+  "top_k": 40,
+  "min_p": 0.05,
+  "repetition_penalty": 1.1,
+  "ignore_eos": true,
+  "min_tokens": 64,
+  "skip_special_tokens": false,
+  "chat_template_kwargs": {"enable_thinking": false},
+  "add_generation_prompt": true,
+  "priority": 1,
+  "cache_salt": "tenant-acme",
+  "stream": false
+}

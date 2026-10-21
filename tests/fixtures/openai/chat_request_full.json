@@ -1,0 +1,58 @@
+{
+  "messages": [
+    {"role": "developer", "content": "You are a terse assistant. Answer in one sentence."},
+    {"role": "user", "content": "What is the capital of France?", "name": "alice"}
+  ],
+  "model": "gpt-4.1",
+  "frequency_penalty": 0,
+  "logit_bias": {"50256": -100},
+  "logprobs": true,
+  "max_completion_tokens": 256,
+  "metadata": {"tenant": "acme", "trace": "a1b2"},
+  "n": 1,
+  "parallel_tool_calls": false,
+  "presence_penalty": 0.5,
+  "reasoning_effort": "low",
+  "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+      "name": "answer",
+      "strict": true,
+      "schema": {
+        "type": "object",
+        "properties": {"city": {"type": "string"}},
+        "required": ["city"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "seed": 42,
+  "service_tier": "auto",
+  "stop": ["\n\n", "END"],
+  "store": false,
+  "stream": true,
+  "stream_options": {"include_usage": true},
+  "temperature": 0.7,
+  "tool_choice": "auto",
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "Current weather for a city.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "city": {"type": "string"},
+            "unit": {"type": "string", "enum": ["c", "f"]}
+          },
+          "required": ["city"]
+        },
+        "strict": false
+      }
+    }
+  ],
+  "top_logprobs": 2,
+  "top_p": 1,
+  "user": "user-1234"
+}

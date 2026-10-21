@@ -1,0 +1,10 @@
+{
+  "model": "gpt-3.5-turbo-instruct",
+  "prompt": "Once upon a time",
+  "max_tokens": 16,
+  "temperature": 1,
+  "logprobs": 3,
+  "echo": false,
+  "suffix": null,
+  "stop": "\n"
+}

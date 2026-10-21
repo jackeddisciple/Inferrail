@@ -17,7 +17,7 @@ pub use common::{
 };
 pub use completion::{CompletionRequest, Prompt, PromptRef};
 pub use error::{ErrorInfo, ErrorResponse};
-pub use models::{ModelCard, ModelList};
+pub use models::{ModelCard, ModelList, ModelPermission};
 pub use nullable::Nullable;
 pub use response::{
     CHAT_COMPLETION_CHUNK_OBJECT, CHAT_COMPLETION_OBJECT, ChatChoice, ChatChunkChoice,

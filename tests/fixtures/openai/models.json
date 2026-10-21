@@ -1,0 +1,7 @@
+{
+  "object": "list",
+  "data": [
+    {"id": "gpt-4.1", "object": "model", "created": 1744316542, "owned_by": "system"},
+    {"id": "ft:gpt-4o-mini:acme::abc", "object": "model", "created": 1730000000, "owned_by": "user-acme"}
+  ]
+}

@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 use super::{Extra, Nullable};
 
@@ -34,7 +33,34 @@ pub struct ModelCard {
     #[serde(default, skip_serializing_if = "Nullable::is_absent")]
     pub max_model_len: Nullable<u64>,
     #[serde(default, skip_serializing_if = "Nullable::is_absent")]
-    pub permission: Nullable<Vec<Value>>,
+    pub permission: Nullable<Vec<ModelPermission>>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelPermission {
+    pub id: String,
+    pub object: String,
+    pub created: u64,
+    #[serde(default, skip_serializing_if = "Nullable::is_absent")]
+    pub allow_create_engine: Nullable<bool>,
+    #[serde(default, skip_serializing_if = "Nullable::is_absent")]
+    pub allow_sampling: Nullable<bool>,
+    #[serde(default, skip_serializing_if = "Nullable::is_absent")]
+    pub allow_logprobs: Nullable<bool>,
+    #[serde(default, skip_serializing_if = "Nullable::is_absent")]
+    pub allow_search_indices: Nullable<bool>,
+    #[serde(default, skip_serializing_if = "Nullable::is_absent")]
+    pub allow_view: Nullable<bool>,
+    #[serde(default, skip_serializing_if = "Nullable::is_absent")]
+    pub allow_fine_tuning: Nullable<bool>,
+    #[serde(default, skip_serializing_if = "Nullable::is_absent")]
+    pub organization: Nullable<String>,
+    #[serde(default, skip_serializing_if = "Nullable::is_absent")]
+    pub group: Nullable<String>,
+    #[serde(default, skip_serializing_if = "Nullable::is_absent")]
+    pub is_blocking: Nullable<bool>,
     #[serde(flatten)]
     pub extra: Extra,
 }
