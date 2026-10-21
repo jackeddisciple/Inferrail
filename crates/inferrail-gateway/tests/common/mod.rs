@@ -376,16 +376,30 @@ pub fn urls(upstreams: &[&Upstream]) -> Vec<String> {
 impl TestGateway {
     pub async fn start(config: Config) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        Self::serve(Gateway::new(config).expect("gateway"), listener).await
+    }
+
+    /// Serves and waits until the gateway answers, so DNS groups are
+    /// resolved by the time it returns.
+    pub async fn serve(gateway: Gateway, listener: TcpListener) -> Self {
         let base = format!("http://{}", listener.local_addr().expect("addr"));
-        let gateway = Gateway::new(config).expect("gateway");
         let (stop, stopped) = oneshot::channel::<()>();
         let task = tokio::spawn(gateway.clone().serve(listener, async move {
             let _ = stopped.await;
         }));
+        let client = reqwest::Client::new();
+        let started = Instant::now();
+        while client.get(format!("{base}/health")).send().await.is_err() {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "gateway never came up"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         Self {
             base,
             gateway,
-            client: reqwest::Client::new(),
+            client,
             stop: Some(stop),
             task: Some(task),
         }

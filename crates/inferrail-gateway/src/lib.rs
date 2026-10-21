@@ -5,11 +5,16 @@ use std::future::Future;
 use std::hash::{BuildHasher, RandomState};
 use std::sync::Arc;
 
-use inferrail_control::{CheckerConfig, Clock, HealthPolicy, Registry, ReplicaSpec, run_checker};
+use inferrail_control::discovery::refresh;
+use inferrail_control::{
+    CheckerConfig, Clock, HealthPolicy, Registry, ReplicaSpec, Resolve, SystemResolver,
+    run_checker, run_dns,
+};
 use inferrail_core::config::{Config, ConfigIssues};
 use inferrail_core::ids::ModelId;
 use inferrail_policy::RoutingPolicy;
 use tokio::net::TcpListener;
+use tokio::task::JoinSet;
 
 mod body;
 pub mod errors;
@@ -49,6 +54,7 @@ pub(crate) struct Shared {
     clock: Clock,
     health: HealthPolicy,
     started_unix: u64,
+    resolver: Arc<dyn Resolve>,
 }
 
 impl Shared {
@@ -63,6 +69,11 @@ impl Shared {
 impl Gateway {
     /// Builds the gateway; must be called inside a Tokio runtime.
     pub fn new(config: Config) -> Result<Self, BuildError> {
+        Self::with_resolver(config, Arc::new(SystemResolver))
+    }
+
+    /// Like [`Gateway::new`] with a custom resolver for DNS discovery.
+    pub fn with_resolver(config: Config, resolver: Arc<dyn Resolve>) -> Result<Self, BuildError> {
         config.validate().map_err(BuildError::Invalid)?;
         let urls = config
             .replicas
@@ -114,6 +125,7 @@ impl Gateway {
             started_unix: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs()),
+            resolver,
             names,
             policies,
             config,
@@ -132,15 +144,28 @@ impl Gateway {
     }
 
     /// Serves until `shutdown` resolves, then drains open connections for at
-    /// most `server.shutdown_timeout`. Health checks run while it serves.
+    /// most `server.shutdown_timeout`. DNS groups are resolved once before
+    /// the first connection; health checks and DNS refreshes run alongside.
     pub async fn serve(
         self,
         listener: TcpListener,
         shutdown: impl Future<Output = ()> + Send + 'static,
     ) -> std::io::Result<()> {
         let shared = self.shared;
+        let mut background = JoinSet::new();
+        for group in &shared.config.discovery.dns {
+            let wait = group.refresh.max(std::time::Duration::from_secs(1));
+            refresh(&shared.registry, group, shared.resolver.as_ref(), wait).await;
+        }
+        for group in &shared.config.discovery.dns {
+            background.spawn(run_dns(
+                Arc::clone(&shared.registry),
+                group.clone(),
+                Arc::clone(&shared.resolver),
+            ));
+        }
         let health = &shared.config.health;
-        let checker = tokio::spawn(run_checker(
+        background.spawn(run_checker(
             Arc::clone(&shared.registry),
             upstream::HttpProbe {
                 client: shared.client.clone(),
@@ -153,8 +178,6 @@ impl Gateway {
             },
             shared.clock,
         ));
-        let served = server::serve(shared, listener, shutdown).await;
-        checker.abort();
-        served
+        server::serve(shared, listener, shutdown).await
     }
 }
