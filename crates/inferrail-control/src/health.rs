@@ -2,6 +2,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use inferrail_core::config::HealthConfig;
+use tokio::sync::Notify;
 
 /// Nanoseconds since a [`Clock`]'s epoch. Zero means "never".
 pub type Nanos = u64;
@@ -68,6 +69,7 @@ pub struct Health {
     failures: AtomicU32,
     ejected_until: AtomicU64,
     ejections: AtomicU32,
+    went_down: Notify,
 }
 
 impl Default for Health {
@@ -79,6 +81,7 @@ impl Default for Health {
             failures: AtomicU32::new(0),
             ejected_until: AtomicU64::new(0),
             ejections: AtomicU32::new(0),
+            went_down: Notify::new(),
         }
     }
 }
@@ -96,6 +99,12 @@ impl Health {
 
     pub fn probe_up(&self) -> bool {
         self.probe_up.load(Ordering::Acquire)
+    }
+
+    /// Wakes every waiter registered before the replica next fails its
+    /// health checks.
+    pub fn went_down(&self) -> &Notify {
+        &self.went_down
     }
 
     pub fn is_ejected(&self, now: Nanos) -> bool {
@@ -175,6 +184,9 @@ impl Health {
         (up != ok && count >= threshold).then(|| {
             self.probe_up.store(ok, Ordering::Release);
             streak.store(0, Ordering::Relaxed);
+            if !ok {
+                self.went_down.notify_waiters();
+            }
             ok
         })
     }
@@ -280,6 +292,30 @@ mod tests {
         assert_eq!(health.record_probe(true, &p), None);
         assert_eq!(health.record_probe(true, &p), Some(true));
         assert!(health.is_routable(1));
+    }
+
+    #[tokio::test]
+    async fn going_down_wakes_waiters_and_coming_up_does_not() {
+        let (health, p) = (Health::default(), policy());
+        let waiter = health.went_down().notified();
+        tokio::pin!(waiter);
+        waiter.as_mut().enable();
+        for _ in 0..3 {
+            health.record_probe(false, &p);
+        }
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("woken when the replica went down");
+
+        let waiter = health.went_down().notified();
+        tokio::pin!(waiter);
+        waiter.as_mut().enable();
+        for _ in 0..2 {
+            health.record_probe(true, &p);
+        }
+        assert!(health.probe_up());
+        let woken = tokio::time::timeout(Duration::from_millis(50), waiter).await;
+        assert!(woken.is_err(), "recovery is not a reason to wake");
     }
 
     #[test]

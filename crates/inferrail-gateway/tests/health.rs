@@ -318,3 +318,52 @@ async fn the_ejection_cap_is_configurable() {
         assert_eq!(ejected(&gw), cap, "max_ejection_percent {percent}");
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn requests_waiting_on_a_replica_that_fails_its_probes_move_elsewhere() {
+    let sims = [
+        Upstream::spawn(sim_config(&[MODEL], decode(1.0))).await,
+        Upstream::spawn(sim_config(&[MODEL], decode(1.0))).await,
+    ];
+    let gw = Arc::new(
+        TestGateway::start(fleet(
+            &all(&sims),
+            &format!(
+                "{FAST_HEALTH}server:\n  request_timeout: 10s\nrouting:\n  default_policy: round_robin\n"
+            ),
+        ))
+        .await,
+    );
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    sims[0].set_fault(Fault::Hang);
+    let started = Instant::now();
+    let mut tasks = Vec::new();
+    for i in 0..10 {
+        let gw = Arc::clone(&gw);
+        tasks.push(tokio::spawn(async move {
+            let body = if i % 2 == 0 {
+                chat("x", 2)
+            } else {
+                streaming(chat("x", 2))
+            };
+            let response = gw.post("/v1/chat/completions", &body).await;
+            let replica = response.headers()["x-inferrail-replica"]
+                .to_str()
+                .unwrap()
+                .to_owned();
+            (response.status(), replica)
+        }));
+    }
+    for task in tasks {
+        let (status, replica) = task.await.unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(replica, "r1");
+    }
+    let took = started.elapsed();
+    assert!(
+        sims[0].hits() > 0,
+        "some requests did wait on the hung replica"
+    );
+    assert!(took < Duration::from_secs(2), "{took:?}");
+    gw.wait_idle().await;
+}

@@ -40,8 +40,10 @@ streaming and add memory proportional to output length.
   `Authorization` included. Every response carries `x-request-id` (the
   client's own when well formed) and `x-inferrail-replica`.
 * **Retry only before the first byte.** An attempt is retryable when the
-  connection fails, the replica closes before answering, or it answers 502,
-  503 or 504. A 500 or any 4xx is passed through: it describes the request,
+  connection fails, the replica closes before answering, it answers 502,
+  503 or 504, or it fails its health checks while the attempt still waits
+  for a response head; a hung engine would otherwise hold those requests
+  until the deadline. A 500 or any 4xx is passed through: it describes the request,
   not the replica. Retries prefer replicas the request has not tried, back
   off exponentially from `retry.backoff`, stop at `retry.max_attempts`, and
   all share the `server.request_timeout` deadline. The gateway commits to a

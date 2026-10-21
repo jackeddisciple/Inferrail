@@ -136,7 +136,8 @@ background, so listing never calls an engine.
 
 **Retries.** A request moves to another replica only before the first
 response byte reaches the client: when the connection fails, the replica
-closes before answering, or it answers 502, 503 or 504. Untried replicas come
+closes before answering, it answers 502, 503 or 504, or it fails its health
+checks while the request is still waiting for an answer. Untried replicas come
 first, attempts stop at `retry.max_attempts` with exponential backoff, and
 everything shares the `server.request_timeout` deadline. A stream that
 breaks after it started is never replayed. The reasoning is in

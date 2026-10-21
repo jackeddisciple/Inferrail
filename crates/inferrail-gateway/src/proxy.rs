@@ -280,7 +280,26 @@ async fn forward(
         Ok(request) => request,
         Err(err) => return Attempt::Fatal(err),
     };
-    let response = match timeout_at(deadline, shared.client.request(request)).await {
+    let went_down = replica.health().went_down().notified();
+    tokio::pin!(went_down);
+    went_down.as_mut().enable();
+    let waiting = async {
+        if !replica.health().probe_up() {
+            return None;
+        }
+        tokio::select! {
+            result = timeout_at(deadline, shared.client.request(request)) => Some(result),
+            () = &mut went_down => None,
+        }
+    };
+    let Some(answer) = waiting.await else {
+        tracing::debug!(replica = %replica.id(), "replica failed its health checks while the request waited");
+        return Attempt::Retry(Err(GatewayError::bad_gateway(format!(
+            "replica {} failed its health checks before responding",
+            replica.id()
+        ))));
+    };
+    let response = match answer {
         Ok(Ok(response)) => response,
         Ok(Err(err)) => {
             record_failure(shared, &replica);
