@@ -53,7 +53,14 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let config = Config::load(&args.config)
         .with_context(|| format!("cannot load {}", args.config.display()))?;
+    let filter = args.log.as_deref().unwrap_or(&config.logging.level);
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::try_new(filter).context("invalid log filter")?)
+        .init();
+    let addr = config.server.listen;
+    let gateway = Gateway::new(config)?;
     if args.check {
+        let config = gateway.config();
         println!(
             "{}: {} models, {} replicas, {} DNS groups",
             args.config.display(),
@@ -63,12 +70,6 @@ async fn main() -> anyhow::Result<()> {
         );
         return Ok(());
     }
-    let filter = args.log.as_deref().unwrap_or(&config.logging.level);
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_new(filter).context("invalid log filter")?)
-        .init();
-    let addr = config.server.listen;
-    let gateway = Gateway::new(config)?;
     let listener = TcpListener::bind(addr)
         .await
         .with_context(|| format!("cannot bind {addr}"))?;

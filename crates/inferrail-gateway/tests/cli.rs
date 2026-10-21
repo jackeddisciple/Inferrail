@@ -61,6 +61,23 @@ fn check_accepts_shipped_configs_and_rejects_bad_ones() {
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("scheme must be http or https"));
 
+    let https = temp_config(
+        "https",
+        "models: [{name: m}]\nreplicas: [{id: r, url: 'https://engine.internal:8443', models: [m]}]\n",
+    );
+    let out = Command::new(BIN)
+        .arg("--check")
+        .arg("-c")
+        .arg(&https)
+        .output()
+        .expect("run");
+    let _ = std::fs::remove_file(&https);
+    assert!(
+        !out.status.success(),
+        "check must refuse what startup refuses"
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("uses https"));
+
     let out = Command::new(BIN)
         .args(["--check", "-c", "/no/such/file.yaml"])
         .output()
