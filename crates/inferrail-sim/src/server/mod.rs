@@ -23,6 +23,7 @@ use tokio::net::TcpListener;
 use xxhash_rust::xxh3::xxh3_128;
 
 use crate::engine::{Engine, EngineConfig, Sequence};
+use crate::metrics::{self, Metrics};
 use crate::tokenizer;
 use wire::Meta;
 
@@ -70,6 +71,7 @@ struct AppState {
     config: SimConfig,
     names: Vec<String>,
     engine: Engine,
+    metrics: Arc<Metrics>,
     started_unix: u64,
     requests: AtomicU64,
 }
@@ -93,10 +95,17 @@ impl Sim {
     pub fn new(config: SimConfig) -> Self {
         let engine = Engine::start(config.engine.clone());
         let names = config.served_names();
+        let metrics = Arc::new(Metrics::new(
+            names[0].clone(),
+            config.max_model_len,
+            config.engine.block_size,
+            config.engine.num_gpu_blocks,
+        ));
         Self {
             state: Arc::new(AppState {
                 names,
                 engine,
+                metrics,
                 started_unix: unix_now(),
                 requests: AtomicU64::new(0),
                 config,
@@ -112,12 +121,17 @@ impl Sim {
         &self.state.config
     }
 
+    pub fn metrics(&self) -> &Metrics {
+        &self.state.metrics
+    }
+
     pub fn router(&self) -> Router {
         Router::new()
             .route("/v1/chat/completions", post(chat_completions))
             .route("/v1/completions", post(completions))
             .route("/v1/models", get(models))
             .route("/health", get(health))
+            .route("/metrics", get(prometheus))
             .route("/version", get(version))
             .route("/reset_prefix_cache", post(reset_prefix_cache))
             .fallback(not_found)
@@ -410,17 +424,22 @@ fn cached_detail(state: &AppState, seq: &Sequence) -> Option<u64> {
 }
 
 async fn full_response(state: Arc<AppState>, plan: Plan) -> Result<Response, ApiError> {
-    let mut seq = state
-        .engine
-        .submit(&plan.prompt)
-        .admitted()
-        .await
-        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let mut tracker = state.metrics.tracker(plan.max_tokens);
+    let mut seq = match state.engine.submit(&plan.prompt).admitted().await {
+        Ok(seq) => seq,
+        Err(err) => {
+            tracker.finish(&FinishReason::Error);
+            return Err(ApiError::internal(err.to_string()));
+        }
+    };
+    tracker.admitted(&seq);
     let mut text = String::new();
     for (_, piece) in tokenizer::generate(plan.seed, plan.max_tokens) {
         seq.next_token().await;
+        tracker.token();
         text.push_str(&piece);
     }
+    tracker.finish(&plan.finish);
     let usage = wire::full_usage(
         plan.prompt.len() as u64,
         seq.generated() as u64,
@@ -447,20 +466,24 @@ fn frame(value: &impl Serialize) -> Bytes {
 
 fn stream_response(state: Arc<AppState>, plan: Plan) -> Response {
     let body = async_stream::stream! {
+        let mut tracker = state.metrics.tracker(plan.max_tokens);
         let admitted = state.engine.submit(&plan.prompt).admitted().await;
         let mut seq = match admitted {
             Ok(seq) => seq,
             Err(err) => {
+                tracker.finish(&FinishReason::Error);
                 yield Ok::<Bytes, Infallible>(frame(&ApiError::internal(err.to_string()).body));
                 yield Ok(Bytes::from_static(DONE_FRAME));
                 return;
             }
         };
+        tracker.admitted(&seq);
         let meta = plan.meta();
         let pieces = tokenizer::generate(plan.seed, plan.max_tokens);
         let last = pieces.len().saturating_sub(1);
         for (i, (_, piece)) in pieces.iter().enumerate() {
             seq.next_token().await;
+            tracker.token();
             let finish = (i == last).then_some(&plan.finish);
             match plan.endpoint {
                 Endpoint::Chat => {
@@ -485,6 +508,7 @@ fn stream_response(state: Arc<AppState>, plan: Plan) -> Response {
                 Endpoint::Completion => frame(&wire::completion_usage_chunk(meta, usage)),
             });
         }
+        tracker.finish(&plan.finish);
         drop(seq);
         yield Ok(Bytes::from_static(DONE_FRAME));
     };
@@ -510,6 +534,18 @@ async fn models(State(state): State<Arc<AppState>>) -> Response {
             &permission,
         ),
     )
+}
+
+async fn prometheus(State(state): State<Arc<AppState>>) -> Response {
+    let body = state.metrics.render(&state.engine.snapshot());
+    (
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static(metrics::CONTENT_TYPE),
+        )],
+        body,
+    )
+        .into_response()
 }
 
 async fn health() -> StatusCode {

@@ -48,7 +48,7 @@ pub struct EngineCounters {
     pub prefix_hits: AtomicU64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct EngineSnapshot {
     pub waiting: u64,
     pub running: u64,

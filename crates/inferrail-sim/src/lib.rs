@@ -3,5 +3,6 @@
 pub mod cache;
 pub mod engine;
 pub mod latency;
+pub mod metrics;
 pub mod server;
 pub mod tokenizer;
