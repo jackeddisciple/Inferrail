@@ -163,6 +163,9 @@ fn backoff(base: Duration, attempt: u32) -> Duration {
     base.saturating_mul(1 << attempt.saturating_sub(1).min(16))
 }
 
+/// Collects the body without keeping an allocation per frame: one frame is
+/// kept as it arrived, more are copied into a single buffer, so memory stays
+/// proportional to the body however finely the client chunks it.
 async fn read_body(
     headers: &HeaderMap,
     mut body: Incoming,
@@ -176,25 +179,35 @@ async fn read_body(
         drain(body, limit).await;
         return Err(GatewayError::too_large(limit));
     }
-    let mut chunks: Vec<Bytes> = Vec::new();
-    let mut total = 0;
+    let mut first: Option<Bytes> = None;
+    let mut joined: Vec<u8> = Vec::new();
     while let Some(frame) = body.frame().await {
         let frame =
             frame.map_err(|_| GatewayError::bad_request("could not read the request body"))?;
-        if let Ok(data) = frame.into_data() {
-            total += data.len();
-            if total > limit {
-                drain(body, limit).await;
-                return Err(GatewayError::too_large(limit));
+        let Ok(data) = frame.into_data() else {
+            continue;
+        };
+        if data.is_empty() {
+            continue;
+        }
+        let held = first.as_ref().map_or(joined.len(), Bytes::len);
+        if held + data.len() > limit {
+            drain(body, limit).await;
+            return Err(GatewayError::too_large(limit));
+        }
+        match first.take() {
+            None if joined.is_empty() => first = Some(data),
+            previous => {
+                if let Some(previous) = previous {
+                    let expected = declared.map_or(0, |len| len as usize).min(limit);
+                    joined.reserve(expected.max(previous.len() + data.len()));
+                    joined.extend_from_slice(&previous);
+                }
+                joined.extend_from_slice(&data);
             }
-            chunks.push(data);
         }
     }
-    Ok(match chunks.len() {
-        0 => Bytes::new(),
-        1 => chunks.swap_remove(0),
-        _ => Bytes::from(chunks.concat()),
-    })
+    Ok(first.unwrap_or_else(|| Bytes::from(joined)))
 }
 
 /// Resolves the requested name to a served model. The body is only

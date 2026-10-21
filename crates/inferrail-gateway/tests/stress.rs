@@ -523,3 +523,38 @@ async fn slow_readers_do_not_make_the_gateway_buffer() {
     assert!((held as usize) < total / 1024 / 8, "held {held} KiB");
     gw.wait_idle().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "stress"]
+async fn bodies_in_tiny_chunks_cost_about_their_size() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let raw = RawUpstream::spawn().await;
+    let gw = TestGateway::start(fleet(&[raw.url()], "server:\n  max_body_bytes: 16777216\n")).await;
+    let addr = gw.base.trim_start_matches("http://").to_owned();
+    let chunks = 8 << 20;
+    let block = b"1\r\n \r\n".repeat(64 * 1024);
+    let before = rss_kib();
+    let mut socket = tokio::net::TcpStream::connect(addr).await.unwrap();
+    socket
+        .write_all(b"POST /v1/completions HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n1\r\n{\r\n")
+        .await
+        .unwrap();
+    for _ in 0..chunks / (64 * 1024) {
+        socket.write_all(&block).await.unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let held = rss_kib().saturating_sub(before);
+    socket.write_all(b"1\r\n}\r\n0\r\n\r\n").await.unwrap();
+    let mut answer = vec![0u8; 64];
+    let n = socket.read(&mut answer).await.unwrap();
+    assert!(answer[..n].starts_with(b"HTTP/1.1 200"));
+    let seen = raw.take();
+    let inserted = format!("{{\"model\":\"{MODEL}\"");
+    assert!(seen[0].body.starts_with(inserted.as_bytes()));
+    assert_eq!(seen[0].body.len(), chunks + 1 + inserted.len());
+    println!(
+        "tiny chunks: an 8 MiB body in one byte chunks held {} KiB while arriving",
+        held
+    );
+    assert!(held < 32 * 1024, "held {held} KiB for an 8 MiB body");
+}

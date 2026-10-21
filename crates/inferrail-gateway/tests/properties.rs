@@ -131,6 +131,44 @@ proptest! {
     }
 
     #[test]
+    fn chunked_request_bodies_arrive_whole(
+        fields in prop::collection::btree_map("[a-z_]{1,12}", json_value(), 0..8),
+        cuts in prop::collection::vec(1usize..64, 1..400),
+    ) {
+        let env = env();
+        env.raw.script(Script::default());
+        let mut object: serde_json::Map<String, Value> =
+            fields.into_iter().filter(|(k, _)| k != "model").collect();
+        object.insert("model".to_owned(), json!(MODEL));
+        let body = serde_json::to_vec(&Value::Object(object)).unwrap();
+        let mut chunks = Vec::new();
+        let mut rest = body.as_slice();
+        for cut in cuts.iter().cycle() {
+            if rest.is_empty() {
+                break;
+            }
+            let (head, tail) = rest.split_at((*cut).min(rest.len()));
+            chunks.push(Ok::<_, std::io::Error>(Bytes::copy_from_slice(head)));
+            rest = tail;
+        }
+        let status = runtime().block_on(async {
+            env.gw
+                .client
+                .post(env.gw.url("/v1/completions"))
+                .body(reqwest::Body::wrap_stream(futures::stream::iter(chunks)))
+                .send()
+                .await
+                .expect("sent")
+                .status()
+                .as_u16()
+        });
+        prop_assert_eq!(status, 200);
+        let seen = env.raw.take();
+        prop_assert_eq!(seen.len(), 1);
+        prop_assert_eq!(seen[0].body.as_ref(), body.as_slice());
+    }
+
+    #[test]
     fn no_request_makes_the_gateway_fail(
         method in prop::sample::select(vec!["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"]),
         path in prop::sample::select(vec![
