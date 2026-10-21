@@ -851,15 +851,15 @@ dependencies = [
 
 [[package]]
 name = "inferrail-calibrate"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "inferrail-control"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "inferrail-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "humantime-serde",
  "proptest",
@@ -872,27 +872,27 @@ dependencies = [
 
 [[package]]
 name = "inferrail-events"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "inferrail-gateway"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "inferrail-index"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "inferrail-load"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "inferrail-policy"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "inferrail-sim"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -915,7 +915,7 @@ dependencies = [
 
 [[package]]
 name = "inferrail-tokenize"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "ipnet"

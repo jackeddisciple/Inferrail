@@ -42,8 +42,23 @@ jobs:
       - uses: astral-sh/setup-uv@v10.3.0
         with:
           working-directory: bench
+      - name: Lint
+        run: uv run --frozen ruff check . && uv run --frozen ruff format --check .
       - name: Tests
         run: uv run --frozen pytest -q
+
+  supply-chain:
+    name: Dependencies
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit,cargo-machete
+      - name: Advisories
+        run: cargo audit --deny warnings
+      - name: Unused dependencies
+        run: cargo machete
 
   e2e:
     name: OpenAI SDK against the simulator

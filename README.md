@@ -12,7 +12,7 @@ most of its prompt in cache, without letting any replica overload.
 The goal is lower tail latency and fewer GPUs for the same traffic, proven
 with benchmarks anyone can rerun.
 
-> **Status: v0.1.0, foundations.** This release ships the workspace, the
+> **Status: v0.1.1, foundations.** This release ships the workspace, the
 > shared wire types and configuration, and `inferrail-sim`, a mock vLLM
 > engine that the rest of the project is built and benchmarked against. The
 > gateway, index and routing policies are scaffolded crates and not usable
@@ -43,7 +43,7 @@ the cache away. Inferrail treats routing as a cost estimate instead: for each
 replica, how long until this request's first token, given what is cached
 there and what is queued there?
 
-## What is in v0.1.0
+## What is in v0.1.1
 
 | Piece | What it does |
 | --- | --- |
@@ -103,8 +103,9 @@ it behaves the same on vLLM.
 **Wire format.** Chat and completion responses, stream chunks, the usage
 chunk, `data: [DONE]`, model cards and error bodies match vLLM v0.31.0 byte
 for byte, including which fields are omitted and which are explicit `null`.
-Parity tests compare the simulator against fixtures derived from that
-version's source.
+Request validation follows vLLM as well; for example a non empty
+`stream_options` without `stream: true` is a 400. Parity tests compare the
+simulator against fixtures derived from that version's source.
 
 **Endpoints.** `POST /v1/chat/completions`, `POST /v1/completions`,
 `GET /v1/models`, `GET /health`, `GET /metrics`, `GET /version` and
@@ -159,7 +160,9 @@ Useful flags (all names follow vLLM where one exists):
 | `--zero-latency` | off | answer as fast as possible, for overhead benchmarks |
 
 Not modeled yet: decode interference inside a continuous batch, preemption,
-KV events, caching of generated blocks, `n > 1`, logprobs and stop strings.
+KV events and caching of generated blocks. Requests that need `n > 1`,
+logprobs, `echo` or `best_of` get a 400 naming the parameter instead of an
+answer that silently differs from vLLM; stop strings are ignored.
 
 ## Configuration
 
@@ -186,12 +189,20 @@ option.
 
 ## Testing
 
-`make check` runs formatting, clippy with warnings denied, every Rust test
-and the Python tests. Beyond unit tests the suite includes:
+`make check` runs formatting, clippy with warnings denied, ruff, every Rust
+test and the Python tests. `make audit` checks dependencies against the
+RustSec advisory database and for unused crates; CI runs it on every push. Beyond unit tests the suite includes:
 
-* **Property tests** for SSE decoding under any chunking, prefix stability of
-  the tokenizer, block hash chaining, the LRU against a naive reference
-  model, latency monotonicity and config round trips.
+* **Property tests** for SSE decoding of arbitrary bytes under any chunking,
+  prefix stability of the tokenizer, block hash chaining, the LRU against a
+  naive reference model, latency monotonicity and config round trips.
+* **Fuzzing**: thousands of random request and response bodies must round
+  trip losslessly whenever a wire type accepts them; random engine schedules
+  with cancellations run on a paused clock and must keep FIFO admission, the
+  sequence cap and clean accounting; random HTTP requests must get responses
+  that obey the vLLM contract, streamed or not.
+* **Hostile config**: deeply nested and alias bomb YAML is rejected in
+  milliseconds, and credentials in replica URLs are refused.
 * **Fixture tests**: OpenAI payloads must round trip canonically and vLLM
   payloads byte for byte.
 * **Parity tests** holding the simulator's streams, responses, errors and

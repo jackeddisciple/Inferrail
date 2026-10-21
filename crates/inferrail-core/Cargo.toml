@@ -11,6 +11,9 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[package.metadata.cargo-machete]
+ignored = ["humantime-serde"]
+
 [dependencies]
 humantime-serde.workspace = true
 serde.workspace = true

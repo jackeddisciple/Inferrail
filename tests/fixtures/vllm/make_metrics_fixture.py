@@ -14,12 +14,74 @@ MAX_MODEL_LEN = 32768
 LABELS = ["model_name", "engine"]
 VALUES = {"model_name": MODEL, "engine": "0"}
 
-REQUEST_LATENCY = [0.3, 0.5, 0.8, 1.0, 1.5, 2.0, 2.5, 5.0, 10.0, 15.0, 20.0, 30.0, 40.0,
-                   50.0, 60.0, 120.0, 240.0, 480.0, 960.0, 1920.0, 7680.0]
-TTFT = [0.001, 0.005, 0.01, 0.02, 0.04, 0.06, 0.08, 0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0,
-        7.5, 10.0, 20.0, 40.0, 80.0, 160.0, 640.0, 2560.0]
-ITL = [0.01, 0.025, 0.05, 0.075, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5,
-       10.0, 20.0, 40.0, 80.0]
+REQUEST_LATENCY = [
+    0.3,
+    0.5,
+    0.8,
+    1.0,
+    1.5,
+    2.0,
+    2.5,
+    5.0,
+    10.0,
+    15.0,
+    20.0,
+    30.0,
+    40.0,
+    50.0,
+    60.0,
+    120.0,
+    240.0,
+    480.0,
+    960.0,
+    1920.0,
+    7680.0,
+]
+TTFT = [
+    0.001,
+    0.005,
+    0.01,
+    0.02,
+    0.04,
+    0.06,
+    0.08,
+    0.1,
+    0.25,
+    0.5,
+    0.75,
+    1.0,
+    2.5,
+    5.0,
+    7.5,
+    10.0,
+    20.0,
+    40.0,
+    80.0,
+    160.0,
+    640.0,
+    2560.0,
+]
+ITL = [
+    0.01,
+    0.025,
+    0.05,
+    0.075,
+    0.1,
+    0.15,
+    0.2,
+    0.3,
+    0.4,
+    0.5,
+    0.75,
+    1.0,
+    2.5,
+    5.0,
+    7.5,
+    10.0,
+    20.0,
+    40.0,
+    80.0,
+]
 ITERATION = [1, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384]
 PARAMS_N = [1, 2, 5, 10, 20]
 PREEMPTIONS = [1, 2, 3, 4, 5, 10, 20]
@@ -69,7 +131,9 @@ sleep = gauge(
     ["sleep_state"],
 )
 kv_usage = gauge("vllm:kv_cache_usage_perc", "KV-cache usage. 1 means 100 percent usage.")
-queries = counter("vllm:prefix_cache_queries", "Prefix cache queries, in terms of number of queried tokens.")
+queries = counter(
+    "vllm:prefix_cache_queries", "Prefix cache queries, in terms of number of queried tokens."
+)
 hits = counter("vllm:prefix_cache_hits", "Prefix cache hits, in terms of number of cached tokens.")
 ext_queries = counter(
     "vllm:external_prefix_cache_queries",
@@ -81,40 +145,70 @@ ext_hits = counter(
     "External prefix cache hits from KV connector cross-instance cache sharing, in terms of "
     "number of cached tokens.",
 )
-mm_queries = counter("vllm:mm_cache_queries", "Multi-modal cache queries, in terms of number of queried items.")
-mm_hits = counter("vllm:mm_cache_hits", "Multi-modal cache hits, in terms of number of cached items.")
+mm_queries = counter(
+    "vllm:mm_cache_queries", "Multi-modal cache queries, in terms of number of queried items."
+)
+mm_hits = counter(
+    "vllm:mm_cache_hits", "Multi-modal cache hits, in terms of number of cached items."
+)
 preemptions = counter("vllm:num_preemptions", "Cumulative number of preemption from the engine.")
 prompt_tokens = counter("vllm:prompt_tokens", "Number of prefill tokens processed.")
-by_source = counter("vllm:prompt_tokens_by_source", "Number of prompt tokens by source.", ["source"])
+by_source = counter(
+    "vllm:prompt_tokens_by_source", "Number of prompt tokens by source.", ["source"]
+)
 cached = counter("vllm:prompt_tokens_cached", "Number of cached prompt tokens (local + external).")
 generation = counter("vllm:generation_tokens", "Number of generation tokens processed.")
-success = counter("vllm:request_success", "Count of successfully processed requests.", ["finished_reason"])
+success = counter(
+    "vllm:request_success", "Count of successfully processed requests.", ["finished_reason"]
+)
 req_prompt = hist("vllm:request_prompt_tokens", "Number of prefill tokens processed.", TOKENS)
 req_gen = hist("vllm:request_generation_tokens", "Number of generation tokens processed.", TOKENS)
-iteration = hist("vllm:iteration_tokens_total", "Histogram of number of tokens per engine_step.", ITERATION)
+iteration = hist(
+    "vllm:iteration_tokens_total", "Histogram of number of tokens per engine_step.", ITERATION
+)
 max_gen = hist(
     "vllm:request_max_num_generation_tokens",
     "Histogram of maximum number of requested generation tokens.",
     TOKENS,
 )
 params_n = hist("vllm:request_params_n", "Histogram of the n request parameter.", PARAMS_N)
-params_max = hist("vllm:request_params_max_tokens", "Histogram of the max_tokens request parameter.", TOKENS)
-ttft = hist("vllm:time_to_first_token_seconds", "Histogram of time to first token in seconds.", TTFT)
+params_max = hist(
+    "vllm:request_params_max_tokens", "Histogram of the max_tokens request parameter.", TOKENS
+)
+ttft = hist(
+    "vllm:time_to_first_token_seconds", "Histogram of time to first token in seconds.", TTFT
+)
 itl = hist("vllm:inter_token_latency_seconds", "Histogram of inter-token latency in seconds.", ITL)
 tpot = hist(
     "vllm:request_time_per_output_token_seconds",
     "Histogram of time_per_output_token_seconds per request.",
     ITL,
 )
-e2e = hist("vllm:e2e_request_latency_seconds", "Histogram of e2e request latency in seconds.", REQUEST_LATENCY)
-queue = hist("vllm:request_queue_time_seconds", "Histogram of time spent in WAITING phase for request.", REQUEST_LATENCY)
+e2e = hist(
+    "vllm:e2e_request_latency_seconds",
+    "Histogram of e2e request latency in seconds.",
+    REQUEST_LATENCY,
+)
+queue = hist(
+    "vllm:request_queue_time_seconds",
+    "Histogram of time spent in WAITING phase for request.",
+    REQUEST_LATENCY,
+)
 inference = hist(
     "vllm:request_inference_time_seconds",
     "Histogram of time spent in RUNNING phase for request.",
     REQUEST_LATENCY,
 )
-prefill = hist("vllm:request_prefill_time_seconds", "Histogram of time spent in PREFILL phase for request.", REQUEST_LATENCY)
-decode = hist("vllm:request_decode_time_seconds", "Histogram of time spent in DECODE phase for request.", REQUEST_LATENCY)
+prefill = hist(
+    "vllm:request_prefill_time_seconds",
+    "Histogram of time spent in PREFILL phase for request.",
+    REQUEST_LATENCY,
+)
+decode = hist(
+    "vllm:request_decode_time_seconds",
+    "Histogram of time spent in DECODE phase for request.",
+    REQUEST_LATENCY,
+)
 req_preempt = hist(
     "vllm:request_num_preemptions",
     "Histogram of the number of times a request was preempted.",

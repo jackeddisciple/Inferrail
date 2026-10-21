@@ -3,6 +3,56 @@
 Notable changes to Inferrail. Versions follow
 [Semantic Versioning](https://semver.org).
 
+## [0.1.1] (21 October 2026)
+
+A hardening pass over everything in 0.1.0, driven by a new round of
+property, fuzz, mutation and load testing.
+
+### Fixed
+
+* SSE decoder: after an invalid UTF-8 line it kept already decoded lines in
+  its buffer, so a caller that kept pushing saw events twice, and an
+  oversized line kept growing the buffer. Errors are now terminal. A
+  leading byte order mark is stripped, as the event stream spec requires.
+* Wire types: some JSON floats changed in their last digit after a parse
+  and serialize cycle. Floats now round trip exactly.
+* Simulator: a streamed request held its sequence slot and KV blocks until
+  the client read `[DONE]`. It now finishes at its last token, as in vLLM.
+* Simulator: decoding in zero latency mode never yielded to the runtime and
+  could starve other requests on the same worker thread.
+* Simulator: `stream_options` without `stream: true` was accepted. It now
+  gets vLLM's 400 with `param` set to `stream_options`.
+* Simulator: `logprobs`, `prompt_logprobs`, `echo` and `best_of` were
+  silently ignored. They now get a 400 that names the parameter.
+* Simulator: a wrong HTTP method got an empty 405; it now gets vLLM's JSON
+  body.
+* Simulator: histogram `_count` is derived from the buckets, so a scrape
+  can never see it below a cumulative bucket.
+* Config: replica URLs with embedded credentials and replicas that list a
+  model twice were accepted; both are now rejected. An alias equal to its
+  own model name gets a clear message.
+
+### Changed
+
+* Config YAML is parsed by `serde-saphyr`, a maintained pure Rust parser,
+  instead of `serde_yaml_ng`, which pulled in the unmaintained
+  `unsafe-libyaml` (`RUSTSEC-2024-0449`). Deeply nested input now fails in
+  milliseconds instead of about 30 seconds, and errors report line and
+  column.
+* `Sim::new` validates its config and returns an error instead of failing
+  later inside a request.
+* The unused `bytes` dependency is gone and `futures` is only used by tests.
+
+### Added
+
+* Property and fuzz suites: wire types must round trip whatever they
+  accept; random engine schedules with cancellations must keep FIFO
+  admission, the sequence cap and clean accounting; random chat requests
+  must get responses that obey the vLLM contract; streamed and full
+  responses must carry the same text; hostile YAML must fail fast.
+* `make audit` and a CI job that runs `cargo audit` and `cargo machete`, and
+  ruff lint and format checks for the Python code.
+
 ## [0.1.0] (21 October 2026)
 
 The first release: project foundations and a faithful vLLM simulator.
@@ -62,4 +112,5 @@ The first release: project foundations and a faithful vLLM simulator.
   disconnect storms, malformed bodies, long prompts and a memory soak.
 * OpenAI Python SDK suite, sync and async, against the simulator binary.
 
-[0.1.0]: https://github.com/jackeddisciple/Inferrail/tree/main
+[0.1.1]: https://github.com/jackeddisciple/Inferrail/tree/main
+[0.1.0]: https://github.com/jackeddisciple/Inferrail/tree/1bb0c4501423ae6499844e25290da8a7b04793aa

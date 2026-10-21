@@ -2,7 +2,7 @@ CARGO ?= cargo
 UV ?= uv
 NEXTEST := $(shell $(CARGO) nextest --version >/dev/null 2>&1 && echo "nextest run" || echo "test")
 
-.PHONY: check fmt lint test test-rust test-python bench e2e stress report
+.PHONY: check fmt lint audit test test-rust test-python bench e2e stress report
 
 check: fmt lint test
 
@@ -11,6 +11,11 @@ fmt:
 
 lint:
 	$(CARGO) clippy --workspace --all-targets -- -D warnings
+	cd bench && $(UV) run --frozen ruff check . && $(UV) run --frozen ruff format --check .
+
+audit:
+	$(CARGO) audit
+	$(CARGO) machete
 
 test: test-rust test-python
 

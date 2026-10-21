@@ -26,22 +26,32 @@ def _binary() -> Path:
 
 
 @pytest.fixture(scope="session")
-def sim_base_url():
+def sim_base_url(tmp_path_factory):
     port = _free_port()
+    log_path = tmp_path_factory.mktemp("sim") / "inferrail-sim.log"
+    log = log_path.open("wb")
     process = subprocess.Popen(
         [
             str(_binary()),
-            "--host", "127.0.0.1",
-            "--port", str(port),
-            "--served-model-name", MODEL, "sim-alias",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+            "--served-model-name",
+            MODEL,
+            "sim-alias",
             "--enable-prompt-tokens-details",
-            "--prefill-token-us", "20",
-            "--prefill-fixed-ms", "1",
-            "--decode-token-ms", "1",
-            "--max-num-seqs", "1024",
+            "--prefill-token-us",
+            "20",
+            "--prefill-fixed-ms",
+            "1",
+            "--decode-token-ms",
+            "1",
+            "--max-num-seqs",
+            "1024",
         ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
+        stdout=log,
+        stderr=subprocess.STDOUT,
     )
     deadline = time.monotonic() + 15
     while True:
@@ -51,7 +61,8 @@ def sim_base_url():
                     break
         except OSError:
             if process.poll() is not None:
-                pytest.fail(f"simulator exited: {process.stderr.read().decode()}")
+                log.close()
+                pytest.fail(f"simulator exited: {log_path.read_text()[-2000:]}")
             if time.monotonic() > deadline:
                 process.kill()
                 pytest.fail("simulator did not become healthy")
@@ -59,6 +70,7 @@ def sim_base_url():
     yield f"http://127.0.0.1:{port}"
     process.terminate()
     process.wait(timeout=10)
+    log.close()
 
 
 @pytest.fixture
