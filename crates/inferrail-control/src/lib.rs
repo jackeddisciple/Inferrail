@@ -1,11 +1,7 @@
 //! Replica discovery, health, admission, rate limits and the admin API.
 
-pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
+pub mod fleet;
+pub mod replica;
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn crate_name_matches_package() {
-        assert_eq!(super::CRATE_NAME, "inferrail-control");
-    }
-}
+pub use fleet::{Fleet, MembershipChange, Registry};
+pub use replica::{Endpoint, Lease, Limits, Origin, Replica, ReplicaSpec};

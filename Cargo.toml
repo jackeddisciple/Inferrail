@@ -13,6 +13,7 @@ publish = false
 [workspace.dependencies]
 inferrail-core = { path = "crates/inferrail-core" }
 anyhow = "1.0.104"
+arc-swap = "1.9.3"
 async-stream = "0.3.6"
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio", "tracing"] }
 clap = { version = "4.6.7", features = ["derive", "env"] }
