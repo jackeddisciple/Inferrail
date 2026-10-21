@@ -3,7 +3,7 @@
 Notable changes to Inferrail. Versions follow
 [Semantic Versioning](https://semver.org).
 
-## [0.1.4] Bug fixes and Improvements (21 October 2026)
+## [0.1.3] Bug fixes and Improvements (21 October 2026)
 
 Fixes from a second sweep over the gateway, policies and control plane.
 
@@ -42,7 +42,7 @@ Fixes from a second sweep over the gateway, policies and control plane.
 * `health.max_ejection_percent`, the cap on passive ejection.
 * Tests for each fix, and a stress test for bodies sent in tiny chunks.
 
-## [0.1.3] OpenAI Compatible Gateway, Baseline Routing Policies and Failure Handling (21 October 2026)
+## [0.1.2] OpenAI Compatible Gateway, Baseline Routing Policies and Failure Handling (21 October 2026)
 
 The gateway becomes usable: it routes chat and completions across a fleet
 of engines with a choice of baseline policies, streams responses untouched,
