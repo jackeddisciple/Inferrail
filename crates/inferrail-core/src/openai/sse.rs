@@ -4,6 +4,7 @@ pub const DONE_DATA: &str = "[DONE]";
 pub const DONE_FRAME: &[u8] = b"data: [DONE]\n\n";
 
 const DEFAULT_MAX_LINE: usize = 16 * 1024 * 1024;
+const BOM: &[u8] = "\u{feff}".as_bytes();
 
 /// Frames one JSON payload. Compact JSON never contains a raw newline.
 pub fn data_frame(payload: &[u8]) -> Vec<u8> {
@@ -36,14 +37,17 @@ pub enum SseError {
 }
 
 /// Incremental decoder that accepts the stream in arbitrary byte chunks.
+/// After an error the stream is unrecoverable and every later push fails.
 #[derive(Debug)]
 pub struct SseDecoder {
     buf: Vec<u8>,
+    started: bool,
     skip_lf: bool,
     data: String,
     has_data: bool,
     event: Option<String>,
     max_line: usize,
+    failed: Option<SseError>,
 }
 
 impl Default for SseDecoder {
@@ -56,49 +60,70 @@ impl SseDecoder {
     pub fn with_max_line(max_line: usize) -> Self {
         Self {
             buf: Vec::new(),
+            started: false,
             skip_lf: false,
             data: String::new(),
             has_data: false,
             event: None,
             max_line,
+            failed: None,
         }
     }
 
     pub fn push(&mut self, chunk: &[u8], out: &mut Vec<SseEvent>) -> Result<(), SseError> {
-        self.buf.extend_from_slice(chunk);
+        if let Some(err) = &self.failed {
+            return Err(err.clone());
+        }
+        let result = self.consume(chunk, out);
+        if let Err(err) = &result {
+            self.failed = Some(err.clone());
+            self.buf = Vec::new();
+        }
+        result
+    }
+
+    fn consume(&mut self, chunk: &[u8], out: &mut Vec<SseEvent>) -> Result<(), SseError> {
+        let mut buf = std::mem::take(&mut self.buf);
+        buf.extend_from_slice(chunk);
         let mut start = 0;
-        while start < self.buf.len() {
+        if !self.started {
+            if buf.len() < BOM.len() && BOM.starts_with(&buf) {
+                self.buf = buf;
+                return Ok(());
+            }
+            self.started = true;
+            if buf.starts_with(BOM) {
+                start = BOM.len();
+            }
+        }
+        while start < buf.len() {
             if self.skip_lf {
                 self.skip_lf = false;
-                if self.buf[start] == b'\n' {
+                if buf[start] == b'\n' {
                     start += 1;
                     continue;
                 }
             }
-            let Some(offset) = self.buf[start..]
-                .iter()
-                .position(|&b| b == b'\n' || b == b'\r')
-            else {
+            let Some(offset) = buf[start..].iter().position(|&b| b == b'\n' || b == b'\r') else {
                 break;
             };
             let end = start + offset;
-            self.skip_lf = self.buf[end] == b'\r';
-            let line = std::str::from_utf8(&self.buf[start..end])
-                .map_err(|_| SseError::InvalidUtf8)?
-                .to_owned();
-            self.process_line(&line, out);
+            self.skip_lf = buf[end] == b'\r';
+            let line = std::str::from_utf8(&buf[start..end]).map_err(|_| SseError::InvalidUtf8)?;
+            self.process_line(line, out);
             start = end + 1;
         }
-        self.buf.drain(..start);
-        if self.buf.len() > self.max_line {
+        buf.drain(..start);
+        if buf.len() > self.max_line {
             return Err(SseError::LineTooLong(self.max_line));
         }
+        self.buf = buf;
         Ok(())
     }
 
     /// True when every byte pushed so far belongs to a completed event.
     pub fn is_idle(&self) -> bool {
-        self.buf.is_empty() && !self.has_data && self.event.is_none()
+        self.failed.is_none() && self.buf.is_empty() && !self.has_data && self.event.is_none()
     }
 
     fn process_line(&mut self, line: &str, out: &mut Vec<SseEvent>) {
@@ -226,6 +251,56 @@ mod tests {
         );
     }
 
+    #[test]
+    fn leading_byte_order_mark_is_stripped_even_when_split() {
+        let mut stream = "\u{feff}".as_bytes().to_vec();
+        stream.extend_from_slice(b"data: first\n\n");
+        assert_eq!(decode_all(&[&stream]), vec![data("first")]);
+        assert_eq!(
+            decode_all(&[&stream[..1], &stream[1..2], &stream[2..]]),
+            vec![data("first")]
+        );
+        let mut later = b"data: a\n\n".to_vec();
+        later.extend_from_slice("\u{feff}data: b\n\n".as_bytes());
+        assert_eq!(decode_all(&[&later]), vec![data("a")]);
+    }
+
+    #[test]
+    fn errors_are_terminal_and_never_replay_events() {
+        let mut decoder = SseDecoder::default();
+        let mut out = Vec::new();
+        assert_eq!(
+            decoder.push(b"data: ok\n\ndata: \xff\n\n", &mut out),
+            Err(SseError::InvalidUtf8)
+        );
+        assert_eq!(out, vec![data("ok")]);
+        assert_eq!(
+            decoder.push(b"data: more\n\n", &mut out),
+            Err(SseError::InvalidUtf8)
+        );
+        assert_eq!(out.len(), 1);
+        assert!(!decoder.is_idle());
+
+        let mut decoder = SseDecoder::with_max_line(4);
+        assert!(decoder.push(b"data: way too long", &mut out).is_err());
+        assert_eq!(
+            decoder.push(b"\n\n", &mut out),
+            Err(SseError::LineTooLong(4))
+        );
+        assert_eq!(decoder.buf.capacity(), 0);
+    }
+
+    fn decode_lossy(chunks: &[&[u8]]) -> (Vec<SseEvent>, Option<SseError>) {
+        let mut decoder = SseDecoder::default();
+        let mut out = Vec::new();
+        for chunk in chunks {
+            if let Err(err) = decoder.push(chunk, &mut out) {
+                return (out, Some(err));
+            }
+        }
+        (out, None)
+    }
+
     fn arb_event() -> impl Strategy<Value = SseEvent> {
         (
             proptest::option::of("[a-z_]{1,8}"),
@@ -269,6 +344,36 @@ mod tests {
             }
             chunks.push(&bytes[last..]);
             prop_assert_eq!(decode_all(&chunks), events);
+        }
+
+        #[test]
+        fn arbitrary_bytes_decode_the_same_under_any_chunking(
+            bytes in proptest::collection::vec(
+                prop_oneof![
+                    4 => any::<u8>(),
+                    3 => prop::sample::select(b"\r\n: datavent".to_vec()),
+                ],
+                0..300,
+            ),
+            cuts in proptest::collection::vec(any::<prop::sample::Index>(), 0..16),
+        ) {
+            let whole = decode_lossy(&[&bytes]);
+            let mut points: Vec<usize> = cuts.iter().map(|c| c.index(bytes.len() + 1)).collect();
+            points.sort_unstable();
+            let mut chunks = Vec::new();
+            let mut last = 0;
+            for p in points {
+                chunks.push(&bytes[last..p]);
+                last = p;
+            }
+            chunks.push(&bytes[last..]);
+            let split = decode_lossy(&chunks);
+            prop_assert_eq!(split.1.is_some(), whole.1.is_some());
+            if whole.1.is_none() {
+                prop_assert_eq!(split.0, whole.0);
+            } else {
+                prop_assert!(whole.0.starts_with(&split.0) || split.0.starts_with(&whole.0));
+            }
         }
     }
 }

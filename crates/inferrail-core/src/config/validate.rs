@@ -123,9 +123,12 @@ impl Config {
             for (j, alias) in model.aliases.iter().enumerate() {
                 let at = format!("{path}.aliases[{j}]");
                 if alias.is_empty() || alias.chars().any(char::is_whitespace) {
-                    c.push(at.clone(), "must be non empty without whitespace");
+                    c.push(at, "must be non empty without whitespace");
+                } else if alias == own {
+                    c.push(at, "repeats the model name");
+                } else {
+                    claim_name(&mut names, alias, at, &path, c);
                 }
-                claim_name(&mut names, alias, at, &path, c);
             }
             if model.block_size == 0 || model.block_size > MAX_BLOCK_SIZE {
                 c.push(
@@ -167,6 +170,12 @@ impl Config {
             if url.query().is_some() || url.fragment().is_some() {
                 c.push(format!("{path}.url"), "must not carry a query or fragment");
             }
+            if !url.username().is_empty() || url.password().is_some() {
+                c.push(
+                    format!("{path}.url"),
+                    "must not embed credentials; they would leak into logs and metrics",
+                );
+            }
             if let Some(first) = urls.insert(url.as_str(), i) {
                 c.push(
                     format!("{path}.url"),
@@ -177,6 +186,12 @@ impl Config {
                 c.push(format!("{path}.models"), "must list at least one model");
             }
             for (j, model) in replica.models.iter().enumerate() {
+                if replica.models[..j].contains(model) {
+                    c.push(
+                        format!("{path}.models[{j}]"),
+                        format!("lists {:?} twice", model.as_str()),
+                    );
+                }
                 if !known.contains(model.as_str()) {
                     c.push(
                         format!("{path}.models[{j}]"),
@@ -318,6 +333,43 @@ replicas:
         let mut config = base();
         config.models[1].aliases = vec!["llama-8b".into()];
         assert!(only_issue(&config).contains("already used by models[0]"));
+    }
+
+    #[test]
+    fn alias_repeating_its_own_name_says_so() {
+        let mut config = base();
+        config.models[0].aliases = vec!["llama-8b".into()];
+        assert_eq!(
+            only_issue(&config),
+            "models[0].aliases[0]: repeats the model name"
+        );
+    }
+
+    #[test]
+    fn credentials_in_replica_urls_are_rejected() {
+        for url in [
+            "http://user:secret@10.0.0.9:8000",
+            "http://token@10.0.0.9:8000",
+        ] {
+            let mut config = base();
+            config.replicas.push(replica("r9", url, &["llama-8b"]));
+            assert!(
+                only_issue(&config).contains("must not embed credentials"),
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn replica_listing_a_model_twice_is_rejected() {
+        let mut config = base();
+        config.replicas[1]
+            .models
+            .push(ModelId::new("llama-8b").unwrap());
+        assert_eq!(
+            only_issue(&config),
+            "replicas[1].models[1]: lists \"llama-8b\" twice"
+        );
     }
 
     #[test]

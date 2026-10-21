@@ -26,7 +26,9 @@ pub enum ConfigError {
         source: std::io::Error,
     },
     #[error("cannot parse config: {0}")]
-    Parse(#[from] serde_yaml_ng::Error),
+    Parse(#[from] serde_saphyr::Error),
+    #[error("cannot render config: {0}")]
+    Render(#[from] serde_saphyr::SerializeError),
     #[error("invalid config: {0}")]
     Invalid(ConfigIssues),
 }
@@ -57,7 +59,7 @@ impl Config {
     }
 
     pub fn parse_unvalidated(text: &str) -> Result<Self, ConfigError> {
-        Ok(serde_yaml_ng::from_str(text)?)
+        Ok(serde_saphyr::from_str(text)?)
     }
 
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
@@ -70,7 +72,7 @@ impl Config {
     }
 
     pub fn to_yaml_string(&self) -> Result<String, ConfigError> {
-        Ok(serde_yaml_ng::to_string(self)?)
+        Ok(serde_saphyr::to_string(self)?)
     }
 
     pub fn model(&self, name: &str) -> Option<&ModelConfig> {
@@ -314,11 +316,11 @@ replicas:
     #[test]
     fn every_policy_name_parses() {
         for policy in PolicyKind::ALL {
-            let parsed: PolicyKind = serde_yaml_ng::from_str(policy.as_str()).unwrap();
+            let parsed: PolicyKind = serde_saphyr::from_str(policy.as_str()).unwrap();
             assert_eq!(parsed, policy);
             assert_eq!(policy.to_string(), policy.as_str());
         }
-        assert!(serde_yaml_ng::from_str::<PolicyKind>("least_loaded").is_err());
+        assert!(serde_saphyr::from_str::<PolicyKind>("least_loaded").is_err());
     }
 
     #[test]

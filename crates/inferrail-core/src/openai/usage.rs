@@ -21,7 +21,7 @@ impl Usage {
     pub fn new(prompt_tokens: u64, completion_tokens: u64) -> Self {
         Self {
             prompt_tokens,
-            total_tokens: prompt_tokens + completion_tokens,
+            total_tokens: prompt_tokens.saturating_add(completion_tokens),
             completion_tokens: Nullable::Value(completion_tokens),
             ..Self::default()
         }
