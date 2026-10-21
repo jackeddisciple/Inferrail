@@ -5,6 +5,8 @@ use inferrail_core::config::{Config, ReplicaConfig};
 use inferrail_core::ids::{ModelId, ReplicaId};
 use url::Url;
 
+use crate::health::{Health, Nanos};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Origin {
     Static,
@@ -97,6 +99,7 @@ pub struct Replica {
     endpoint: Endpoint,
     in_flight: AtomicU32,
     pending: AtomicU32,
+    health: Health,
 }
 
 impl Replica {
@@ -106,7 +109,16 @@ impl Replica {
             spec,
             in_flight: AtomicU32::new(0),
             pending: AtomicU32::new(0),
+            health: Health::default(),
         }
+    }
+
+    pub fn health(&self) -> &Health {
+        &self.health
+    }
+
+    pub fn is_routable(&self, now: Nanos) -> bool {
+        self.health.is_routable(now)
     }
 
     pub fn id(&self) -> &ReplicaId {

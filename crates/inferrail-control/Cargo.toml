@@ -11,6 +11,7 @@ publish.workspace = true
 [dependencies]
 arc-swap.workspace = true
 inferrail-core.workspace = true
+tokio.workspace = true
 url.workspace = true
 
 [dev-dependencies]
