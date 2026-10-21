@@ -15,11 +15,14 @@ path = "src/main.rs"
 [dependencies]
 inferrail-core.workspace = true
 serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
 xxhash-rust.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
 proptest.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 
 [[bench]]
 name = "prefix_cache"
