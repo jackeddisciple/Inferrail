@@ -65,13 +65,23 @@ async fn dispatch(
     match route_of(request.method(), request.uri().path()) {
         Route::Proxy => proxy(shared, request, id).await,
         Route::Local(local) => {
-            drain(request.into_body(), shared.config.server.max_body_bytes).await;
+            if !expects_continue(request.headers()) {
+                drain(request.into_body(), shared.config.server.max_body_bytes).await;
+            }
             match local? {
                 Local::Models => Ok(models::list(shared)),
                 Local::Health => Ok(Response::new(ResponseBody::empty())),
             }
         }
     }
+}
+
+/// A client that sent `Expect: 100-continue` holds its body back until told
+/// to send it; answering without reading the body declines it cleanly.
+fn expects_continue(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::EXPECT)
+        .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"100-continue"))
 }
 
 const DRAIN_FLOOR: usize = 1 << 20;
@@ -176,7 +186,9 @@ async fn read_body(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok());
     if declared.is_some_and(|len| len > limit as u64) {
-        drain(body, limit).await;
+        if !expects_continue(headers) {
+            drain(body, limit).await;
+        }
         return Err(GatewayError::too_large(limit));
     }
     let mut first: Option<Bytes> = None;

@@ -248,3 +248,67 @@ async fn a_body_that_never_finishes_arriving_times_out() {
     );
     assert_eq!(sim.hits(), 0);
 }
+
+async fn first_line(addr: &str, request: &[u8]) -> (String, Duration) {
+    let mut socket = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    socket.write_all(request).await.expect("write");
+    let started = Instant::now();
+    let mut buf = vec![0u8; 1024];
+    let n = tokio::time::timeout(Duration::from_secs(5), socket.read(&mut buf))
+        .await
+        .expect("an answer")
+        .expect("read");
+    let text = String::from_utf8_lossy(&buf[..n]).into_owned();
+    (
+        text.lines().next().unwrap_or("").to_owned(),
+        started.elapsed(),
+    )
+}
+
+#[tokio::test]
+async fn rejected_requests_never_invite_a_held_back_body() {
+    let sim = Upstream::zero(&[MODEL]).await;
+    let gw = TestGateway::start(fleet(&[sim.url()], "server:\n  max_body_bytes: 65536\n")).await;
+    let addr = gw.base.trim_start_matches("http://").to_owned();
+    for (request, want) in [
+        (
+            &b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nContent-Length: 1000000000\r\n\r\n"[..],
+            "HTTP/1.1 413 Payload Too Large",
+        ),
+        (
+            b"POST /no/such/route HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nContent-Length: 5000\r\n\r\n",
+            "HTTP/1.1 404 Not Found",
+        ),
+        (
+            b"PUT /v1/completions HTTP/1.1\r\nHost: x\r\nExpect: 100-Continue\r\nContent-Length: 5000\r\n\r\n",
+            "HTTP/1.1 405 Method Not Allowed",
+        ),
+    ] {
+        let (line, took) = first_line(&addr, request).await;
+        assert_eq!(line, want);
+        assert!(took < Duration::from_millis(500), "{took:?}");
+    }
+    assert_eq!(sim.hits(), 0);
+}
+
+#[tokio::test]
+async fn an_accepted_request_still_gets_its_continue() {
+    let sim = Upstream::zero(&[MODEL]).await;
+    let gw = TestGateway::start(fleet(&[sim.url()], "")).await;
+    let addr = gw.base.trim_start_matches("http://").to_owned();
+    let body = chat("x", 2).to_string();
+    let head = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nConnection: close\r\nExpect: 100-continue\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    );
+    let mut socket = tokio::net::TcpStream::connect(addr).await.unwrap();
+    socket.write_all(head.as_bytes()).await.unwrap();
+    let mut buf = vec![0u8; 64];
+    let n = socket.read(&mut buf).await.unwrap();
+    assert!(buf[..n].starts_with(b"HTTP/1.1 100 Continue"));
+    socket.write_all(body.as_bytes()).await.unwrap();
+    let mut rest = Vec::new();
+    socket.read_to_end(&mut rest).await.unwrap();
+    let rest = String::from_utf8_lossy(&rest);
+    assert!(rest.contains("HTTP/1.1 200 OK"), "{rest}");
+}
