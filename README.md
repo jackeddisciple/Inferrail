@@ -12,7 +12,7 @@ most of its prompt in cache, without letting any replica overload.
 The goal is lower tail latency and fewer GPUs for the same traffic, proven
 with benchmarks anyone can rerun.
 
-> **Status: v0.1.4, gateway and baselines.** The gateway is usable: it
+> **Status: v0.1.3, gateway and baselines.** The gateway is usable: it
 > proxies chat and completions to a fleet of engines, streams responses
 > untouched, retries before the first byte, ejects failing replicas,
 > discovers replicas through DNS and routes with four baseline policies.
@@ -45,7 +45,7 @@ the cache away. Inferrail treats routing as a cost estimate instead: for each
 replica, how long until this request's first token, given what is cached
 there and what is queued there?
 
-## What is in v0.1.4
+## What is in v0.1.3
 
 | Piece | What it does |
 | --- | --- |
@@ -387,7 +387,7 @@ with fewer GPUs than a cache blind balancer, while adding under 1 ms of its
 own latency. Every number below is a target to prove or disprove with
 committed, rerunnable benchmarks, not a claim.
 
-* **Gateway and baselines.** Shipped in v0.1.3: OpenAI compatible proxy,
+* **Gateway and baselines.** Shipped in v0.1.2: OpenAI compatible proxy,
   zero copy streaming, retries before the first byte, health checks, outlier
   ejection, breakers, DNS discovery, cancellation, and four baseline
   policies behind one trait.
