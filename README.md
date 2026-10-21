@@ -118,8 +118,9 @@ get a 404 and wrong methods a 405 with `Allow`, in the OpenAI error shape
 vLLM uses. HTTP/1.1 and h2c are accepted from clients; engines are reached
 over pooled HTTP/1.1 keep alive connections, or h2c with `upstream.http2`.
 
-**Pass through.** The request body is read once and forwarded byte for
-byte; only the `model` field is parsed. When a client asks for a gateway
+**Pass through.** The request body is read once, within
+`server.request_timeout` (a body that stops arriving gets a 408), and
+forwarded byte for byte; only the `model` field is parsed. When a client asks for a gateway
 alias, or omits the model while the gateway serves exactly one, only those
 bytes are rewritten so the engine sees a name it serves. Responses stream
 back frame by frame as they arrive, with headers intact except hop by hop

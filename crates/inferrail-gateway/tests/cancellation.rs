@@ -217,3 +217,34 @@ async fn prompts_never_reach_the_logs_unless_enabled() {
     let logs = captured_logs(true).await;
     assert!(logs.contains("SECRET-PROMPT-7f3a"));
 }
+
+#[tokio::test]
+async fn a_body_that_never_finishes_arriving_times_out() {
+    let sim = Upstream::zero(&[MODEL]).await;
+    let gw = TestGateway::start(fleet(
+        &[sim.url()],
+        "server:\n  request_timeout: 300ms\nupstream:\n  connect_timeout: 100ms\n",
+    ))
+    .await;
+    let addr = gw.base.trim_start_matches("http://").to_owned();
+    let mut socket = tokio::net::TcpStream::connect(addr).await.unwrap();
+    socket
+        .write_all(
+            b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n{\"model",
+        )
+        .await
+        .unwrap();
+    let started = Instant::now();
+    let mut answer = Vec::new();
+    let read = tokio::time::timeout(Duration::from_secs(3), socket.read_to_end(&mut answer)).await;
+    let took = started.elapsed();
+    assert!(read.is_ok(), "the gateway kept waiting for the body");
+    let answer = String::from_utf8_lossy(&answer);
+    assert!(answer.starts_with("HTTP/1.1 408"), "{answer}");
+    assert!(answer.contains("RequestTimeoutError"), "{answer}");
+    assert!(
+        took >= Duration::from_millis(250) && took < Duration::from_secs(2),
+        "{took:?}"
+    );
+    assert_eq!(sim.hits(), 0);
+}

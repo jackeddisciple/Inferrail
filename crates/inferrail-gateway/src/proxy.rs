@@ -118,7 +118,10 @@ async fn proxy(
 ) -> Result<Response<ResponseBody>, GatewayError> {
     let deadline = Instant::now() + shared.config.server.request_timeout;
     let (parts, body) = request.into_parts();
-    let body = read_body(&parts.headers, body, shared.config.server.max_body_bytes).await?;
+    let limit = shared.config.server.max_body_bytes;
+    let body = timeout_at(deadline, read_body(&parts.headers, body, limit))
+        .await
+        .map_err(|_| GatewayError::slow_body())??;
     let (model, body) = resolve_model(shared, body)?;
     if shared.config.logging.log_prompts {
         tracing::debug!(request_id = ?id, body = %String::from_utf8_lossy(&body), "request body");

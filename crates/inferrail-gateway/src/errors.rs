@@ -89,6 +89,14 @@ impl GatewayError {
         Self::new(StatusCode::GATEWAY_TIMEOUT, "GatewayTimeoutError", message)
     }
 
+    pub fn slow_body() -> Self {
+        Self::new(
+            StatusCode::REQUEST_TIMEOUT,
+            "RequestTimeoutError",
+            "The request body did not arrive before the request timeout",
+        )
+    }
+
     pub fn status(&self) -> StatusCode {
         self.status
     }
@@ -145,6 +153,7 @@ mod tests {
             GatewayError::unavailable("x"),
             GatewayError::bad_gateway("x"),
             GatewayError::timeout("x"),
+            GatewayError::slow_body(),
         ] {
             let body = json_of(&err);
             assert_eq!(body["error"]["code"], json!(err.status().as_u16()));
