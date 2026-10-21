@@ -3,6 +3,45 @@
 Notable changes to Inferrail. Versions follow
 [Semantic Versioning](https://semver.org).
 
+## [Unreleased]
+
+Fixes from a second sweep over the gateway, policies and control plane.
+
+### Fixed
+
+* Requests that made engines fail could passively eject every replica of a
+  model, turning a bad request pattern into an outage. Passive ejection now
+  takes out at most `health.max_ejection_percent` of the replicas passing
+  health checks (half by default) and never a sole replica.
+* Requests already waiting on a replica that then failed its health checks
+  waited for the whole request timeout and failed, although nothing had
+  reached the client. They now move to another replica at once.
+* Request bodies had no read deadline, so a stalled upload held its
+  connection forever. Reading now shares `server.request_timeout` and
+  answers 408.
+* A body sent in many tiny chunks cost about forty times its size in memory
+  (307 MiB for an 8 MiB body in one byte chunks). It now costs about its
+  size.
+* Clients sending `Expect: 100-continue` were invited to upload bodies the
+  gateway was about to reject with a 404, 405 or 413. Those answers now
+  come at once.
+* HEAD on `/health` and `/v1/models` returned 405; it now answers as GET
+  does.
+* Bodies starting with a byte order mark, which Python engines accept, got
+  a 400. The mark is now skipped when reading the model and forwarded as
+  sent.
+* DNS groups were resolved one after another at startup, so a slow DNS
+  server delayed startup by every group's timeout in turn. They now resolve
+  together.
+* `--check` accepted configs that startup refuses, such as https replicas.
+* Health and stress tests measured ejection windows on a clock other than
+  the gateway's.
+
+### Added
+
+* `health.max_ejection_percent`, the cap on passive ejection.
+* Tests for each fix, and a stress test for bodies sent in tiny chunks.
+
 ## [0.1.3] OpenAI Compatible Gateway, Baseline Routing Policies and Failure Handling (21 October 2026)
 
 The gateway becomes usable: it routes chat and completions across a fleet
@@ -197,6 +236,7 @@ The first release: project foundations and a faithful vLLM simulator.
   disconnect storms, malformed bodies, long prompts and a memory soak.
 * OpenAI Python SDK suite, sync and async, against the simulator binary.
 
-[0.1.3]: https://github.com/jackeddisciple/Inferrail/tree/main
+[Unreleased]: https://github.com/jackeddisciple/Inferrail/compare/d7b4d58...main
+[0.1.3]: https://github.com/jackeddisciple/Inferrail/tree/d7b4d58b108f339496938df7649bd66592b2b8d9
 [0.1.1]: https://github.com/jackeddisciple/Inferrail/tree/664e148a663636837ea98cb32ddc8676dd8b7093
 [0.1.0]: https://github.com/jackeddisciple/Inferrail/tree/1bb0c4501423ae6499844e25290da8a7b04793aa

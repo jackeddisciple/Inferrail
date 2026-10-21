@@ -113,9 +113,10 @@ readmits it once it is back.
 ## The gateway
 
 **Routes.** `POST /v1/chat/completions` and `POST /v1/completions` are
-proxied; `GET /v1/models` and `GET /health` are answered locally. Other paths
-get a 404 and wrong methods a 405 with `Allow`, in the OpenAI error shape
-vLLM uses. HTTP/1.1 and h2c are accepted from clients; engines are reached
+proxied; `/v1/models` and `/health` are answered locally to GET and HEAD.
+Other paths get a 404 and wrong methods a 405 with `Allow`, in the OpenAI
+error shape vLLM uses. A rejected request that holds its body back behind
+`Expect: 100-continue` is answered at once, without being asked to upload. HTTP/1.1 and h2c are accepted from clients; engines are reached
 over pooled HTTP/1.1 keep alive connections, or h2c with `upstream.http2`.
 
 **Pass through.** The request body is read once, within
@@ -170,8 +171,12 @@ set.
 
 **Cancellation and shutdown.** A client that disconnects, whether streaming,
 queued in the engine or waiting for a full response, frees the engine's slot
-within 100 ms. On SIGTERM the gateway stops accepting, lets running streams
-finish for up to `server.shutdown_timeout`, then closes what is left.
+within 100 ms. Idle client connections are closed after
+`server.header_read_timeout`. On SIGTERM the gateway stops accepting, lets
+running streams finish for up to `server.shutdown_timeout`, then closes what
+is left; a request a client sends on an idle connection at that very moment
+can be lost, so put the gateway behind something that retries, or drain it
+from the load balancer first.
 
 ## Routing policies
 
@@ -339,13 +344,16 @@ includes:
 | Scenario | Result |
 | --- | --- |
 | 2,000 concurrent streams through the gateway over 3 simulators | all complete in 0.3 to 0.7 s, zero errors, even spread |
-| Open loop at 2,000 and 5,000 req/s, 10,000 requests each | the gateway adds 0.04 to 0.11 ms at p50 and under 0.6 ms at p99 |
-| A simulator killed under 1,000 req/s, then restarted | zero errors for requests sent after the kill, ejected within 3 ms, back in rotation within 60 ms |
+| Open loop at 2,000 and 5,000 req/s, 10,000 requests each | the gateway adds 0.04 to 0.12 ms at p50 and under 0.6 ms at p99 |
+| A simulator killed under 1,000 req/s, then restarted | zero errors for requests sent after the kill, ejected within 10 ms, back in rotation within 60 ms |
+| A replica that hangs, with requests waiting on it | they move to another replica as soon as probes mark it down |
+| Requests that make every engine fail | at most half the replicas are ejected; the pool never empties |
 | A replica flapping between healthy and 503 every 100 ms at 1,000 req/s | zero client errors |
 | 1,000 streams with 741 random disconnects | every disconnect aborted in the engine, nothing leaked |
 | 3,000 hostile requests | zero gateway failures |
-| 35,000 request soak through the gateway | resident memory grew under 8 MB |
+| 35,000 request soak through the gateway | resident memory grew under 10 MB |
 | 640 MiB streamed to 20 clients that stop reading | about 20 MB held in total |
+| An 8 MiB request body sent in one byte chunks | about 11 MB held while it arrives |
 | 1,000 concurrent streams through the async SDK, direct and via the gateway | all complete with exact usage |
 | 2,000 concurrent SSE streams straight to one simulator | all complete in 0.55 s, zero errors |
 | 35,000 request simulator soak | resident memory grew under 20 MB |
