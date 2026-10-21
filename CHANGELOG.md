@@ -3,7 +3,7 @@
 Notable changes to Inferrail. Versions follow
 [Semantic Versioning](https://semver.org).
 
-## [0.1.1] (21 October 2026)
+## [0.1.1] Hardening (21 October 2026)
 
 A hardening pass over everything in 0.1.0, driven by a new round of
 property, fuzz, mutation and load testing.
@@ -53,7 +53,7 @@ property, fuzz, mutation and load testing.
 * `make audit` and a CI job that runs `cargo audit` and `cargo machete`, and
   ruff lint and format checks for the Python code.
 
-## [0.1.0] (21 October 2026)
+## [0.1.0] Foundations (21 October 2026)
 
 The first release: project foundations and a faithful vLLM simulator.
 
