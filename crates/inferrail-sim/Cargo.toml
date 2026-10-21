@@ -1,0 +1,16 @@
+[package]
+name = "inferrail-sim"
+description = "Mock inference engine that speaks the vLLM HTTP API and metrics."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "inferrail-sim"
+path = "src/main.rs"
+
+[lints]
+workspace = true

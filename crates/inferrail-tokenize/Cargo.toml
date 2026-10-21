@@ -1,0 +1,12 @@
+[package]
+name = "inferrail-tokenize"
+description = "Chat templates, tokenization and chained block hashing."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
