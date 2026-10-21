@@ -2,7 +2,7 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 
-use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
+use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::{Bytes, Incoming};
 use hyper::header::{self, HeaderMap, HeaderValue};
 use hyper::http::request::Parts;
@@ -33,22 +33,65 @@ pub(crate) async fn handle(
     Ok(response)
 }
 
+enum Route {
+    Proxy,
+    Local(Result<Local, GatewayError>),
+}
+
+enum Local {
+    Models,
+    Health,
+}
+
+fn route_of(method: &Method, path: &str) -> Route {
+    let local = match path {
+        "/v1/chat/completions" | "/v1/completions" if method == Method::POST => {
+            return Route::Proxy;
+        }
+        "/v1/chat/completions" | "/v1/completions" => Err(GatewayError::method_not_allowed("POST")),
+        "/v1/models" if method == Method::GET => Ok(Local::Models),
+        "/health" if method == Method::GET => Ok(Local::Health),
+        "/v1/models" | "/health" => Err(GatewayError::method_not_allowed("GET")),
+        _ => Err(GatewayError::not_found()),
+    };
+    Route::Local(local)
+}
+
 async fn dispatch(
     shared: &Arc<Shared>,
     request: Request<Incoming>,
     id: &HeaderValue,
 ) -> Result<Response<ResponseBody>, GatewayError> {
-    let method = request.method();
-    match request.uri().path() {
-        "/v1/chat/completions" | "/v1/completions" if method == Method::POST => {
-            proxy(shared, request, id).await
+    match route_of(request.method(), request.uri().path()) {
+        Route::Proxy => proxy(shared, request, id).await,
+        Route::Local(local) => {
+            drain(request.into_body(), shared.config.server.max_body_bytes).await;
+            match local? {
+                Local::Models => Ok(models::list(shared)),
+                Local::Health => Ok(Response::new(ResponseBody::empty())),
+            }
         }
-        "/v1/chat/completions" | "/v1/completions" => Err(GatewayError::method_not_allowed("POST")),
-        "/v1/models" if method == Method::GET => Ok(models::list(shared)),
-        "/health" if method == Method::GET => Ok(Response::new(ResponseBody::empty())),
-        "/v1/models" | "/health" => Err(GatewayError::method_not_allowed("GET")),
-        _ => Err(GatewayError::not_found()),
     }
+}
+
+const DRAIN_FLOOR: usize = 1 << 20;
+const DRAIN_TIME: Duration = Duration::from_secs(2);
+
+/// Reads and discards what is left of a request body, so a client that is
+/// still uploading gets the answer rather than a connection reset. Bounded
+/// in bytes and time; past either bound the connection simply closes.
+async fn drain(mut body: Incoming, limit: usize) {
+    let mut left = limit.max(DRAIN_FLOOR);
+    let discard = async {
+        while let Some(Ok(frame)) = body.frame().await {
+            let len = frame.data_ref().map_or(0, Bytes::len);
+            if len >= left {
+                break;
+            }
+            left -= len;
+        }
+    };
+    let _ = timeout(DRAIN_TIME, discard).await;
 }
 
 pub(crate) fn error_response(err: &GatewayError) -> Response<ResponseBody> {
@@ -119,7 +162,7 @@ fn backoff(base: Duration, attempt: u32) -> Duration {
 
 async fn read_body(
     headers: &HeaderMap,
-    body: Incoming,
+    mut body: Incoming,
     limit: usize,
 ) -> Result<Bytes, GatewayError> {
     let declared = headers
@@ -127,13 +170,28 @@ async fn read_body(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok());
     if declared.is_some_and(|len| len > limit as u64) {
+        drain(body, limit).await;
         return Err(GatewayError::too_large(limit));
     }
-    match Limited::new(body, limit).collect().await {
-        Ok(collected) => Ok(collected.to_bytes()),
-        Err(err) if err.is::<LengthLimitError>() => Err(GatewayError::too_large(limit)),
-        Err(_) => Err(GatewayError::bad_request("could not read the request body")),
+    let mut chunks: Vec<Bytes> = Vec::new();
+    let mut total = 0;
+    while let Some(frame) = body.frame().await {
+        let frame =
+            frame.map_err(|_| GatewayError::bad_request("could not read the request body"))?;
+        if let Ok(data) = frame.into_data() {
+            total += data.len();
+            if total > limit {
+                drain(body, limit).await;
+                return Err(GatewayError::too_large(limit));
+            }
+            chunks.push(data);
+        }
     }
+    Ok(match chunks.len() {
+        0 => Bytes::new(),
+        1 => chunks.swap_remove(0),
+        _ => Bytes::from(chunks.concat()),
+    })
 }
 
 /// Resolves the requested name to a served model. The body is only

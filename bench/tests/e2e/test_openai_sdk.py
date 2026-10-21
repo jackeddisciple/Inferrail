@@ -1,4 +1,5 @@
-"""The official OpenAI SDK must work against the simulator with only a base URL change."""
+"""The official OpenAI SDK must work against the simulator, and through the gateway, with
+only a base URL change."""
 
 import asyncio
 
@@ -6,7 +7,7 @@ import openai
 import pytest
 from openai import AsyncOpenAI
 
-from conftest import MODEL
+from conftest import MODEL, SOLO
 
 pytestmark = pytest.mark.e2e
 
@@ -50,10 +51,10 @@ def test_streaming_chat_with_usage(client):
     assert len({c.id for c in chunks}) == 1
 
 
-def test_prefix_cache_is_visible_in_usage(client):
+def test_prefix_cache_is_visible_in_usage(client, cache_model):
     def ask(question):
         return client.chat.completions.create(
-            model=MODEL,
+            model=cache_model,
             messages=[
                 {"role": "system", "content": LONG_SYSTEM},
                 {"role": "user", "content": question},
@@ -86,9 +87,10 @@ def test_legacy_completions_plain_and_streaming(client):
     assert chunks[3].usage.prompt_tokens == 3
 
 
-def test_models_list(client):
+def test_models_list(client, target):
     ids = [model.id for model in client.models.list()]
-    assert ids == [MODEL, "sim-alias"]
+    expected = [MODEL, "sim-alias"] if target[0] == "sim" else [MODEL, "sim-alias", SOLO]
+    assert ids == expected
 
 
 def test_vllm_extensions_pass_through_extra_body(client):
@@ -128,9 +130,9 @@ def test_raw_response_headers(client):
     assert raw.parse().usage.completion_tokens == 1
 
 
-def test_async_client_runs_many_streams_concurrently(sim_base_url):
+def test_async_client_runs_many_streams_concurrently(base_url):
     async def run():
-        async with AsyncOpenAI(base_url=f"{sim_base_url}/v1", api_key="unused") as client:
+        async with AsyncOpenAI(base_url=f"{base_url}/v1", api_key="unused") as client:
 
             async def one(i):
                 stream = await client.chat.completions.create(

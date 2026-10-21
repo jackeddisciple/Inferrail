@@ -15,12 +15,12 @@ STREAMS = 1000
 TOKENS = 32
 
 
-def test_thousand_concurrent_sdk_streams(sim_base_url):
+def test_thousand_concurrent_sdk_streams(base_url, target):
     async def run():
         limits = httpx2.Limits(max_connections=STREAMS, max_keepalive_connections=STREAMS)
         http = DefaultAsyncHttpx2Client(limits=limits, timeout=60)
         async with AsyncOpenAI(
-            base_url=f"{sim_base_url}/v1", api_key="unused", http_client=http
+            base_url=f"{base_url}/v1", api_key="unused", http_client=http
         ) as client:
 
             async def one(i):
@@ -50,6 +50,9 @@ def test_thousand_concurrent_sdk_streams(sim_base_url):
     ttfts = sorted(r[0] for r in results)
     p50 = ttfts[len(ttfts) // 2] * 1000
     p99 = ttfts[int(len(ttfts) * 0.99)] * 1000
-    print(f"\nsdk stress: {STREAMS} streams in {wall:.2f}s, ttft p50={p50:.1f}ms p99={p99:.1f}ms")
+    print(
+        f"\nsdk stress via {target[0]}: {STREAMS} streams in {wall:.2f}s, "
+        f"ttft p50={p50:.1f}ms p99={p99:.1f}ms"
+    )
     assert all(chunks == TOKENS + 2 for _, chunks, _ in results)
     assert all(tokens == TOKENS for _, _, tokens in results)

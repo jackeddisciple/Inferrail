@@ -17,8 +17,8 @@ build-backend = "uv_build"
 testpaths = ["tests"]
 addopts = "-ra -m 'not e2e and not stress'"
 markers = [
-    "e2e: drives a real inferrail-sim binary through the official OpenAI SDK",
-    "stress: heavy concurrent load through the OpenAI SDK",
+    "e2e: drives real inferrail-sim and inferrail-gateway binaries through the official OpenAI SDK",
+    "stress: heavy concurrent load through the OpenAI SDK, direct and via the gateway",
 ]
 
 [tool.ruff]

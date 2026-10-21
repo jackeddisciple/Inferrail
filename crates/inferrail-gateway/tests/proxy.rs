@@ -442,3 +442,30 @@ async fn hundreds_of_concurrent_streams_complete_and_drain() {
     tokio::time::sleep(Duration::from_millis(20)).await;
     assert!(sims.iter().all(|s| s.snapshot().running == 0));
 }
+
+#[tokio::test]
+async fn clients_still_uploading_get_a_clean_answer() {
+    let sim = Upstream::zero(&[MODEL]).await;
+    let gw = TestGateway::start(fleet(&[sim.url()], "server:\n  max_body_bytes: 65536\n")).await;
+    let big = vec![b'x'; 512 * 1024];
+    for _ in 0..10 {
+        for (method, path, want) in [
+            (reqwest::Method::POST, "/no/such/route", 404),
+            (reqwest::Method::PUT, "/v1/chat/completions", 405),
+            (reqwest::Method::GET, "/v1/models", 200),
+            (reqwest::Method::POST, "/v1/completions", 413),
+        ] {
+            let response = gw
+                .client
+                .request(method, gw.url(path))
+                .body(big.clone())
+                .send()
+                .await
+                .expect("an answer, not a reset");
+            assert_eq!(response.status(), want, "{path}");
+            let _ = response.bytes().await.expect("body");
+        }
+    }
+    let (status, _) = gw.post_json("/v1/chat/completions", &chat("x", 1)).await;
+    assert_eq!(status, 200);
+}

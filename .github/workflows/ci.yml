@@ -61,13 +61,13 @@ jobs:
         run: cargo machete
 
   e2e:
-    name: OpenAI SDK against the simulator
+    name: OpenAI SDK against the simulator and gateway
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - uses: actions-rust-lang/setup-rust-toolchain@v2
-      - name: Build simulator
-        run: cargo build -p inferrail-sim
+      - name: Build simulator and gateway
+        run: cargo build -p inferrail-sim -p inferrail-gateway
       - uses: astral-sh/setup-uv@v10.3.0
         with:
           working-directory: bench
@@ -75,4 +75,5 @@ jobs:
         working-directory: bench
         env:
           INFERRAIL_SIM_BIN: ${{ github.workspace }}/target/debug/inferrail-sim
+          INFERRAIL_GATEWAY_BIN: ${{ github.workspace }}/target/debug/inferrail-gateway
         run: uv run --frozen pytest -q -m e2e
