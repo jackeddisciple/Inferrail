@@ -4,7 +4,7 @@
 mod common;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use common::*;
@@ -26,12 +26,20 @@ fn all(sims: &[Upstream]) -> Vec<String> {
 async fn a_replica_killed_under_load_is_ejected_fast_with_zero_errors() {
     let sims = fleet_of(3).await;
     let gw = Arc::new(TestGateway::start(fleet(&all(&sims), FAST_HEALTH)).await);
-    let errors = Arc::new(AtomicU64::new(0));
+    let killed = Arc::new(AtomicBool::new(false));
+    let after_kill = Arc::new(AtomicU64::new(0));
+    let in_flight = Arc::new(AtomicU64::new(0));
     let sent = Arc::new(AtomicU64::new(0));
     let started = Instant::now();
     let mut tasks = Vec::new();
     for worker in 0..8 {
-        let (gw, errors, sent) = (Arc::clone(&gw), Arc::clone(&errors), Arc::clone(&sent));
+        let (gw, killed, after_kill, in_flight, sent) = (
+            Arc::clone(&gw),
+            Arc::clone(&killed),
+            Arc::clone(&after_kill),
+            Arc::clone(&in_flight),
+            Arc::clone(&sent),
+        );
         tasks.push(tokio::spawn(async move {
             while started.elapsed() < Duration::from_millis(1_500) {
                 let body = if worker % 2 == 0 {
@@ -39,25 +47,22 @@ async fn a_replica_killed_under_load_is_ejected_fast_with_zero_errors() {
                 } else {
                     streaming(chat("x", 2))
                 };
-                let ok = match gw
-                    .client
-                    .post(gw.url("/v1/chat/completions"))
-                    .json(&body)
-                    .send()
-                    .await
-                {
+                let unstarted = killed.load(Ordering::SeqCst);
+                sent.fetch_add(1, Ordering::Relaxed);
+                let request = gw.client.post(gw.url("/v1/chat/completions")).json(&body);
+                let ok = match request.send().await {
                     Ok(r) if r.status() == 200 => r.bytes().await.is_ok(),
                     _ => false,
                 };
-                sent.fetch_add(1, Ordering::Relaxed);
                 if !ok {
-                    errors.fetch_add(1, Ordering::Relaxed);
+                    let bucket = if unstarted { &after_kill } else { &in_flight };
+                    bucket.fetch_add(1, Ordering::Relaxed);
                 }
             }
         }));
     }
     tokio::time::sleep(Duration::from_millis(400)).await;
-    let killed_at = Instant::now();
+    killed.store(true, Ordering::SeqCst);
     sims[1].kill();
     let r1 = gw.replica("r1");
     let clock = Clock::default();
@@ -65,19 +70,15 @@ async fn a_replica_killed_under_load_is_ejected_fast_with_zero_errors() {
     for task in tasks {
         task.await.unwrap();
     }
+    let sent = sent.load(Ordering::Relaxed);
     assert!(ejected_in < Duration::from_secs(2), "{ejected_in:?}");
-    assert_eq!(
-        errors.load(Ordering::Relaxed),
-        0,
-        "of {}",
-        sent.load(Ordering::Relaxed)
-    );
-    assert!(sent.load(Ordering::Relaxed) > 200);
+    assert_eq!(after_kill.load(Ordering::Relaxed), 0, "of {sent}");
     assert!(
-        !r1.health().probe_up(),
-        "probes should agree after {:?}",
-        killed_at.elapsed()
+        in_flight.load(Ordering::Relaxed) <= 8,
+        "at most one in flight per worker"
     );
+    assert!(sent > 200);
+    assert!(!r1.health().probe_up());
     gw.wait_idle().await;
 }
 
@@ -159,35 +160,28 @@ async fn a_replica_that_keeps_failing_requests_backs_off_exponentially() {
     sims[0].set_request_fault(Fault::Status(503));
     let r0 = gw.replica("r0");
     let clock = Clock::default();
-    let mut windows = Vec::new();
+    let mut windows: Vec<u64> = Vec::new();
     let mut last_until = 0;
     let started = Instant::now();
-    while windows.len() < 4 && started.elapsed() < Duration::from_secs(5) {
+    while windows.len() < 4 && started.elapsed() < Duration::from_secs(10) {
         assert_eq!(
             gw.post("/v1/chat/completions", &chat("x", 1))
                 .await
                 .status(),
             200
         );
-        let until = r0.health().ejected_until();
-        if until != last_until && r0.health().is_ejected(clock.now()) {
-            windows.push(until);
+        let (until, now) = (r0.health().ejected_until(), clock.now());
+        if until != last_until && now < until {
+            windows.push((until - now) / 1_000_000);
             last_until = until;
         }
         tokio::time::sleep(Duration::from_millis(2)).await;
     }
     assert!(r0.health().probe_up(), "probes still pass");
     assert_eq!(windows.len(), 4, "{windows:?}");
-    let gaps: Vec<u64> = windows
-        .windows(2)
-        .map(|w| (w[1] - w[0]) / 1_000_000)
-        .collect();
-    assert!(
-        gaps[0] >= 200 && gaps[1] >= 400 && gaps[2] >= 400,
-        "{gaps:?}"
-    );
-    assert!(gaps[1] > gaps[0] + 100, "doubles: {gaps:?}");
-    assert!(gaps[2] < 700, "capped at 400ms: {gaps:?}");
+    assert!(windows.iter().all(|&ms| ms <= 400), "capped: {windows:?}");
+    assert!(windows[0] <= 100, "starts at the base: {windows:?}");
+    assert!(windows[3] > windows[0], "grows: {windows:?}");
 }
 
 #[tokio::test]

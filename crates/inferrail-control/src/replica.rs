@@ -102,6 +102,7 @@ pub struct Replica {
     endpoint: Endpoint,
     in_flight: AtomicU32,
     pending: AtomicU32,
+    peak_in_flight: AtomicU32,
     health: Health,
     cards: ArcSwapOption<Cards>,
 }
@@ -120,6 +121,7 @@ impl Replica {
             spec,
             in_flight: AtomicU32::new(0),
             pending: AtomicU32::new(0),
+            peak_in_flight: AtomicU32::new(0),
             health: Health::default(),
             cards: ArcSwapOption::empty(),
         }
@@ -176,6 +178,12 @@ impl Replica {
         self.pending.load(Ordering::Relaxed)
     }
 
+    /// The most requests ever in flight at once, as seen by the lease that
+    /// reached it.
+    pub fn peak_in_flight(&self) -> u32 {
+        self.peak_in_flight.load(Ordering::Relaxed)
+    }
+
     pub fn has_room(&self) -> bool {
         let Limits {
             max_concurrency,
@@ -189,13 +197,12 @@ impl Replica {
     /// cap is reached. The caps can never be exceeded, even under races.
     pub fn try_acquire(self: &Arc<Self>) -> Option<Lease> {
         let limits = self.spec.limits;
-        if !increment_below(&self.in_flight, limits.max_concurrency) {
-            return None;
-        }
-        if !increment_below(&self.pending, limits.max_pending) {
+        let in_flight = increment_below(&self.in_flight, limits.max_concurrency)?;
+        if increment_below(&self.pending, limits.max_pending).is_none() {
             self.in_flight.fetch_sub(1, Ordering::Relaxed);
             return None;
         }
+        self.peak_in_flight.fetch_max(in_flight, Ordering::Relaxed);
         Some(Lease {
             replica: Arc::clone(self),
             pending: true,
@@ -203,17 +210,16 @@ impl Replica {
     }
 }
 
-fn increment_below(counter: &AtomicU32, cap: Option<u32>) -> bool {
+/// Adds one unless that would pass `cap`; returns the new value.
+fn increment_below(counter: &AtomicU32, cap: Option<u32>) -> Option<u32> {
     match cap {
-        None => {
-            counter.fetch_add(1, Ordering::Relaxed);
-            true
-        }
+        None => Some(counter.fetch_add(1, Ordering::Relaxed) + 1),
         Some(cap) => counter
             .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |n| {
                 (n < cap).then_some(n + 1)
             })
-            .is_ok(),
+            .ok()
+            .map(|n| n + 1),
     }
 }
 
@@ -363,6 +369,7 @@ pub(crate) mod tests {
         let granted: u32 = threads.into_iter().map(|t| t.join().unwrap()).sum();
         assert!(granted > 0);
         assert!(high_in_flight.load(Ordering::Relaxed) <= 4);
+        assert!((1..=4).contains(&replica.peak_in_flight()));
         assert!(high_pending.load(Ordering::Relaxed) <= 3);
         assert_eq!((replica.in_flight(), replica.pending()), (0, 0));
     }
