@@ -7,6 +7,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto;
 use hyper_util::server::graceful::GracefulShutdown;
 use tokio::net::TcpListener;
+use tokio::task::JoinSet;
 
 use crate::Shared;
 use crate::proxy::handle;
@@ -24,6 +25,7 @@ pub(crate) async fn serve(
     builder.http2().timer(TokioTimer::new());
     let graceful = GracefulShutdown::new();
     let drain = shared.config.server.shutdown_timeout;
+    let mut connections = JoinSet::new();
     tokio::pin!(shutdown);
     loop {
         let stream = tokio::select! {
@@ -35,6 +37,7 @@ pub(crate) async fn serve(
                     continue;
                 }
             },
+            Some(_) = connections.join_next(), if !connections.is_empty() => continue,
             () = &mut shutdown => break,
         };
         let _ = stream.set_nodelay(true);
@@ -44,19 +47,23 @@ pub(crate) async fn serve(
             .serve_connection(TokioIo::new(stream), service)
             .into_owned();
         let connection = graceful.watch(connection);
-        tokio::spawn(async move {
+        connections.spawn(async move {
             if let Err(err) = connection.await {
                 tracing::debug!(error = %err, "client connection ended with an error");
             }
         });
     }
     drop(listener);
-    tracing::info!(open = graceful.count(), "draining connections");
+    tracing::info!(open = connections.len(), "draining connections");
     if tokio::time::timeout(drain, graceful.shutdown())
         .await
         .is_err()
     {
-        tracing::warn!("shutdown timeout reached with connections still open");
+        tracing::warn!(
+            open = connections.len(),
+            "shutdown timeout reached; closing remaining connections"
+        );
     }
+    connections.shutdown().await;
     Ok(())
 }

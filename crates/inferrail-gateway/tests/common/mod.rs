@@ -470,14 +470,22 @@ impl TestGateway {
         }
     }
 
-    pub async fn shutdown(mut self) -> std::io::Result<()> {
+    pub fn signal_shutdown(&mut self) {
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
         }
+    }
+
+    pub async fn join(&mut self) -> std::io::Result<()> {
         match self.task.take() {
             Some(task) => task.await.expect("serve task"),
             None => Ok(()),
         }
+    }
+
+    pub async fn shutdown(mut self) -> std::io::Result<()> {
+        self.signal_shutdown();
+        self.join().await
     }
 }
 
