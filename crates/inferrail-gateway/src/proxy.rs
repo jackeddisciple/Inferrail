@@ -7,7 +7,7 @@ use hyper::body::{Bytes, Incoming};
 use hyper::header::{self, HeaderMap, HeaderValue};
 use hyper::http::request::Parts;
 use hyper::{Method, Request, Response, StatusCode};
-use inferrail_control::{Lease, Replica};
+use inferrail_control::{Lease, Nanos, Replica};
 use inferrail_core::ids::{ModelId, ReplicaId};
 use tokio::time::{Instant, sleep, timeout, timeout_at};
 
@@ -331,11 +331,26 @@ async fn forward(
     Attempt::Done(Response::from_parts(head, ResponseBody::Upstream(body)))
 }
 
+/// Counts a failed request against the replica and ejects it once the streak
+/// is long enough, unless that would push the share of ejected replicas
+/// among those passing probes, for any model it serves, past
+/// `health.max_ejection_percent`. Evidence from
+/// failed requests can come from the requests themselves, so it must never
+/// be able to take a whole pool out of rotation.
 pub(crate) fn record_failure(shared: &Shared, replica: &Replica) {
-    if let Some(ejection) = replica
-        .health()
-        .record_failure(shared.clock.now(), &shared.health)
-    {
+    let now = shared.clock.now();
+    if !replica.health().record_failure(now, &shared.health) {
+        return;
+    }
+    let _deciding = shared
+        .ejecting
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !ejection_allowed(shared, replica, now) {
+        tracing::debug!(replica = %replica.id(), "not ejecting; too much of the pool is already ejected");
+        return;
+    }
+    if let Some(ejection) = replica.health().eject(now, &shared.health) {
         tracing::warn!(
             replica = %replica.id(),
             seconds = ejection.length.as_secs_f64(),
@@ -343,4 +358,18 @@ pub(crate) fn record_failure(shared: &Shared, replica: &Replica) {
             "ejecting replica after consecutive failures"
         );
     }
+}
+
+fn ejection_allowed(shared: &Shared, replica: &Replica, now: Nanos) -> bool {
+    let percent = shared.config.health.max_ejection_percent as usize;
+    let fleet = shared.registry.load();
+    replica.models().iter().all(|model| {
+        let up: Vec<_> = fleet
+            .serving(model)
+            .iter()
+            .filter(|r| r.health().probe_up())
+            .collect();
+        let ejected = up.iter().filter(|r| r.health().is_ejected(now)).count();
+        (ejected + 1) * 100 <= percent * up.len()
+    })
 }

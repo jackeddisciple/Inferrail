@@ -54,8 +54,11 @@ streaming and add memory proportional to output length.
   probes, returning after `healthy_threshold` passing ones. Independently,
   `unhealthy_threshold` consecutive request failures eject it for
   `ejection_backoff`, doubling on each repeat up to `max_ejection_backoff`
-  and resetting after a clean stretch that long. A replica is routable only
-  when both agree. There is no panic mode: when nothing is routable the
+  and resetting after a clean stretch that long. Because a failed request
+  can be the request's fault rather than the replica's, passive ejection
+  never takes more than `max_ejection_percent` (half by default) of the
+  model's replicas that pass their health checks, and never a sole one. A replica is
+  routable only when both agree. There is no panic mode: when nothing is routable the
   client gets a 503 with `Retry-After`, because routing to a replica known to
   be unhealthy breaks the invariant that policies never see one.
 * **Breakers fail fast.** Optional per replica caps on requests in flight

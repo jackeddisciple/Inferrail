@@ -124,6 +124,7 @@ mod tests {
             }
             if m.ejected {
                 replica.health().record_failure(10, &policy());
+                replica.health().eject(10, &policy());
             }
             held.extend((0..m.held).filter_map(|_| replica.try_acquire()));
         }

@@ -116,15 +116,22 @@ impl Health {
         }
     }
 
-    /// Counts a failed request; returns the ejection when this failure is
-    /// the one that crossed the threshold. Failures while ejected are ignored.
-    pub fn record_failure(&self, now: Nanos, policy: &HealthPolicy) -> Option<Ejection> {
-        let until = self.ejected_until.load(Ordering::Acquire);
-        if now < until {
-            return None;
+    /// Counts a failed request. True once the replica has failed
+    /// `unhealthy_threshold` times in a row while not ejected, which makes
+    /// it eligible for [`Health::eject`]. Failures while ejected are ignored.
+    pub fn record_failure(&self, now: Nanos, policy: &HealthPolicy) -> bool {
+        if self.is_ejected(now) {
+            return false;
         }
         let failures = self.failures.fetch_add(1, Ordering::AcqRel) + 1;
-        if failures < policy.unhealthy_threshold {
+        failures >= policy.unhealthy_threshold
+    }
+
+    /// Ejects the replica for its next backoff window unless it already is;
+    /// of any number of concurrent callers exactly one succeeds.
+    pub fn eject(&self, now: Nanos, policy: &HealthPolicy) -> Option<Ejection> {
+        let until = self.ejected_until.load(Ordering::Acquire);
+        if now < until {
             return None;
         }
         let clean = until == 0 || now - until >= duration_nanos(policy.max_ejection_backoff);
@@ -186,6 +193,14 @@ mod tests {
 
     const MS: u64 = 1_000_000;
 
+    fn fail(health: &Health, now: Nanos, p: &HealthPolicy) -> Option<Ejection> {
+        if health.record_failure(now, p) {
+            health.eject(now, p)
+        } else {
+            None
+        }
+    }
+
     fn policy() -> HealthPolicy {
         HealthPolicy {
             unhealthy_threshold: 3,
@@ -207,12 +222,12 @@ mod tests {
     #[test]
     fn threshold_failures_eject_and_success_resets_the_streak() {
         let (health, p) = (Health::default(), policy());
-        assert!(health.record_failure(10, &p).is_none());
-        assert!(health.record_failure(11, &p).is_none());
+        assert!(fail(&health, 10, &p).is_none());
+        assert!(fail(&health, 11, &p).is_none());
         health.record_success();
-        assert!(health.record_failure(12, &p).is_none());
-        assert!(health.record_failure(13, &p).is_none());
-        let ejection = health.record_failure(14, &p).unwrap();
+        assert!(fail(&health, 12, &p).is_none());
+        assert!(fail(&health, 13, &p).is_none());
+        let ejection = fail(&health, 14, &p).unwrap();
         assert_eq!(ejection.length, Duration::from_millis(100));
         assert!(!health.is_routable(15));
         assert!(health.is_routable(14 + 100 * MS));
@@ -226,7 +241,7 @@ mod tests {
         for _ in 0..6 {
             let mut ejection = None;
             while ejection.is_none() {
-                ejection = health.record_failure(now, &p);
+                ejection = fail(&health, now, &p);
             }
             let ejection = ejection.unwrap();
             lengths.push(ejection.length.as_millis());
@@ -235,22 +250,19 @@ mod tests {
         assert_eq!(lengths, [100, 200, 400, 800, 1_000, 1_000]);
         now += 1_000 * MS;
         for _ in 0..2 {
-            assert!(health.record_failure(now, &p).is_none());
+            assert!(fail(&health, now, &p).is_none());
         }
-        assert_eq!(
-            health.record_failure(now, &p).unwrap().length.as_millis(),
-            100
-        );
+        assert_eq!(fail(&health, now, &p).unwrap().length.as_millis(), 100);
     }
 
     #[test]
     fn failures_while_ejected_are_ignored() {
         let (health, p) = (Health::default(), policy());
         for _ in 0..3 {
-            health.record_failure(5, &p);
+            fail(&health, 5, &p);
         }
         for _ in 0..50 {
-            assert!(health.record_failure(6, &p).is_none());
+            assert!(fail(&health, 6, &p).is_none());
         }
         assert_eq!(health.consecutive_failures(), 0);
     }
@@ -280,7 +292,7 @@ mod tests {
                 std::thread::spawn(move || {
                     barrier.wait();
                     (0..100)
-                        .filter(|_| health.record_failure(7, &policy()).is_some())
+                        .filter(|_| fail(&health, 7, &policy()).is_some())
                         .count()
                 })
             })
@@ -291,6 +303,22 @@ mod tests {
     }
 
     #[test]
+    fn a_declined_ejection_keeps_the_replica_eligible() {
+        let (health, p) = (Health::default(), policy());
+        assert!(!health.record_failure(1, &p));
+        assert!(!health.record_failure(2, &p));
+        assert!(health.record_failure(3, &p));
+        assert!(
+            health.record_failure(4, &p),
+            "still eligible after a decline"
+        );
+        assert!(health.is_routable(5));
+        assert!(health.eject(5, &p).is_some());
+        assert!(health.eject(6, &p).is_none(), "already ejected");
+        assert!(!health.record_failure(7, &p));
+    }
+
+    #[test]
     fn clock_never_reports_zero() {
         assert!(Clock::default().now() >= 1);
     }
@@ -298,7 +326,7 @@ mod tests {
     #[derive(Debug, Clone)]
     enum Event {
         Success,
-        Failure,
+        Failure { allowed: bool },
         Probe(bool),
         Advance(u64),
     }
@@ -314,12 +342,12 @@ mod tests {
     }
 
     impl Model {
-        fn failure(&mut self, now: u64, p: &HealthPolicy) -> Option<Duration> {
+        fn failure(&mut self, now: u64, p: &HealthPolicy, allowed: bool) -> Option<Duration> {
             if now < self.until {
                 return None;
             }
             self.failures += 1;
-            if self.failures < p.unhealthy_threshold {
+            if self.failures < p.unhealthy_threshold || !allowed {
                 return None;
             }
             let max = p.max_ejection_backoff.as_nanos() as u64;
@@ -362,7 +390,7 @@ mod tests {
     fn event() -> impl Strategy<Value = Event> {
         prop_oneof![
             2 => Just(Event::Success),
-            5 => Just(Event::Failure),
+            5 => prop::bool::weighted(0.8).prop_map(|allowed| Event::Failure { allowed }),
             2 => any::<bool>().prop_map(Event::Probe),
             3 => (0u64..1_500).prop_map(|ms| Event::Advance(ms * MS)),
         ]
@@ -392,9 +420,13 @@ mod tests {
                         health.record_success();
                         model.failures = 0;
                     }
-                    Event::Failure => {
-                        let got = health.record_failure(now, &p).map(|e| e.length);
-                        prop_assert_eq!(got, model.failure(now, &p));
+                    Event::Failure { allowed } => {
+                        let got = if health.record_failure(now, &p) && allowed {
+                            health.eject(now, &p).map(|e| e.length)
+                        } else {
+                            None
+                        };
+                        prop_assert_eq!(got, model.failure(now, &p, allowed));
                         if let Some(length) = got {
                             prop_assert!(length <= p.max_ejection_backoff);
                             prop_assert!(!health.is_routable(now));

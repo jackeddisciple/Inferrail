@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::hash::{BuildHasher, RandomState};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use inferrail_control::discovery::refresh;
 use inferrail_control::{
@@ -55,6 +55,7 @@ pub(crate) struct Shared {
     health: HealthPolicy,
     started_unix: u64,
     resolver: Arc<dyn Resolve>,
+    ejecting: Mutex<()>,
 }
 
 impl Shared {
@@ -126,6 +127,7 @@ impl Gateway {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs()),
             resolver,
+            ejecting: Mutex::new(()),
             names,
             policies,
             config,
@@ -141,6 +143,11 @@ impl Gateway {
 
     pub fn registry(&self) -> &Registry {
         &self.shared.registry
+    }
+
+    /// The clock health and ejection deadlines are measured on.
+    pub fn clock(&self) -> Clock {
+        self.shared.clock
     }
 
     /// Serves until `shutdown` resolves, then drains open connections for at

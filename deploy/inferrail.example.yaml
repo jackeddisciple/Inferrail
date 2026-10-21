@@ -59,6 +59,7 @@ health:
   healthy_threshold: 2
   ejection_backoff: 5s
   max_ejection_backoff: 1m
+  max_ejection_percent: 50
 
 retry:
   max_attempts: 3

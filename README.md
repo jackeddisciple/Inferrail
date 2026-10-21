@@ -146,8 +146,12 @@ breaks after it started is never replayed. The reasoning is in
 `health.interval` and leaves rotation after `unhealthy_threshold` failed
 probes. Independently, `unhealthy_threshold` consecutive failed requests
 eject it for `ejection_backoff`, doubling on every repeat up to
-`max_ejection_backoff`. Under load a crashed replica is out of rotation in
-milliseconds; it comes back once probes pass and its window ends.
+`max_ejection_backoff`. Failed requests never eject more than
+`max_ejection_percent` (half by default) of the replicas of a model that
+pass their health checks, so requests that make every engine fail cannot
+empty the pool. Under load a
+crashed replica is out of rotation in milliseconds; it comes back once
+probes pass and its window ends.
 
 **Breakers.** `max_concurrency` caps requests in flight to a replica and
 `max_pending` caps those still waiting for a response head. Caps never

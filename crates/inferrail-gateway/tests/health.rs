@@ -206,3 +206,115 @@ async fn outlier_ejection_caps_errors_from_a_replica_that_answers_500() {
     }
     assert_eq!(errors, 2, "unhealthy_threshold is 2");
 }
+
+fn ejected(gw: &TestGateway) -> usize {
+    let now = gw.gateway.clock().now();
+    gw.gateway
+        .registry()
+        .load()
+        .replicas()
+        .iter()
+        .filter(|r| r.health().is_ejected(now))
+        .count()
+}
+
+#[tokio::test]
+async fn replicas_already_down_do_not_count_toward_the_cap() {
+    let sims = fleet_of(4).await;
+    let gw = TestGateway::start(fleet(
+        &all(&sims),
+        &format!("{FAST_HEALTH}routing:\n  default_policy: round_robin\n"),
+    ))
+    .await;
+    sims[0].kill();
+    sims[1].kill();
+    let (r0, r1) = (gw.replica("r0"), gw.replica("r1"));
+    wait_until(Duration::from_secs(2), || {
+        !r0.health().probe_up() && !r1.health().probe_up()
+    })
+    .await;
+    sims[2].set_request_fault(Fault::Status(500));
+    sims[3].set_request_fault(Fault::Status(500));
+    for _ in 0..20 {
+        let _ = gw.post("/v1/chat/completions", &chat("poison", 1)).await;
+    }
+    sims[2].set_request_fault(Fault::None);
+    sims[3].set_request_fault(Fault::None);
+    let (status, body) = gw
+        .post_json("/v1/chat/completions", &chat("legit", 1))
+        .await;
+    assert_eq!(status, 200, "{body}");
+}
+
+#[tokio::test]
+async fn poison_requests_cannot_eject_the_whole_pool() {
+    let sims = fleet_of(3).await;
+    let gw = TestGateway::start(fleet(
+        &all(&sims),
+        &format!("{FAST_HEALTH}routing:\n  default_policy: round_robin\n"),
+    ))
+    .await;
+    for sim in &sims {
+        sim.set_request_fault(Fault::Status(500));
+    }
+    for _ in 0..30 {
+        let status = gw
+            .post("/v1/chat/completions", &chat("poison", 1))
+            .await
+            .status();
+        assert_eq!(status, 500);
+        assert!(ejected(&gw) <= 1, "half of three is one");
+    }
+    assert_eq!(ejected(&gw), 1);
+    for sim in &sims {
+        sim.set_request_fault(Fault::None);
+    }
+    let (status, body) = gw
+        .post_json("/v1/chat/completions", &chat("legit", 1))
+        .await;
+    assert_eq!(status, 200, "{body}");
+}
+
+#[tokio::test]
+async fn a_sole_replica_is_never_ejected_by_failed_requests() {
+    let sims = fleet_of(1).await;
+    let gw = TestGateway::start(fleet(&all(&sims), FAST_HEALTH)).await;
+    sims[0].set_request_fault(Fault::Status(500));
+    for _ in 0..10 {
+        assert_eq!(
+            gw.post("/v1/chat/completions", &chat("x", 1))
+                .await
+                .status(),
+            500
+        );
+    }
+    assert_eq!(ejected(&gw), 0);
+    sims[0].set_request_fault(Fault::None);
+    assert_eq!(
+        gw.post("/v1/chat/completions", &chat("x", 1))
+            .await
+            .status(),
+        200
+    );
+}
+
+#[tokio::test]
+async fn the_ejection_cap_is_configurable() {
+    for (percent, cap) in [(0, 0), (100, 2)] {
+        let sims = fleet_of(2).await;
+        let gw = TestGateway::start(fleet(
+            &all(&sims),
+            &format!(
+                "{FAST_HEALTH}  max_ejection_percent: {percent}\nrouting:\n  default_policy: round_robin\n"
+            ),
+        ))
+        .await;
+        for sim in &sims {
+            sim.set_request_fault(Fault::Status(500));
+        }
+        for _ in 0..12 {
+            let _ = gw.post("/v1/chat/completions", &chat("x", 1)).await;
+        }
+        assert_eq!(ejected(&gw), cap, "max_ejection_percent {percent}");
+    }
+}

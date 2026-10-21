@@ -321,6 +321,9 @@ impl Config {
         if health.healthy_threshold == 0 {
             c.push("health.healthy_threshold", "must be at least 1");
         }
+        if health.max_ejection_percent > 100 {
+            c.push("health.max_ejection_percent", "must be at most 100");
+        }
     }
 
     fn check_retry(&self, c: &mut Collector) {
@@ -705,6 +708,17 @@ discovery:
         config.health.unhealthy_threshold = 0;
         config.health.healthy_threshold = 0;
         assert_eq!(issues(&config).len(), 2);
+
+        let mut config = base();
+        config.health.max_ejection_percent = 101;
+        assert_eq!(
+            only_issue(&config),
+            "health.max_ejection_percent: must be at most 100"
+        );
+        for percent in [0, 100] {
+            config.health.max_ejection_percent = percent;
+            assert!(config.validate().is_ok());
+        }
     }
 
     #[test]

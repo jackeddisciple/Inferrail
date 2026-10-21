@@ -294,6 +294,9 @@ pub struct HealthConfig {
     pub ejection_backoff: Duration,
     #[serde(with = "humantime_serde")]
     pub max_ejection_backoff: Duration,
+    /// The largest share of a model's replicas passing health checks that
+    /// failed requests may eject at once.
+    pub max_ejection_percent: u32,
 }
 
 impl Default for HealthConfig {
@@ -305,6 +308,7 @@ impl Default for HealthConfig {
             healthy_threshold: 2,
             ejection_backoff: Duration::from_secs(5),
             max_ejection_backoff: Duration::from_secs(60),
+            max_ejection_percent: 50,
         }
     }
 }
@@ -366,6 +370,7 @@ replicas:
         assert!(!config.logging.log_prompts);
         assert_eq!(config.retry.max_attempts, 3);
         assert_eq!(config.health.interval, Duration::from_secs(1));
+        assert_eq!(config.health.max_ejection_percent, 50);
         assert_eq!(config.replicas[0].url.as_str(), "http://10.0.0.10:8000/");
         assert_eq!(config.replicas[0].max_pending, None);
         assert_eq!(config.upstream.connect_timeout, Duration::from_secs(2));
