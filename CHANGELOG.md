@@ -3,6 +3,91 @@
 Notable changes to Inferrail. Versions follow
 [Semantic Versioning](https://semver.org).
 
+## [0.1.3] OpenAI Compatible Gateway, Baseline Routing Policies and Failure Handling (21 October 2026)
+
+The gateway becomes usable: it routes chat and completions across a fleet
+of engines with a choice of baseline policies, streams responses untouched,
+and keeps clients whole when replicas crash, hang, flap or disappear.
+
+### Added
+
+#### `inferrail-gateway`
+
+* OpenAI compatible proxy on hyper for `POST /v1/chat/completions` and
+  `POST /v1/completions`, plus `GET /v1/models` and `GET /health`, over
+  HTTP/1.1 and h2c. Other routes and methods get OpenAI shaped 404 and 405
+  answers.
+* Request bodies forwarded byte for byte. Only the `model` field is read,
+  and only its bytes are rewritten when a client uses a gateway alias or
+  omits the model while one model is served.
+* Streaming pass through: engine frames reach the client as they arrive,
+  with no per token state and memory bounded by backpressure.
+* Request IDs: a well formed client `x-request-id` is kept, otherwise one is
+  minted; it reaches the engine and comes back on every response, along
+  with `x-inferrail-replica` on proxied ones.
+* Retries on another replica only before the first response byte, for
+  connect failures, early closes and 502, 503 or 504 answers, bounded by
+  `retry.max_attempts`, exponential backoff and the request deadline.
+* Passive outlier ejection after consecutive failures, with ejection windows
+  that double up to a cap and reset after a clean stretch.
+* Model list served from memory, built from the cards each engine publishes
+  and refreshed alongside health probes, aliases included.
+* Graceful shutdown bounded by `server.shutdown_timeout`, a header read
+  timeout against slow clients, and request bodies drained before local
+  error answers so uploading clients get the error rather than a reset.
+* `--check` validates a config and exits.
+
+#### `inferrail-policy`
+
+* The `RoutingPolicy` trait and `RouteContext`, with `round_robin`,
+  `random`, `least_request` and `p2c`, chosen per model. Randomness is a lock
+  free SplitMix64 seeded per model from `routing.seed`.
+* `prefix_hash`, `kv_aware` and `cost_model` route as `p2c`, their
+  documented fallback, until the KV index exists, with a startup warning.
+
+#### `inferrail-control`
+
+* Replica registry swapped atomically for lock free reads, with in flight
+  and pending counters whose caps hold under any race.
+* Health state combining active probes with passive ejection, and the
+  active checker that probes every replica in parallel each interval.
+* DNS discovery through a pluggable resolver: groups are resolved before the
+  first request and on every refresh, survivors keep their state, leavers
+  finish their streams and failed lookups keep the last known members.
+
+#### Configuration
+
+* `upstream` section for the connection pool: connect timeout, idle timeout,
+  idle connections per host and h2c.
+* `discovery.dns` groups, `replicas[].max_pending`, and
+  `server.header_read_timeout` and `server.shutdown_timeout`.
+* `deploy/local.yaml` for three local simulators behind one gateway.
+
+#### Tests
+
+* Property tests for every policy, fleet membership and replica health
+  against naive reference models, the body splice, stream byte equality
+  under any chunking, request body equality, gateway HTTP fuzzing, and the
+  rule that no policy ever reaches an unhealthy replica or one that does not
+  serve the model.
+* Integration tests against three in process simulators that can be killed
+  for real or made to refuse, close, hang, delay or fail on demand.
+* Stress suite for the gateway: 2,000 concurrent streams, open loop overhead
+  against a direct simulator at 2,000 and 5,000 req/s, a simulator killed
+  and restarted under load, a flapping replica, a disconnect storm, hostile
+  requests, a soak and slow readers.
+* The OpenAI SDK suites now also run through the gateway binary in front of
+  three simulators.
+* ADR 003 (gateway proxy and failure semantics) and ADR 004 (routing
+  policies).
+
+### Changed
+
+* `replicas` may be empty when DNS groups serve every model, and the "no
+  replica serves" check counts DNS groups.
+* The SDK suites moved from `bench/tests/sim` to `bench/tests/e2e`; `make e2e`,
+  `make stress` and the CI e2e job build and drive the gateway as well.
+
 ## [0.1.1] Reliability, Security and vLLM Parity Hardening (21 October 2026)
 
 A hardening pass over everything in 0.1.0, driven by a new round of
@@ -112,5 +197,6 @@ The first release: project foundations and a faithful vLLM simulator.
   disconnect storms, malformed bodies, long prompts and a memory soak.
 * OpenAI Python SDK suite, sync and async, against the simulator binary.
 
-[0.1.1]: https://github.com/jackeddisciple/Inferrail/tree/main
+[0.1.3]: https://github.com/jackeddisciple/Inferrail/tree/main
+[0.1.1]: https://github.com/jackeddisciple/Inferrail/tree/664e148a663636837ea98cb32ddc8676dd8b7093
 [0.1.0]: https://github.com/jackeddisciple/Inferrail/tree/1bb0c4501423ae6499844e25290da8a7b04793aa

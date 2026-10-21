@@ -12,11 +12,13 @@ most of its prompt in cache, without letting any replica overload.
 The goal is lower tail latency and fewer GPUs for the same traffic, proven
 with benchmarks anyone can rerun.
 
-> **Status: v0.1.1, foundations.** This release ships the workspace, the
-> shared wire types and configuration, and `inferrail-sim`, a mock vLLM
-> engine that the rest of the project is built and benchmarked against. The
-> gateway, index and routing policies are scaffolded crates and not usable
-> yet. See [Roadmap](#roadmap).
+> **Status: v0.1.3, gateway and baselines.** The gateway is usable: it
+> proxies chat and completions to a fleet of engines, streams responses
+> untouched, retries before the first byte, ejects failing replicas,
+> discovers replicas through DNS and routes with four baseline policies.
+> The KV index and the cost model come next, so the cache aware policies
+> currently route by their documented fallback, power of two choices. See
+> [Roadmap](#roadmap).
 
 ## Why this exists
 
@@ -43,15 +45,18 @@ the cache away. Inferrail treats routing as a cost estimate instead: for each
 replica, how long until this request's first token, given what is cached
 there and what is queued there?
 
-## What is in v0.1.1
+## What is in v0.1.3
 
 | Piece | What it does |
 | --- | --- |
-| `inferrail-core` | Lossless OpenAI wire types for chat, completions, chunks, usage, models and errors; an incremental SSE decoder; validated YAML configuration |
+| `inferrail-gateway` | OpenAI compatible proxy on hyper: chat and completions, streaming pass through, model list, request IDs, retries before the first byte, health checks, outlier ejection, breakers, DNS discovery, graceful shutdown |
+| `inferrail-policy` | The `RoutingPolicy` trait and the round robin, random, least request and power of two choices baselines, chosen per model |
+| `inferrail-control` | Lock free replica registry, health state with exponential ejection backoff, the active health checker and DNS discovery |
+| `inferrail-core` | Lossless OpenAI wire types, an incremental SSE decoder and validated YAML configuration |
 | `inferrail-sim` | A CPU mock of vLLM v0.31.0 with the same HTTP API, streaming bytes and Prometheus metrics, a calibrated latency model and a real prefix cache |
-| Other crates | `tokenize`, `index`, `events`, `policy`, `load`, `control`, `gateway`, `calibrate` compile as stubs with the boundaries the router will use |
-| `bench/` | Python 3.12 package managed by uv; today it holds the OpenAI SDK compatibility and load suites |
-| CI | fmt, clippy with warnings denied, nextest, doc tests, pytest, and the official OpenAI SDK against the simulator on every push |
+| Other crates | `tokenize`, `index`, `events`, `load` and `calibrate` compile as stubs with the boundaries the router will use |
+| `bench/` | Python 3.12 package managed by uv; today it holds the OpenAI SDK suites, run against the simulator and through the gateway |
+| CI | fmt, clippy with warnings denied, nextest, doc tests, ruff, pytest, `cargo audit`, `cargo machete`, and the official OpenAI SDK against the simulator and the gateway on every push |
 
 ## Quick start
 
@@ -59,28 +64,37 @@ Requirements: Rust (the pinned 1.98.1 toolchain installs itself through
 rustup), [uv](https://docs.astral.sh/uv/) for the Python side, and optionally
 [`cargo-nextest`](https://nexte.st).
 
+Start three simulated engines and a gateway in front of them:
+
 ```sh
-cargo run --release -p inferrail-sim -- --port 8000 --enable-prompt-tokens-details
+cargo build --release -p inferrail-sim -p inferrail-gateway
+for port in 8001 8002 8003; do
+  ./target/release/inferrail-sim --port $port --enable-prompt-tokens-details &
+done
+./target/release/inferrail-gateway --config deploy/local.yaml
 ```
 
-Talk to it like any vLLM server:
+Talk to the gateway like any vLLM server. `sim` is an alias the gateway
+resolves to `inferrail/sim-8b`:
 
 ```sh
-curl -s localhost:8000/v1/chat/completions \
+curl -si localhost:8080/v1/chat/completions \
   -H 'content-type: application/json' \
-  -d '{"model": "inferrail/sim-8b",
+  -d '{"model": "sim",
        "messages": [{"role": "user", "content": "Hello"}],
        "max_tokens": 16}'
 ```
 
-or with the official SDK, changing nothing but the base URL:
+The response headers name the replica that served it (`x-inferrail-replica`)
+and the request ID the engine used (`x-request-id`). The official SDK works
+by changing nothing but the base URL:
 
 ```python
 from openai import OpenAI
 
-client = OpenAI(base_url="http://localhost:8000/v1", api_key="unused")
+client = OpenAI(base_url="http://localhost:8080/v1", api_key="unused")
 stream = client.chat.completions.create(
-    model="inferrail/sim-8b",
+    model="sim",
     messages=[{"role": "user", "content": "Hello"}],
     max_tokens=16,
     stream=True,
@@ -90,9 +104,90 @@ for chunk in stream:
     print(chunk)
 ```
 
-Send the same long system prompt twice and the second response reports the
-reused tokens in `usage.prompt_tokens_details.cached_tokens`, with a much
-shorter time to first token.
+Kill one of the simulators while traffic is flowing: only responses it was
+already sending can break. The gateway retries every request that had not
+started on another replica, ejects the dead one within milliseconds and
+readmits it once it is back.
+`inferrail-gateway --check --config <file>` validates a config and exits.
+
+## The gateway
+
+**Routes.** `POST /v1/chat/completions` and `POST /v1/completions` are
+proxied; `GET /v1/models` and `GET /health` are answered locally. Other paths
+get a 404 and wrong methods a 405 with `Allow`, in the OpenAI error shape
+vLLM uses. HTTP/1.1 and h2c are accepted from clients; engines are reached
+over pooled HTTP/1.1 keep alive connections, or h2c with `upstream.http2`.
+
+**Pass through.** The request body is read once and forwarded byte for
+byte; only the `model` field is parsed. When a client asks for a gateway
+alias, or omits the model while the gateway serves exactly one, only those
+bytes are rewritten so the engine sees a name it serves. Responses stream
+back frame by frame as they arrive, with headers intact except hop by hop
+ones, and the gateway holds no per token state. Every response carries
+`x-request-id` (the client's own when well formed, which vLLM also uses as
+the response id), and proxied ones name their replica in
+`x-inferrail-replica`. Request bodies are never logged unless
+`logging.log_prompts` is on.
+
+**Models.** `GET /v1/models` lists the configured models and aliases in
+config order, with the metadata the engines published (context length,
+root, permissions). The health checker refreshes those cards in the
+background, so listing never calls an engine.
+
+**Retries.** A request moves to another replica only before the first
+response byte reaches the client: when the connection fails, the replica
+closes before answering, or it answers 502, 503 or 504. Untried replicas come
+first, attempts stop at `retry.max_attempts` with exponential backoff, and
+everything shares the `server.request_timeout` deadline. A stream that
+breaks after it started is never replayed. The reasoning is in
+[ADR 003](docs/adr/003-gateway-proxy-and-failure-semantics.md).
+
+**Health and ejection.** Every replica is probed at `/health` each
+`health.interval` and leaves rotation after `unhealthy_threshold` failed
+probes. Independently, `unhealthy_threshold` consecutive failed requests
+eject it for `ejection_backoff`, doubling on every repeat up to
+`max_ejection_backoff`. Under load a crashed replica is out of rotation in
+milliseconds; it comes back once probes pass and its window ends.
+
+**Breakers.** `max_concurrency` caps requests in flight to a replica and
+`max_pending` caps those still waiting for a response head. Caps never
+overshoot, even under races. A full replica is skipped and a full fleet gets
+an immediate 503 with `Retry-After`, so a replica that hangs stops absorbing
+traffic instead of making every client wait.
+
+**Discovery.** Replicas come from the config, from DNS groups, or both. Each
+address a group name resolves to becomes a replica named
+`<group>-<ip>-<port>`. Groups are resolved before the first request and then
+every `refresh`; members that stay keep their health and counters, members
+that leave finish their streams, and a failed lookup keeps the last known
+set.
+
+**Cancellation and shutdown.** A client that disconnects, whether streaming,
+queued in the engine or waiting for a full response, frees the engine's slot
+within 100 ms. On SIGTERM the gateway stops accepting, lets running streams
+finish for up to `server.shutdown_timeout`, then closes what is left.
+
+## Routing policies
+
+Every policy implements one `RoutingPolicy` trait and is chosen per model in
+the config, so baselines and the main policy run in the same binary on the
+same candidates. The gateway only ever offers a policy replicas that serve
+the model, are healthy and have room. See
+[ADR 004](docs/adr/004-routing-policies.md).
+
+| Policy | Rule | Status |
+| --- | --- | --- |
+| `round_robin` | next replica in turn | available |
+| `random` | uniform choice | available |
+| `least_request` | fewest requests in flight, ties broken at random | available |
+| `p2c` | two random replicas, the less loaded wins | available |
+| `prefix_hash` | consistent hash on the first blocks | needs the KV index; routes as `p2c` meanwhile |
+| `kv_aware` | weighted cache hit and load score | needs the KV index; routes as `p2c` meanwhile |
+| `cost_model` | lowest estimated time to first token | needs the KV index; routes as `p2c` meanwhile |
+
+Randomized policies are seeded from `routing.seed`, so a fixed seed replays
+the same choices. A choice takes 2 to 106 ns on an Apple silicon laptop, from
+round robin to least request over 256 replicas.
 
 ## The simulator
 
@@ -166,81 +261,108 @@ answer that silently differs from vLLM; stop strings are ignored.
 
 ## Configuration
 
-The gateway reads one YAML file. Only `models` and `replicas` are required;
-everything else has a safe default, unknown keys are rejected, and every
-problem is reported at once with its path.
+The gateway reads one YAML file. Only `models` and at least one replica or
+DNS group are required; everything else has a safe default, unknown keys are
+rejected, and every problem is reported at once with its path.
 
 ```yaml
 models:
   - name: meta-llama/Llama-3.1-8B-Instruct
     aliases: [llama-8b]
+    policy: least_request
 replicas:
   - id: gpu-0
     url: http://10.0.0.10:8000
     models: [meta-llama/Llama-3.1-8B-Instruct]
+    max_concurrency: 256
+    max_pending: 32
+discovery:
+  dns:
+    - name: llama-pool
+      url: http://vllm.inference.svc.cluster.local:8000
+      models: [meta-llama/Llama-3.1-8B-Instruct]
+      refresh: 2s
 routing:
   default_policy: cost_model
-  epsilon: 0.25
-  kappa: 0.92
+  seed: 42
+health:
+  interval: 1s
+  timeout: 500ms
+  unhealthy_threshold: 3
+  ejection_backoff: 5s
+retry:
+  max_attempts: 3
+  backoff: 25ms
 ```
 
 See [`deploy/inferrail.example.yaml`](deploy/inferrail.example.yaml) for every
-option.
+option with its default, and [`deploy/local.yaml`](deploy/local.yaml) for the
+quick start fleet.
 
 ## Testing
 
 `make check` runs formatting, clippy with warnings denied, ruff, every Rust
 test and the Python tests. `make audit` checks dependencies against the
-RustSec advisory database and for unused crates; CI runs it on every push. Beyond unit tests the suite includes:
+RustSec advisory database and for unused crates. Beyond unit tests the suite
+includes:
 
-* **Property tests** for SSE decoding of arbitrary bytes under any chunking,
-  prefix stability of the tokenizer, block hash chaining, the LRU against a
-  naive reference model, latency monotonicity and config round trips.
-* **Fuzzing**: thousands of random request and response bodies must round
-  trip losslessly whenever a wire type accepts them; random engine schedules
-  with cancellations run on a paused clock and must keep FIFO admission, the
-  sequence cap and clean accounting; random HTTP requests must get responses
-  that obey the vLLM contract, streamed or not.
-* **Hostile config**: deeply nested and alias bomb YAML is rejected in
-  milliseconds, and credentials in replica URLs are refused.
-* **Fixture tests**: OpenAI payloads must round trip canonically and vLLM
-  payloads byte for byte.
-* **Parity tests** holding the simulator's streams, responses, errors and
-  metrics to the vLLM fixtures.
-* **Behaviour tests** over HTTP: cache hits cut TTFT, later turns reuse
-  earlier ones, prefills queue, the sequence cap holds, and a disconnect
-  frees its slot in under 100 ms.
+* **Property tests** for SSE decoding under any chunking, tokenizer prefix
+  stability, block hash chaining, the prefix cache LRU, latency
+  monotonicity, config round trips, uniform policy choices under fixed seeds,
+  least request always picking a minimum, power of two choices never picking
+  a unique maximum, fleet membership and replica health against naive
+  reference models, and the request splice changing nothing but the model.
+* **Gateway invariants**: no policy ever routes to an unhealthy replica or
+  one that does not serve the model; bytes the engine sends reach the client
+  unchanged under any chunking; request bodies reach the engine byte for
+  byte; no request, however malformed, gets a gateway failure; a request
+  succeeds whenever a healthy replica is within its attempts.
+* **Fuzzing**: random wire payloads must round trip, random engine schedules
+  must keep FIFO admission and clean accounting, random HTTP requests must
+  get responses that obey the vLLM contract, and hostile YAML fails fast.
+* **Integration tests** against three in process simulators that can be
+  killed for real or made to refuse, close, hang, delay or fail on demand:
+  routing, retries, ejection and readmission, DNS joins and leaves, breakers,
+  disconnects, graceful shutdown, header timeouts and log hygiene.
 * **SDK tests** (`make e2e`): the official OpenAI Python SDK, sync and async,
-  against the simulator binary.
-* **Stress tests** (`make stress`), on an Apple silicon laptop:
+  against the simulator binary and through the gateway binary in front of
+  three simulators.
+* **Stress tests** (`make stress`), on an Apple silicon laptop with client,
+  gateway and simulators sharing one machine:
 
 | Scenario | Result |
 | --- | --- |
-| 2,000 concurrent SSE streams | all complete in 0.55 s, zero errors |
-| Open loop at 2,000 req/s for 10,000 requests | zero errors, p99 0.23 ms |
-| 1,000 streams with 740 random disconnects | every abort counted, nothing leaked |
-| 3,000 malformed and fuzzed bodies | zero server errors |
-| 64 prompts near the 32k context limit | served, cache shared across them |
-| 35,000 request soak | resident memory grew under 20 MB, within its 64 MB budget |
-| 1,000 concurrent streams through the async SDK | all complete with exact usage |
+| 2,000 concurrent streams through the gateway over 3 simulators | all complete in 0.3 to 0.7 s, zero errors, even spread |
+| Open loop at 2,000 and 5,000 req/s, 10,000 requests each | the gateway adds 0.04 to 0.11 ms at p50 and under 0.6 ms at p99 |
+| A simulator killed under 1,000 req/s, then restarted | zero errors for requests sent after the kill, ejected within 3 ms, back in rotation within 60 ms |
+| A replica flapping between healthy and 503 every 100 ms at 1,000 req/s | zero client errors |
+| 1,000 streams with 741 random disconnects | every disconnect aborted in the engine, nothing leaked |
+| 3,000 hostile requests | zero gateway failures |
+| 35,000 request soak through the gateway | resident memory grew under 8 MB |
+| 640 MiB streamed to 20 clients that stop reading | about 20 MB held in total |
+| 1,000 concurrent streams through the async SDK, direct and via the gateway | all complete with exact usage |
+| 2,000 concurrent SSE streams straight to one simulator | all complete in 0.55 s, zero errors |
+| 35,000 request simulator soak | resident memory grew under 20 MB |
+
+The suite runs clean ten times in a row with every core saturated.
 
 ## Repository layout
 
 ```
 crates/
   inferrail-core/        wire types, SSE codec, configuration
+  inferrail-gateway/     the router: proxy, retries, health, discovery wiring
+  inferrail-policy/      routing policy trait and baseline policies
+  inferrail-control/     replica registry, health, ejection, DNS discovery
   inferrail-sim/         mock vLLM engine (binary and library)
   inferrail-tokenize/    chat templates, tokenization, block hashing
   inferrail-index/       KV block index
   inferrail-events/      engine KV event subscribers
-  inferrail-policy/      routing policies and the TTFT cost model
   inferrail-load/        engine metrics scraping, load snapshots
-  inferrail-control/     discovery, health, admission, admin API
-  inferrail-gateway/     the router binary
   inferrail-calibrate/   engine profiler that fits the cost model
-bench/                   Python tooling and SDK suites
+bench/                   Python tooling and the OpenAI SDK suites
 tests/fixtures/          OpenAI and vLLM reference payloads
-deploy/                  example configuration
+deploy/                  example and local configurations
 docs/adr/                architecture decision records
 ```
 
@@ -251,12 +373,14 @@ with fewer GPUs than a cache blind balancer, while adding under 1 ms of its
 own latency. Every number below is a target to prove or disprove with
 committed, rerunnable benchmarks, not a claim.
 
-* **Gateway.** OpenAI compatible proxy with zero copy streaming, pooled
-  upstream connections, retries only before the first byte, client
-  cancellation propagated upstream, health checks and outlier ejection.
-* **Baselines.** Round robin, random, least request and power of two choices
-  behind one routing policy trait, so every comparison is fair and runs in
-  one binary.
+* **Gateway and baselines.** Shipped in v0.1.3: OpenAI compatible proxy,
+  zero copy streaming, retries before the first byte, health checks, outlier
+  ejection, breakers, DNS discovery, cancellation, and four baseline
+  policies behind one trait.
+* **Load signals and observability.** Engine metrics scraping merged with
+  the gateway's own counts, Prometheus metrics, OpenTelemetry traces with
+  routing attributes, Grafana dashboards, and a benchmark harness that
+  compares the baselines on the simulator.
 * **Tokens and hashes.** Real chat templates and tokenizers with byte level
   parity against Python `transformers`, and chained XXH3 128 bit block hashes
   salted by model and LoRA adapter.
@@ -267,8 +391,7 @@ committed, rerunnable benchmarks, not a claim.
   uncached tokens plus tier load time, with bounded load, KV pressure guards,
   hot prefix replication and optional session affinity.
 * **Production controls.** SLO aware admission, token based rate limits,
-  hot reload, shadow mode, an explain endpoint, Prometheus metrics,
-  OpenTelemetry traces and Grafana dashboards.
+  hot reload, shadow mode, an explain endpoint, API keys and TLS.
 * **Advanced regimes.** Disaggregated prefill and decode pools, tiered KV
   cache across GPU, CPU and disk, and Kubernetes packaging.
 * **Proof.** A benchmark report against cache blind baselines on synthetic
