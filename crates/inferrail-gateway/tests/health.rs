@@ -8,7 +8,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use common::*;
-use inferrail_control::Clock;
 
 async fn fleet_of(n: usize) -> Vec<Upstream> {
     let mut sims = Vec::new();
@@ -65,7 +64,7 @@ async fn a_replica_killed_under_load_is_ejected_fast_with_zero_errors() {
     killed.store(true, Ordering::SeqCst);
     sims[1].kill();
     let r1 = gw.replica("r1");
-    let clock = Clock::default();
+    let clock = gw.gateway.clock();
     let ejected_in = wait_until(Duration::from_secs(2), || !r1.is_routable(clock.now())).await;
     for task in tasks {
         task.await.unwrap();
@@ -159,7 +158,7 @@ async fn a_replica_that_keeps_failing_requests_backs_off_exponentially() {
     .await;
     sims[0].set_request_fault(Fault::Status(503));
     let r0 = gw.replica("r0");
-    let clock = Clock::default();
+    let clock = gw.gateway.clock();
     let mut windows: Vec<u64> = Vec::new();
     let mut last_until = 0;
     let started = Instant::now();

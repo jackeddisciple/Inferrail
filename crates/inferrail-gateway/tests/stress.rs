@@ -234,7 +234,7 @@ async fn a_sim_killed_and_restarted_under_open_loop_load() {
     let mut restarted_at = None;
     let mut ejected_at = None;
     let r1 = gw.replica("r1");
-    let clock = inferrail_control::Clock::default();
+    let clock = gw.gateway.clock();
     for i in 0..total {
         tokio::time::sleep_until(started + interval * i as u32).await;
         if killed_at.is_some() && ejected_at.is_none() && !r1.is_routable(clock.now()) {
