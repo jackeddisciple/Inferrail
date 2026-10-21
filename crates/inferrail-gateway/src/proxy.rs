@@ -1,14 +1,15 @@
 use std::convert::Infallible;
 use std::sync::Arc;
+use std::time::Duration;
 
 use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
 use hyper::body::{Bytes, Incoming};
 use hyper::header::{self, HeaderMap, HeaderValue};
 use hyper::http::request::Parts;
-use hyper::{Method, Request, Response};
+use hyper::{Method, Request, Response, StatusCode};
 use inferrail_control::{Lease, Replica};
-use inferrail_core::ids::ModelId;
-use tokio::time::{Instant, timeout_at};
+use inferrail_core::ids::{ModelId, ReplicaId};
+use tokio::time::{Instant, sleep, timeout, timeout_at};
 
 use crate::body::{ResponseBody, UpstreamBody};
 use crate::errors::GatewayError;
@@ -79,14 +80,41 @@ async fn proxy(
     if shared.config.logging.log_prompts {
         tracing::debug!(request_id = ?id, body = %String::from_utf8_lossy(&body), "request body");
     }
-    let lease = route::select(
-        &shared.registry,
-        shared.policy(&model)?,
-        &model,
-        shared.clock.now(),
-        &[],
-    )?;
-    forward(shared, lease, &parts, body, id, deadline).await
+    let policy = shared.policy(&model)?;
+    let mut tried: Vec<ReplicaId> = Vec::new();
+    let mut last: Option<Result<Response<ResponseBody>, GatewayError>> = None;
+    for attempt in 0..shared.config.retry.max_attempts {
+        if attempt > 0 {
+            let pause = backoff(shared.config.retry.backoff, attempt);
+            if Instant::now() + pause >= deadline {
+                break;
+            }
+            sleep(pause).await;
+        }
+        let now = shared.clock.now();
+        let lease = match route::select(&shared.registry, policy, &model, now, &tried) {
+            Ok(lease) => lease,
+            Err(err) => return last.unwrap_or(Err(err)),
+        };
+        tried.push(lease.replica().id().clone());
+        match forward(shared, lease, &parts, body.clone(), id, deadline).await {
+            Attempt::Done(response) => return Ok(response),
+            Attempt::Fatal(err) => return Err(err),
+            Attempt::Retry(failure) => {
+                tracing::debug!(request_id = ?id, attempt, "retrying on another replica");
+                last = Some(failure);
+            }
+        }
+    }
+    last.unwrap_or_else(|| {
+        Err(GatewayError::timeout(
+            "no response before the request timeout",
+        ))
+    })
+}
+
+fn backoff(base: Duration, attempt: u32) -> Duration {
+    base.saturating_mul(1 << attempt.saturating_sub(1).min(16))
 }
 
 async fn read_body(
@@ -164,6 +192,23 @@ fn upstream_request(
     Ok(request)
 }
 
+enum Attempt {
+    Done(Response<ResponseBody>),
+    Retry(Result<Response<ResponseBody>, GatewayError>),
+    Fatal(GatewayError),
+}
+
+const MAX_ERROR_BODY: usize = 64 * 1024;
+
+fn is_retryable(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE | StatusCode::GATEWAY_TIMEOUT
+    )
+}
+
+/// One try against one replica. Nothing reaches the client until this
+/// returns `Done`, which is what makes retrying the other outcomes safe.
 async fn forward(
     shared: &Arc<Shared>,
     mut lease: Lease,
@@ -171,28 +216,32 @@ async fn forward(
     body: Bytes,
     id: &HeaderValue,
     deadline: Instant,
-) -> Result<Response<ResponseBody>, GatewayError> {
+) -> Attempt {
     let replica = Arc::clone(lease.replica());
-    let request = upstream_request(&replica, parts, body, id)?;
+    let request = match upstream_request(&replica, parts, body, id) {
+        Ok(request) => request,
+        Err(err) => return Attempt::Fatal(err),
+    };
     let response = match timeout_at(deadline, shared.client.request(request)).await {
         Ok(Ok(response)) => response,
         Ok(Err(err)) => {
             record_failure(shared, &replica);
             tracing::debug!(replica = %replica.id(), error = %err, "upstream request failed");
-            return Err(GatewayError::bad_gateway(format!(
+            return Attempt::Retry(Err(GatewayError::bad_gateway(format!(
                 "replica {} failed before responding",
                 replica.id()
-            )));
+            ))));
         }
         Err(_) => {
             record_failure(shared, &replica);
-            return Err(GatewayError::timeout(
+            return Attempt::Fatal(GatewayError::timeout(
                 "no response before the request timeout",
             ));
         }
     };
     lease.responded();
-    if response.status().is_server_error() {
+    let status = response.status();
+    if status.is_server_error() {
         record_failure(shared, &replica);
     } else {
         replica.health().record_success();
@@ -202,8 +251,26 @@ async fn forward(
     if let Ok(value) = HeaderValue::from_str(replica.id().as_str()) {
         head.headers.insert(REPLICA, value);
     }
+    if is_retryable(status) {
+        drop(lease);
+        let buffered = timeout(
+            Duration::from_secs(1),
+            Limited::new(incoming, MAX_ERROR_BODY).collect(),
+        )
+        .await;
+        return Attempt::Retry(match buffered {
+            Ok(Ok(collected)) => Ok(Response::from_parts(
+                head,
+                ResponseBody::full(collected.to_bytes()),
+            )),
+            _ => Err(GatewayError::bad_gateway(format!(
+                "replica {} answered {status}",
+                replica.id()
+            ))),
+        });
+    }
     let body = UpstreamBody::new(incoming, lease, Arc::clone(shared));
-    Ok(Response::from_parts(head, ResponseBody::Upstream(body)))
+    Attempt::Done(Response::from_parts(head, ResponseBody::Upstream(body)))
 }
 
 pub(crate) fn record_failure(shared: &Shared, replica: &Replica) {
