@@ -889,6 +889,10 @@ version = "0.1.1"
 [[package]]
 name = "inferrail-policy"
 version = "0.1.1"
+dependencies = [
+ "inferrail-core",
+ "proptest",
+]
 
 [[package]]
 name = "inferrail-sim"
