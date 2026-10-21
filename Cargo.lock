@@ -341,6 +341,12 @@ version = "0.1.0"
 [[package]]
 name = "inferrail-sim"
 version = "0.1.0"
+dependencies = [
+ "inferrail-core",
+ "proptest",
+ "serde_json",
+ "xxhash-rust",
+]
 
 [[package]]
 name = "inferrail-tokenize"
@@ -765,6 +771,12 @@ name = "writeable"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
+
+[[package]]
+name = "xxhash-rust"
+version = "0.8.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "550a2b930b62486a393c52d5c3b84bff264b28aa437ed64694d31e93b1757af7"
 
 [[package]]
 name = "yoke"

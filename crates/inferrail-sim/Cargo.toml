@@ -12,5 +12,13 @@ publish.workspace = true
 name = "inferrail-sim"
 path = "src/main.rs"
 
+[dependencies]
+inferrail-core.workspace = true
+serde_json.workspace = true
+xxhash-rust.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
 [lints]
 workspace = true
