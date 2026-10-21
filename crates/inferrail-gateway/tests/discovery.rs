@@ -201,3 +201,36 @@ async fn the_system_resolver_discovers_a_literal_address() {
     let id = format!("local-127.0.0.1-{}", sim.addr.port());
     assert_eq!(served_by(&gw, 2).await, [id]);
 }
+
+#[derive(Debug)]
+struct SlowDns(SocketAddr);
+
+impl Resolve for SlowDns {
+    fn resolve<'a>(&'a self, _host: &'a str, _port: u16) -> Resolution<'a> {
+        Box::pin(async move {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            Ok(vec![self.0])
+        })
+    }
+}
+
+#[tokio::test]
+async fn groups_are_resolved_together_at_startup() {
+    let sim = Upstream::zero(&[MODEL]).await;
+    let mut text = format!("models:\n  - name: {MODEL}\ndiscovery:\n  dns:\n");
+    for name in ["a", "b", "c", "d"] {
+        text.push_str(&format!(
+            "    - name: pool-{name}\n      url: http://{name}.test:8000\n      models: [{MODEL}]\n      refresh: 1m\n"
+        ));
+    }
+    let started = std::time::Instant::now();
+    let gateway = Gateway::with_resolver(config(&text), Arc::new(SlowDns(sim.addr))).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let gw = TestGateway::serve(gateway, listener).await;
+    let took = started.elapsed();
+    assert_eq!(gw.gateway.registry().load().replicas().len(), 4);
+    assert!(
+        took < Duration::from_millis(1_000),
+        "four lookups took {took:?}"
+    );
+}

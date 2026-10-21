@@ -159,11 +159,18 @@ impl Gateway {
         shutdown: impl Future<Output = ()> + Send + 'static,
     ) -> std::io::Result<()> {
         let shared = self.shared;
-        let mut background = JoinSet::new();
+        let mut first = JoinSet::new();
         for group in &shared.config.discovery.dns {
-            let wait = group.refresh.max(std::time::Duration::from_secs(1));
-            refresh(&shared.registry, group, shared.resolver.as_ref(), wait).await;
+            let registry = Arc::clone(&shared.registry);
+            let resolver = Arc::clone(&shared.resolver);
+            let group = group.clone();
+            first.spawn(async move {
+                let wait = group.refresh.max(std::time::Duration::from_secs(1));
+                refresh(&registry, &group, resolver.as_ref(), wait).await;
+            });
         }
+        while first.join_next().await.is_some() {}
+        let mut background = JoinSet::new();
         for group in &shared.config.discovery.dns {
             background.spawn(run_dns(
                 Arc::clone(&shared.registry),
