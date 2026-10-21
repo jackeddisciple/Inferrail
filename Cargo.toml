@@ -12,6 +12,7 @@ publish = false
 
 [workspace.dependencies]
 inferrail-core = { path = "crates/inferrail-core" }
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
 humantime-serde = "1.1.1"
 proptest = "1.12"
 serde = { version = "1.0.229", features = ["derive"] }

@@ -18,7 +18,12 @@ serde_json.workspace = true
 xxhash-rust.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
 proptest.workspace = true
+
+[[bench]]
+name = "prefix_cache"
+harness = false
 
 [lints]
 workspace = true
