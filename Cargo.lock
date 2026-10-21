@@ -891,6 +891,7 @@ dependencies = [
  "inferrail-core",
  "proptest",
  "tokio",
+ "tracing",
  "url",
 ]
 

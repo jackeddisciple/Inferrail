@@ -5,7 +5,7 @@ use std::future::Future;
 use std::hash::{BuildHasher, RandomState};
 use std::sync::Arc;
 
-use inferrail_control::{Clock, HealthPolicy, Registry, ReplicaSpec};
+use inferrail_control::{CheckerConfig, Clock, HealthPolicy, Registry, ReplicaSpec, run_checker};
 use inferrail_core::config::{Config, ConfigIssues};
 use inferrail_core::ids::ModelId;
 use inferrail_policy::RoutingPolicy;
@@ -41,7 +41,7 @@ pub struct Gateway {
 #[derive(Debug)]
 pub(crate) struct Shared {
     config: Config,
-    registry: Registry,
+    registry: Arc<Registry>,
     names: HashMap<String, ModelId>,
     policies: HashMap<ModelId, Box<dyn RoutingPolicy>>,
     client: upstream::Client,
@@ -106,7 +106,7 @@ impl Gateway {
             );
         }
         let shared = Shared {
-            registry: Registry::new(ReplicaSpec::statics(&config)),
+            registry: Arc::new(Registry::new(ReplicaSpec::statics(&config))),
             client: upstream::client(&config.upstream),
             ids: request_id::RequestIds::default(),
             clock: Clock::default(),
@@ -132,12 +132,28 @@ impl Gateway {
     }
 
     /// Serves until `shutdown` resolves, then drains open connections for at
-    /// most `server.shutdown_timeout`.
+    /// most `server.shutdown_timeout`. Health checks run while it serves.
     pub async fn serve(
         self,
         listener: TcpListener,
         shutdown: impl Future<Output = ()> + Send + 'static,
     ) -> std::io::Result<()> {
-        server::serve(self.shared, listener, shutdown).await
+        let shared = self.shared;
+        let health = &shared.config.health;
+        let checker = tokio::spawn(run_checker(
+            Arc::clone(&shared.registry),
+            upstream::HttpProbe {
+                client: shared.client.clone(),
+            },
+            CheckerConfig {
+                interval: health.interval,
+                timeout: health.timeout,
+                policy: shared.health,
+            },
+            shared.clock,
+        ));
+        let served = server::serve(shared, listener, shutdown).await;
+        checker.abort();
+        served
     }
 }

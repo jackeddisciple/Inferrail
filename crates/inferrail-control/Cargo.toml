@@ -12,10 +12,12 @@ publish.workspace = true
 arc-swap.workspace = true
 inferrail-core.workspace = true
 tokio.workspace = true
+tracing.workspace = true
 url.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

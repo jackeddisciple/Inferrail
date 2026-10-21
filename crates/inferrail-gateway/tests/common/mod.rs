@@ -48,6 +48,7 @@ pub struct Upstream {
     pub sim: Sim,
     pub addr: SocketAddr,
     fault: Arc<Mutex<Fault>>,
+    request_fault: Arc<Mutex<Fault>>,
     hits: Arc<AtomicU64>,
     tasks: Tasks,
 }
@@ -78,6 +79,7 @@ impl Upstream {
             addr: listener.local_addr().expect("addr"),
             sim: Sim::new(config).expect("sim config"),
             fault: Arc::new(Mutex::new(Fault::None)),
+            request_fault: Arc::new(Mutex::new(Fault::None)),
             hits: Arc::new(AtomicU64::new(0)),
             tasks: Arc::default(),
         };
@@ -91,8 +93,9 @@ impl Upstream {
 
     fn start(&self, listener: TcpListener) {
         let router = self.sim.router();
-        let (fault, hits, tasks) = (
+        let (fault, request_fault, hits, tasks) = (
             Arc::clone(&self.fault),
+            Arc::clone(&self.request_fault),
             Arc::clone(&self.hits),
             Arc::clone(&self.tasks),
         );
@@ -102,13 +105,23 @@ impl Upstream {
                 let Ok((stream, _)) = listener.accept().await else {
                     continue;
                 };
-                let (router, fault, hits) = (router.clone(), Arc::clone(&fault), Arc::clone(&hits));
+                let (router, fault, request_fault, hits) = (
+                    router.clone(),
+                    Arc::clone(&fault),
+                    Arc::clone(&request_fault),
+                    Arc::clone(&hits),
+                );
                 let service = service_fn(move |request: Request<Incoming>| {
                     let (router, hits) = (router.clone(), Arc::clone(&hits));
-                    let fault = fault.lock().expect("fault").clone();
+                    let path = request.uri().path();
+                    let inference =
+                        path.starts_with("/v1/chat") || path.starts_with("/v1/completions");
+                    let mut fault = fault.lock().expect("fault").clone();
+                    if inference && fault == Fault::None {
+                        fault = request_fault.lock().expect("fault").clone();
+                    }
                     async move {
-                        let path = request.uri().path();
-                        if path.starts_with("/v1/chat") || path.starts_with("/v1/completions") {
+                        if inference {
                             hits.fetch_add(1, Ordering::SeqCst);
                         }
                         match fault {
@@ -149,6 +162,11 @@ impl Upstream {
 
     pub fn set_fault(&self, fault: Fault) {
         *self.fault.lock().expect("fault") = fault;
+    }
+
+    /// A fault on inference routes only; `/health` keeps answering.
+    pub fn set_request_fault(&self, fault: Fault) {
+        *self.request_fault.lock().expect("fault") = fault;
     }
 
     pub fn hits(&self) -> u64 {
@@ -384,6 +402,16 @@ impl TestGateway {
                 .expect("sse");
         }
         events
+    }
+
+    pub fn replica(&self, id: &str) -> std::sync::Arc<inferrail_control::Replica> {
+        std::sync::Arc::clone(
+            self.gateway
+                .registry()
+                .load()
+                .get(id)
+                .unwrap_or_else(|| panic!("no replica {id}")),
+        )
     }
 
     pub fn in_flight(&self) -> u32 {
