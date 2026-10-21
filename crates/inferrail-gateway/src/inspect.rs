@@ -34,14 +34,21 @@ pub struct Inspected<'a> {
     open: usize,
 }
 
+const BOM: &[u8] = b"\xef\xbb\xbf";
+
+/// A leading byte order mark is skipped, as Python engines decoding JSON
+/// bytes do, and kept in the forwarded body.
 pub fn inspect(body: &[u8]) -> Result<Inspected<'_>, InspectError> {
-    let open = body
+    let skip = if body.starts_with(BOM) { BOM.len() } else { 0 };
+    let json = &body[skip..];
+    let open = json
         .iter()
         .position(|b| !b.is_ascii_whitespace())
-        .filter(|&i| body[i] == b'{')
+        .filter(|&i| json[i] == b'{')
+        .map(|i| skip + i)
         .ok_or(InspectError::NotAnObject)?;
     let peek: Peek<'_> =
-        serde_json::from_slice(body).map_err(|e| InspectError::InvalidJson(e.to_string()))?;
+        serde_json::from_slice(json).map_err(|e| InspectError::InvalidJson(e.to_string()))?;
     let Some(raw) = peek.model else {
         return Ok(Inspected {
             model: None,
@@ -128,6 +135,25 @@ mod tests {
     }
 
     #[test]
+    fn a_leading_byte_order_mark_is_skipped_and_kept() {
+        let body = "\u{feff}{\"model\":\"alias\",\"n\":1}".as_bytes();
+        let inspected = inspect(body).unwrap();
+        assert_eq!(inspected.model.as_deref(), Some("alias"));
+        assert_eq!(
+            inspected.with_model(body, "real"),
+            "\u{feff}{\"model\":\"real\",\"n\":1}".as_bytes()
+        );
+        let bare = "\u{feff} {}".as_bytes();
+        assert_eq!(
+            inspect(bare).unwrap().with_model(bare, "m"),
+            "\u{feff} {\"model\":\"m\"}".as_bytes()
+        );
+        for bad in ["\u{feff}\u{feff}{}", "\u{feff}[]", " \u{feff}{}"] {
+            assert!(inspect(bad.as_bytes()).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
     fn absent_and_null_models_are_none() {
         assert_eq!(model_of(r#"{"messages":[]}"#).unwrap(), None);
         assert_eq!(model_of(r#"{"model":null}"#).unwrap(), None);
@@ -205,6 +231,7 @@ mod tests {
             model in prop::option::of("\\PC{0,30}"),
             target in "\\PC{1,40}",
             pretty: bool,
+            bom: bool,
         ) {
             let mut object: serde_json::Map<String, Value> =
                 fields.into_iter().filter(|(k, _)| k != "model").collect();
@@ -212,17 +239,19 @@ mod tests {
                 object.insert("model".to_owned(), Value::from(model.as_str()));
             }
             let original = Value::Object(object);
-            let body = if pretty {
-                serde_json::to_vec_pretty(&original).unwrap()
+            let mut body = if bom { BOM.to_vec() } else { Vec::new() };
+            if pretty {
+                body.extend(serde_json::to_vec_pretty(&original).unwrap());
             } else {
-                serde_json::to_vec(&original).unwrap()
-            };
+                body.extend(serde_json::to_vec(&original).unwrap());
+            }
             let inspected = inspect(&body).unwrap();
             prop_assert_eq!(inspected.model.as_deref(), model.as_deref());
             let out = inspected.with_model(&body, &target);
             let mut want = original.clone();
             want["model"] = Value::from(target.as_str());
-            let got: Value = serde_json::from_slice(&out).unwrap();
+            prop_assert_eq!(out.starts_with(BOM), bom);
+            let got: Value = serde_json::from_slice(&out[if bom { 3 } else { 0 }..]).unwrap();
             prop_assert_eq!(got, want);
             if let Some(span) = &inspected.span {
                 prop_assert_eq!(&out[..span.start], &body[..span.start]);

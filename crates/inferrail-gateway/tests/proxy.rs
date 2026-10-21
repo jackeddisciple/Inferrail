@@ -498,3 +498,33 @@ async fn head_works_wherever_get_does() {
     assert_eq!(response.status(), 405);
     assert_eq!(sim.hits(), 0);
 }
+
+#[tokio::test]
+async fn a_leading_byte_order_mark_reaches_the_engine() {
+    let raw = RawUpstream::spawn().await;
+    let text = format!(
+        "models:\n  - name: {MODEL}\n    aliases: [friendly]\nreplicas:\n  - id: r0\n    url: {}\n    models: [{MODEL}]\n",
+        raw.url()
+    );
+    let gw = TestGateway::start(config(&text)).await;
+    for (sent, forwarded) in [
+        (
+            format!("\u{feff}{{\"model\":\"{MODEL}\",\"prompt\":\"x\"}}"),
+            format!("\u{feff}{{\"model\":\"{MODEL}\",\"prompt\":\"x\"}}"),
+        ),
+        (
+            "\u{feff}{\"model\":\"friendly\",\"prompt\":\"x\"}".to_owned(),
+            format!("\u{feff}{{\"model\":\"{MODEL}\",\"prompt\":\"x\"}}"),
+        ),
+    ] {
+        let response = gw
+            .client
+            .post(gw.url("/v1/completions"))
+            .body(sent)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(raw.take()[0].body, forwarded.as_bytes());
+    }
+}
