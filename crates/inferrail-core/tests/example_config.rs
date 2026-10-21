@@ -12,6 +12,8 @@ fn shipped_example_config_is_valid() {
     let config = Config::load(example_path()).unwrap();
     assert_eq!(config.models.len(), 2);
     assert_eq!(config.replicas.len(), 3);
+    assert_eq!(config.discovery.dns.len(), 1);
+    assert_eq!(config.replicas[2].max_pending, Some(32));
     assert_eq!(config.server.request_timeout, Duration::from_secs(600));
     assert_eq!(config.health.max_ejection_backoff, Duration::from_secs(60));
 
@@ -23,6 +25,8 @@ fn shipped_example_config_is_valid() {
     assert_eq!(config.policy_for(qwen), PolicyKind::LeastRequest);
     assert_eq!(qwen.block_size, 16);
     assert_eq!(config.replicas_serving(&qwen.name).count(), 1);
+    assert!(config.is_served(&qwen.name));
+    assert_eq!(config.discovery.dns[0].max_concurrency, Some(128));
 }
 
 #[test]
@@ -33,4 +37,5 @@ fn example_documents_the_defaults() {
     assert_eq!(config.retry, Default::default());
     assert_eq!(config.logging, Default::default());
     assert_eq!(config.server, Default::default());
+    assert_eq!(config.upstream, Default::default());
 }

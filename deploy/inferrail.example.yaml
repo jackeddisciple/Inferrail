@@ -1,11 +1,13 @@
-# Inferrail gateway configuration. Every section except models and replicas
-# is optional; the values below are the defaults unless noted.
+# Inferrail gateway configuration. Only models and at least one replica or
+# DNS group are required; the values below are the defaults unless noted.
 
 server:
   listen: 0.0.0.0:8080
   admin_listen: 127.0.0.1:9090
   request_timeout: 10m
   max_body_bytes: 33554432
+  header_read_timeout: 30s
+  shutdown_timeout: 30s
 
 models:
   - name: meta-llama/Llama-3.1-8B-Instruct
@@ -28,6 +30,22 @@ replicas:
     url: http://10.0.0.12:8000
     models: [meta-llama/Llama-3.1-8B-Instruct, Qwen/Qwen3-8B]
     max_concurrency: 256
+    max_pending: 32
+
+# Every address a name resolves to becomes a replica named <name>-<ip>-<port>.
+discovery:
+  dns:
+    - name: qwen-pool
+      url: http://qwen.inference.svc.cluster.local:8000
+      models: [Qwen/Qwen3-8B]
+      refresh: 2s
+      max_concurrency: 128
+
+upstream:
+  connect_timeout: 2s
+  pool_idle_timeout: 90s
+  pool_max_idle_per_host: 1024
+  http2: false
 
 routing:
   default_policy: cost_model

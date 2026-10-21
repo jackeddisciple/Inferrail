@@ -39,7 +39,12 @@ pub struct Config {
     #[serde(default)]
     pub server: ServerConfig,
     pub models: Vec<ModelConfig>,
+    #[serde(default)]
     pub replicas: Vec<ReplicaConfig>,
+    #[serde(default)]
+    pub discovery: DiscoveryConfig,
+    #[serde(default)]
+    pub upstream: UpstreamConfig,
     #[serde(default)]
     pub routing: RoutingConfig,
     #[serde(default)]
@@ -93,6 +98,12 @@ impl Config {
             .iter()
             .filter(move |r| r.models.contains(model))
     }
+
+    /// True when a static replica or a DNS group serves the model.
+    pub fn is_served(&self, model: &ModelId) -> bool {
+        self.replicas_serving(model).next().is_some()
+            || self.discovery.dns.iter().any(|g| g.models.contains(model))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -103,6 +114,10 @@ pub struct ServerConfig {
     #[serde(with = "humantime_serde")]
     pub request_timeout: Duration,
     pub max_body_bytes: usize,
+    #[serde(with = "humantime_serde")]
+    pub header_read_timeout: Duration,
+    #[serde(with = "humantime_serde")]
+    pub shutdown_timeout: Duration,
 }
 
 impl Default for ServerConfig {
@@ -112,6 +127,30 @@ impl Default for ServerConfig {
             admin_listen: SocketAddr::from(([127, 0, 0, 1], 9090)),
             request_timeout: Duration::from_secs(600),
             max_body_bytes: 32 * 1024 * 1024,
+            header_read_timeout: Duration::from_secs(30),
+            shutdown_timeout: Duration::from_secs(30),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct UpstreamConfig {
+    #[serde(with = "humantime_serde")]
+    pub connect_timeout: Duration,
+    #[serde(with = "humantime_serde")]
+    pub pool_idle_timeout: Duration,
+    pub pool_max_idle_per_host: usize,
+    pub http2: bool,
+}
+
+impl Default for UpstreamConfig {
+    fn default() -> Self {
+        Self {
+            connect_timeout: Duration::from_secs(2),
+            pool_idle_timeout: Duration::from_secs(90),
+            pool_max_idle_per_host: 1024,
+            http2: false,
         }
     }
 }
@@ -144,6 +183,35 @@ pub struct ReplicaConfig {
     pub kv_capacity_blocks: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_concurrency: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_pending: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct DiscoveryConfig {
+    pub dns: Vec<DnsGroupConfig>,
+}
+
+/// A host name whose addresses each become a replica, re-resolved every `refresh`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DnsGroupConfig {
+    pub name: ReplicaId,
+    pub url: Url,
+    pub models: Vec<ModelId>,
+    #[serde(default = "default_dns_refresh", with = "humantime_serde")]
+    pub refresh: Duration,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv_capacity_blocks: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrency: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_pending: Option<u32>,
+}
+
+fn default_dns_refresh() -> Duration {
+    Duration::from_secs(2)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -299,6 +367,31 @@ replicas:
         assert_eq!(config.retry.max_attempts, 3);
         assert_eq!(config.health.interval, Duration::from_secs(1));
         assert_eq!(config.replicas[0].url.as_str(), "http://10.0.0.10:8000/");
+        assert_eq!(config.replicas[0].max_pending, None);
+        assert_eq!(config.upstream.connect_timeout, Duration::from_secs(2));
+        assert_eq!(config.upstream.pool_idle_timeout, Duration::from_secs(90));
+        assert_eq!(config.upstream.pool_max_idle_per_host, 1024);
+        assert!(!config.upstream.http2);
+        assert_eq!(config.server.header_read_timeout, Duration::from_secs(30));
+        assert_eq!(config.server.shutdown_timeout, Duration::from_secs(30));
+        assert!(config.discovery.dns.is_empty());
+    }
+
+    #[test]
+    fn breaker_and_upstream_settings_parse() {
+        let text = format!(
+            "{MINIMAL}upstream:\n  connect_timeout: 150ms\n  http2: true\n  pool_max_idle_per_host: 0\n"
+        )
+        .replace(
+            "    models: [meta-llama/Llama-3.1-8B-Instruct]\n",
+            "    models: [meta-llama/Llama-3.1-8B-Instruct]\n    max_concurrency: 64\n    max_pending: 8\n",
+        );
+        let config = Config::from_yaml_str(&text).unwrap();
+        assert_eq!(config.upstream.connect_timeout, Duration::from_millis(150));
+        assert!(config.upstream.http2);
+        assert_eq!(config.upstream.pool_max_idle_per_host, 0);
+        assert_eq!(config.replicas[0].max_concurrency, Some(64));
+        assert_eq!(config.replicas[0].max_pending, Some(8));
     }
 
     #[test]
@@ -329,6 +422,9 @@ replicas:
             "typo_section: 1\n",
             "routing:\n  epsilonn: 0.3\n",
             "server:\n  listen_addr: 0.0.0.0:1\n",
+            "upstream:\n  http3: true\n",
+            "discovery:\n  consul: []\n",
+            "discovery:\n  dns:\n    - name: p\n      url: http://p:1\n      models: [meta-llama/Llama-3.1-8B-Instruct]\n      ttl: 5s\n",
         ] {
             let err = Config::from_yaml_str(&format!("{MINIMAL}{extra}")).unwrap_err();
             assert!(err.to_string().contains("unknown field"), "{err}");

@@ -2,7 +2,10 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::time::Duration;
 
+use url::Url;
+
 use super::Config;
+use crate::ids::ModelId;
 
 pub const MAX_BLOCK_SIZE: u32 = 4096;
 pub const MAX_RETRY_ATTEMPTS: u32 = 10;
@@ -77,6 +80,66 @@ fn claim_name<'a>(
     }
 }
 
+fn check_url<'a>(path: &str, url: &'a Url, seen: &mut HashMap<&'a str, String>, c: &mut Collector) {
+    let at = format!("{path}.url");
+    if !matches!(url.scheme(), "http" | "https") {
+        c.push(&*at, "scheme must be http or https");
+    }
+    if url.host().is_none() {
+        c.push(&*at, "must include a host");
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        c.push(&*at, "must not carry a query or fragment");
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        c.push(
+            &*at,
+            "must not embed credentials; they would leak into logs and metrics",
+        );
+    }
+    if let Some(first) = seen.insert(url.as_str(), path.to_owned()) {
+        c.push(at, format!("duplicate url, first used by {first}"));
+    }
+}
+
+fn check_models(path: &str, models: &[ModelId], known: &HashSet<&str>, c: &mut Collector) {
+    if models.is_empty() {
+        c.push(format!("{path}.models"), "must list at least one model");
+    }
+    for (j, model) in models.iter().enumerate() {
+        if models[..j].contains(model) {
+            c.push(
+                format!("{path}.models[{j}]"),
+                format!("lists {:?} twice", model.as_str()),
+            );
+        }
+        if !known.contains(model.as_str()) {
+            c.push(
+                format!("{path}.models[{j}]"),
+                format!("unknown model {:?}", model.as_str()),
+            );
+        }
+    }
+}
+
+fn check_limits(
+    path: &str,
+    kv_capacity_blocks: Option<u64>,
+    max_concurrency: Option<u32>,
+    max_pending: Option<u32>,
+    c: &mut Collector,
+) {
+    for (name, value) in [
+        ("kv_capacity_blocks", kv_capacity_blocks.map(|v| v == 0)),
+        ("max_concurrency", max_concurrency.map(|v| v == 0)),
+        ("max_pending", max_pending.map(|v| v == 0)),
+    ] {
+        if value == Some(true) {
+            c.push(format!("{path}.{name}"), "must be greater than zero");
+        }
+    }
+}
+
 impl Config {
     /// Checks cross field rules that the schema alone cannot express.
     pub fn validate(&self) -> Result<(), ConfigIssues> {
@@ -84,6 +147,8 @@ impl Config {
         self.check_server(&mut c);
         self.check_models(&mut c);
         self.check_replicas(&mut c);
+        self.check_discovery(&mut c);
+        self.check_upstream(&mut c);
         self.check_routing(&mut c);
         self.check_health(&mut c);
         self.check_retry(&mut c);
@@ -108,6 +173,19 @@ impl Config {
         c.positive("server.request_timeout", server.request_timeout);
         if server.max_body_bytes == 0 {
             c.push("server.max_body_bytes", "must be greater than zero");
+        }
+        c.positive("server.header_read_timeout", server.header_read_timeout);
+    }
+
+    fn check_upstream(&self, c: &mut Collector) {
+        let upstream = &self.upstream;
+        c.positive("upstream.connect_timeout", upstream.connect_timeout);
+        c.positive("upstream.pool_idle_timeout", upstream.pool_idle_timeout);
+        if upstream.connect_timeout > self.server.request_timeout {
+            c.push(
+                "upstream.connect_timeout",
+                "must not exceed server.request_timeout",
+            );
         }
     }
 
@@ -136,19 +214,19 @@ impl Config {
                     format!("must be between 1 and {MAX_BLOCK_SIZE}"),
                 );
             }
-            if self.replicas_serving(&model.name).next().is_none() {
+            if !self.is_served(&model.name) {
                 c.push(format!("{path}.name"), format!("no replica serves {own:?}"));
             }
         }
     }
 
     fn check_replicas(&self, c: &mut Collector) {
-        if self.replicas.is_empty() {
-            c.push("replicas", "at least one replica is required");
+        if self.replicas.is_empty() && self.discovery.dns.is_empty() {
+            c.push("replicas", "at least one replica or DNS group is required");
         }
-        let known: HashSet<&str> = self.models.iter().map(|m| m.name.as_str()).collect();
+        let known = self.known_models();
+        let mut urls: HashMap<&str, String> = HashMap::new();
         let mut ids: HashMap<&str, usize> = HashMap::new();
-        let mut urls: HashMap<&str, usize> = HashMap::new();
         for (i, replica) in self.replicas.iter().enumerate() {
             let path = format!("replicas[{i}]");
             if let Some(first) = ids.insert(replica.id.as_str(), i) {
@@ -160,58 +238,57 @@ impl Config {
                     ),
                 );
             }
-            let url = &replica.url;
-            if !matches!(url.scheme(), "http" | "https") {
-                c.push(format!("{path}.url"), "scheme must be http or https");
-            }
-            if url.host().is_none() {
-                c.push(format!("{path}.url"), "must include a host");
-            }
-            if url.query().is_some() || url.fragment().is_some() {
-                c.push(format!("{path}.url"), "must not carry a query or fragment");
-            }
-            if !url.username().is_empty() || url.password().is_some() {
-                c.push(
-                    format!("{path}.url"),
-                    "must not embed credentials; they would leak into logs and metrics",
-                );
-            }
-            if let Some(first) = urls.insert(url.as_str(), i) {
-                c.push(
-                    format!("{path}.url"),
-                    format!("duplicate url, first used by replicas[{first}]"),
-                );
-            }
-            if replica.models.is_empty() {
-                c.push(format!("{path}.models"), "must list at least one model");
-            }
-            for (j, model) in replica.models.iter().enumerate() {
-                if replica.models[..j].contains(model) {
-                    c.push(
-                        format!("{path}.models[{j}]"),
-                        format!("lists {:?} twice", model.as_str()),
-                    );
-                }
-                if !known.contains(model.as_str()) {
-                    c.push(
-                        format!("{path}.models[{j}]"),
-                        format!("unknown model {:?}", model.as_str()),
-                    );
-                }
-            }
-            if replica.kv_capacity_blocks == Some(0) {
-                c.push(
-                    format!("{path}.kv_capacity_blocks"),
-                    "must be greater than zero",
-                );
-            }
-            if replica.max_concurrency == Some(0) {
-                c.push(
-                    format!("{path}.max_concurrency"),
-                    "must be greater than zero",
-                );
-            }
+            check_url(&path, &replica.url, &mut urls, c);
+            check_models(&path, &replica.models, &known, c);
+            check_limits(
+                &path,
+                replica.kv_capacity_blocks,
+                replica.max_concurrency,
+                replica.max_pending,
+                c,
+            );
         }
+    }
+
+    fn check_discovery(&self, c: &mut Collector) {
+        let known = self.known_models();
+        let mut urls: HashMap<&str, String> = self
+            .replicas
+            .iter()
+            .enumerate()
+            .map(|(i, r)| (r.url.as_str(), format!("replicas[{i}]")))
+            .collect();
+        let mut names: HashMap<&str, usize> = HashMap::new();
+        for (i, group) in self.discovery.dns.iter().enumerate() {
+            let path = format!("discovery.dns[{i}]");
+            let name = group.name.as_str();
+            if let Some(first) = names.insert(name, i) {
+                c.push(
+                    format!("{path}.name"),
+                    format!("duplicate name {name:?}, first used by discovery.dns[{first}]"),
+                );
+            }
+            if self.replicas.iter().any(|r| r.id.as_str() == name) {
+                c.push(
+                    format!("{path}.name"),
+                    format!("name {name:?} is already a replica id"),
+                );
+            }
+            check_url(&path, &group.url, &mut urls, c);
+            check_models(&path, &group.models, &known, c);
+            c.positive(&format!("{path}.refresh"), group.refresh);
+            check_limits(
+                &path,
+                group.kv_capacity_blocks,
+                group.max_concurrency,
+                group.max_pending,
+                c,
+            );
+        }
+    }
+
+    fn known_models(&self) -> HashSet<&str> {
+        self.models.iter().map(|m| m.name.as_str()).collect()
     }
 
     fn check_routing(&self, c: &mut Collector) {
@@ -261,7 +338,7 @@ impl Config {
 mod tests {
     use std::time::Duration;
 
-    use super::super::{Config, ConfigError, ReplicaConfig};
+    use super::super::{Config, ConfigError, DnsGroupConfig, ReplicaConfig};
     use super::MAX_BLOCK_SIZE;
     use crate::ids::{ModelId, ReplicaId};
     use proptest::prelude::*;
@@ -305,6 +382,19 @@ replicas:
             models: models.iter().map(|m| ModelId::new(m).unwrap()).collect(),
             kv_capacity_blocks: None,
             max_concurrency: None,
+            max_pending: None,
+        }
+    }
+
+    fn group(name: &str, url: &str, models: &[&str]) -> DnsGroupConfig {
+        DnsGroupConfig {
+            name: ReplicaId::new(name).unwrap(),
+            url: url.parse().unwrap(),
+            models: models.iter().map(|m| ModelId::new(m).unwrap()).collect(),
+            refresh: Duration::from_secs(2),
+            kv_capacity_blocks: None,
+            max_concurrency: None,
+            max_pending: None,
         }
     }
 
@@ -320,6 +410,106 @@ replicas:
             panic!("expected validation failure");
         };
         assert_eq!(found.paths().collect::<Vec<_>>(), ["models", "replicas"]);
+    }
+
+    #[test]
+    fn dns_groups_alone_can_serve_every_model() {
+        let text = r#"
+models:
+  - name: llama-8b
+discovery:
+  dns:
+    - name: pool
+      url: http://vllm.default.svc:8000
+      models: [llama-8b]
+"#;
+        let config = Config::from_yaml_str(text).unwrap();
+        assert!(config.replicas.is_empty());
+        assert_eq!(config.discovery.dns[0].refresh, Duration::from_secs(2));
+        assert!(config.is_served(&ModelId::new("llama-8b").unwrap()));
+    }
+
+    #[test]
+    fn a_model_served_only_by_dns_is_not_flagged() {
+        let mut config = base();
+        config.replicas[0]
+            .models
+            .retain(|m| m.as_str() != "qwen-8b");
+        config
+            .discovery
+            .dns
+            .push(group("qwen-pool", "http://qwen.svc:8000", &["qwen-8b"]));
+        assert!(config.validate().is_ok(), "{:?}", issues(&config));
+    }
+
+    #[test]
+    fn dns_groups_are_validated_like_replicas() {
+        let mut config = base();
+        let mut bad = group(
+            "r0",
+            "http://user:pw@pool.svc:8000/?x=1",
+            &["ghost", "ghost"],
+        );
+        bad.refresh = Duration::ZERO;
+        bad.max_pending = Some(0);
+        bad.max_concurrency = Some(0);
+        config.discovery.dns.push(bad);
+        config
+            .discovery
+            .dns
+            .push(group("r0", "http://10.0.0.10:8000", &[]));
+        let found = issues(&config);
+        for needle in [
+            "discovery.dns[0].name: name \"r0\" is already a replica id",
+            "discovery.dns[0].url: must not carry a query or fragment",
+            "discovery.dns[0].url: must not embed credentials",
+            "discovery.dns[0].models[0]: unknown model \"ghost\"",
+            "discovery.dns[0].models[1]: lists \"ghost\" twice",
+            "discovery.dns[0].refresh: must be greater than zero",
+            "discovery.dns[0].max_concurrency: must be greater than zero",
+            "discovery.dns[0].max_pending: must be greater than zero",
+            "discovery.dns[1].name: duplicate name \"r0\", first used by discovery.dns[0]",
+            "discovery.dns[1].url: duplicate url, first used by replicas[0]",
+            "discovery.dns[1].models: must list at least one model",
+        ] {
+            assert!(
+                found.iter().any(|i| i.starts_with(needle)),
+                "missing {needle}: {found:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_fleet_message_mentions_dns() {
+        let text = "models: [{name: m}]\n";
+        let err = Config::from_yaml_str(text).unwrap_err().to_string();
+        assert!(
+            err.contains("replicas: at least one replica or DNS group is required"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn upstream_and_server_timeouts_are_checked() {
+        let mut config = base();
+        config.upstream.connect_timeout = Duration::ZERO;
+        config.upstream.pool_idle_timeout = Duration::ZERO;
+        config.server.header_read_timeout = Duration::ZERO;
+        let found = issues(&config);
+        assert_eq!(found.len(), 3, "{found:?}");
+
+        let mut config = base();
+        config.server.request_timeout = Duration::from_secs(1);
+        config.upstream.connect_timeout = Duration::from_secs(2);
+        assert_eq!(
+            only_issue(&config),
+            "upstream.connect_timeout: must not exceed server.request_timeout"
+        );
+
+        let mut config = base();
+        config.server.shutdown_timeout = Duration::ZERO;
+        config.upstream.pool_max_idle_per_host = 0;
+        assert!(config.validate().is_ok());
     }
 
     #[test]
@@ -451,8 +641,14 @@ replicas:
         let mut config = base();
         config.replicas[0].kv_capacity_blocks = Some(0);
         config.replicas[0].max_concurrency = Some(0);
+        config.replicas[0].max_pending = Some(0);
         config.replicas[0].models.clear();
         let found = issues(&config);
+        assert!(
+            found
+                .iter()
+                .any(|i| i.starts_with("replicas[0].max_pending"))
+        );
         assert!(
             found
                 .iter()
@@ -579,9 +775,12 @@ retry:
         fn random_valid_fleets_validate_and_round_trip(
             models in 1usize..5,
             replicas in 1usize..12,
+            groups in 0usize..4,
             epsilon in 0.01f64..10.0,
             kappa in 0.01f64..=1.0,
             block_shift in 0u32..8,
+            refresh_ms in 1u64..60_000,
+            cap in proptest::option::of(1u32..10_000),
         ) {
             let mut text = String::from("models:\n");
             for m in 0..models {
@@ -593,6 +792,16 @@ retry:
                     "  - id: r{r}\n    url: http://10.1.{}.{}:8000\n    models: [model-{}]\n",
                     r / 250, r % 250, r % models
                 ));
+            }
+            text.push_str("discovery:\n  dns:\n");
+            for g in 0..groups {
+                text.push_str(&format!(
+                    "    - name: pool-{g}\n      url: http://pool-{g}.svc:8000\n      models: [model-{}]\n      refresh: {refresh_ms}ms\n",
+                    g % models
+                ));
+                if let Some(cap) = cap {
+                    text.push_str(&format!("      max_pending: {cap}\n"));
+                }
             }
             text.push_str(&format!("routing:\n  epsilon: {epsilon}\n  kappa: {kappa}\n"));
             let config = Config::from_yaml_str(&text).unwrap();
