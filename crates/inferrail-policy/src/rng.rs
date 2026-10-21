@@ -28,6 +28,14 @@ impl SplitMix {
     }
 }
 
+/// Derives an independent stream seed for one label, such as a model name.
+pub fn mix_seed(seed: u64, label: &str) -> u64 {
+    let hash = label.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    });
+    SplitMix::new(seed ^ hash).next_u64()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

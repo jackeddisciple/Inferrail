@@ -890,6 +890,7 @@ version = "0.1.1"
 name = "inferrail-policy"
 version = "0.1.1"
 dependencies = [
+ "criterion",
  "inferrail-core",
  "proptest",
 ]
