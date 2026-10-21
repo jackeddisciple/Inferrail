@@ -10,6 +10,10 @@ use url::Url;
 
 use crate::ids::{ModelId, ReplicaId};
 
+mod validate;
+
+pub use validate::{ConfigIssue, ConfigIssues, MAX_BLOCK_SIZE, MAX_RETRY_ATTEMPTS};
+
 pub const DEFAULT_BLOCK_SIZE: u32 = 16;
 pub const DEFAULT_EPSILON: f64 = 0.25;
 pub const DEFAULT_KAPPA: f64 = 0.92;
@@ -23,6 +27,8 @@ pub enum ConfigError {
     },
     #[error("cannot parse config: {0}")]
     Parse(#[from] serde_yaml_ng::Error),
+    #[error("invalid config: {0}")]
+    Invalid(ConfigIssues),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -43,7 +49,14 @@ pub struct Config {
 }
 
 impl Config {
+    /// Parses and validates; the only way callers should obtain a `Config`.
     pub fn from_yaml_str(text: &str) -> Result<Self, ConfigError> {
+        let config = Self::parse_unvalidated(text)?;
+        config.validate().map_err(ConfigError::Invalid)?;
+        Ok(config)
+    }
+
+    pub fn parse_unvalidated(text: &str) -> Result<Self, ConfigError> {
         Ok(serde_yaml_ng::from_str(text)?)
     }
 
@@ -289,11 +302,11 @@ replicas:
     #[test]
     fn durations_and_policies_parse_from_text() {
         let config = Config::from_yaml_str(&format!(
-            "{MINIMAL}health:\n  interval: 250ms\n  timeout: 2s\nrouting:\n  default_policy: p2c\n"
+            "{MINIMAL}health:\n  interval: 250ms\n  timeout: 200ms\nrouting:\n  default_policy: p2c\n"
         ))
         .unwrap();
         assert_eq!(config.health.interval, Duration::from_millis(250));
-        assert_eq!(config.health.timeout, Duration::from_secs(2));
+        assert_eq!(config.health.timeout, Duration::from_millis(200));
         assert_eq!(config.routing.default_policy, PolicyKind::P2c);
         assert_eq!(config.health.unhealthy_threshold, 3);
     }

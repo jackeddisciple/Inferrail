@@ -1,0 +1,51 @@
+# Inferrail gateway configuration. Every section except models and replicas
+# is optional; the values below are the defaults unless noted.
+
+server:
+  listen: 0.0.0.0:8080
+  admin_listen: 127.0.0.1:9090
+  request_timeout: 10m
+  max_body_bytes: 33554432
+
+models:
+  - name: meta-llama/Llama-3.1-8B-Instruct
+    aliases: [llama-8b]
+    block_size: 16
+    tokenizer: meta-llama/Llama-3.1-8B-Instruct
+  - name: Qwen/Qwen3-8B
+    policy: least_request
+
+replicas:
+  - id: gpu-0
+    url: http://10.0.0.10:8000
+    models: [meta-llama/Llama-3.1-8B-Instruct]
+    kv_capacity_blocks: 18000
+  - id: gpu-1
+    url: http://10.0.0.11:8000
+    models: [meta-llama/Llama-3.1-8B-Instruct]
+    kv_capacity_blocks: 18000
+  - id: gpu-2
+    url: http://10.0.0.12:8000
+    models: [meta-llama/Llama-3.1-8B-Instruct, Qwen/Qwen3-8B]
+    max_concurrency: 256
+
+routing:
+  default_policy: cost_model
+  epsilon: 0.25
+  kappa: 0.92
+
+health:
+  interval: 1s
+  timeout: 500ms
+  unhealthy_threshold: 3
+  healthy_threshold: 2
+  ejection_backoff: 5s
+  max_ejection_backoff: 1m
+
+retry:
+  max_attempts: 3
+  backoff: 25ms
+
+logging:
+  level: info
+  log_prompts: false
