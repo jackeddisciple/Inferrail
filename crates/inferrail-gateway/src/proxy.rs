@@ -44,14 +44,15 @@ enum Local {
 }
 
 fn route_of(method: &Method, path: &str) -> Route {
+    let read = method == Method::GET || method == Method::HEAD;
     let local = match path {
         "/v1/chat/completions" | "/v1/completions" if method == Method::POST => {
             return Route::Proxy;
         }
         "/v1/chat/completions" | "/v1/completions" => Err(GatewayError::method_not_allowed("POST")),
-        "/v1/models" if method == Method::GET => Ok(Local::Models),
-        "/health" if method == Method::GET => Ok(Local::Health),
-        "/v1/models" | "/health" => Err(GatewayError::method_not_allowed("GET")),
+        "/v1/models" if read => Ok(Local::Models),
+        "/health" if read => Ok(Local::Health),
+        "/v1/models" | "/health" => Err(GatewayError::method_not_allowed("GET, HEAD")),
         _ => Err(GatewayError::not_found()),
     };
     Route::Local(local)

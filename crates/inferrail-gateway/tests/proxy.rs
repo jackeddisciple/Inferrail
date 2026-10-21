@@ -287,7 +287,7 @@ async fn gateway_errors_are_openai_shaped() {
     assert_eq!(response.headers()["allow"], "POST");
     let response = gw.client.post(gw.url("/v1/models")).send().await.unwrap();
     assert_eq!(response.status(), 405);
-    assert_eq!(response.headers()["allow"], "GET");
+    assert_eq!(response.headers()["allow"], "GET, HEAD");
     let response = gw
         .client
         .get(gw.url("/v1/embeddings"))
@@ -468,4 +468,33 @@ async fn clients_still_uploading_get_a_clean_answer() {
     }
     let (status, _) = gw.post_json("/v1/chat/completions", &chat("x", 1)).await;
     assert_eq!(status, 200);
+}
+
+#[tokio::test]
+async fn head_works_wherever_get_does() {
+    let sim = Upstream::zero(&[MODEL]).await;
+    let gw = TestGateway::start(fleet(&[sim.url()], "")).await;
+    let r0 = gw.replica("r0");
+    wait_until(Duration::from_secs(2), || r0.cards().is_some()).await;
+    for path in ["/health", "/v1/models"] {
+        let get = gw.client.get(gw.url(path)).send().await.unwrap();
+        let length = get.bytes().await.unwrap().len();
+        let head = gw.client.head(gw.url(path)).send().await.unwrap();
+        assert_eq!(head.status(), 200, "{path}");
+        assert!(head.headers().contains_key("x-request-id"));
+        let declared = head
+            .headers()
+            .get("content-length")
+            .map(|v| v.to_str().unwrap().parse::<usize>().unwrap());
+        assert_eq!(declared.unwrap_or(0), length, "{path}");
+        assert!(head.bytes().await.unwrap().is_empty());
+    }
+    let response = gw
+        .client
+        .head(gw.url("/v1/chat/completions"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 405);
+    assert_eq!(sim.hits(), 0);
 }
