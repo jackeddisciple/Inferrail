@@ -47,6 +47,8 @@ pub enum BuildError {
     },
 }
 
+const PRUNE_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// A configured gateway. Cheap to clone; clones share all state.
 #[derive(Debug, Clone)]
 pub struct Gateway {
@@ -249,6 +251,7 @@ impl Gateway {
             },
             shared.clock,
         ));
+        background.spawn(Arc::clone(&shared.metrics).run_pruner(PRUNE_EVERY));
         if shared.config.load.enabled {
             let registry = Arc::clone(&shared.registry);
             background.spawn(run_collector(

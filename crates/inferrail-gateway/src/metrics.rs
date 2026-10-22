@@ -418,6 +418,17 @@ impl Metrics {
         });
     }
 
+    /// Prunes every `period`, so departed replicas are forgotten even when
+    /// nothing scrapes the page.
+    pub async fn run_pruner(self: Arc<Self>, period: Duration) {
+        let mut ticker = tokio::time::interval(period);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            self.prune();
+        }
+    }
+
     pub fn render(&self) -> String {
         self.prune();
         let mut out = String::with_capacity(32 * 1024);
@@ -837,6 +848,36 @@ mod tests {
         fleet.set_group(&group, Vec::new());
         let page = m.render();
         assert_eq!(page.matches("pool-").count(), 0, "stranded series");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn departed_replicas_are_forgotten_without_a_scrape() {
+        let fleet = Arc::new(Registry::new(Vec::new()));
+        let m = Arc::new(metrics(&fleet));
+        let pruner = tokio::spawn(Arc::clone(&m).run_pruner(Duration::from_secs(10)));
+        let group = ReplicaId::new("pool").unwrap();
+        for g in 0..200 {
+            let id = format!("pool-{g}");
+            fleet.set_group(&group, vec![spec(&id, Some("pool"))]);
+            let r = routed(&id);
+            m.decided(&r, Duration::from_micros(1));
+            m.finished(
+                &r,
+                Outcome::Complete(StatusCode::OK),
+                Duration::from_millis(1),
+            );
+        }
+        assert_eq!(m.series.lock().unwrap().len(), 200);
+        tokio::time::sleep(Duration::from_secs(11)).await;
+        let tracked: Vec<String> = m
+            .series
+            .lock()
+            .unwrap()
+            .keys()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(tracked, ["pool-199"]);
+        pruner.abort();
     }
 
     #[test]
