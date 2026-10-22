@@ -4,6 +4,7 @@ The product's best case: almost all of each prompt is a prefix some other
 request already sent."""
 
 import random
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from inferrail_bench.text import words
@@ -24,7 +25,9 @@ class SharedPrompt:
             for i in range(self.prompts)
         ]
 
-    def requests(self, count: int, seed: int) -> list[Request]:
+    def requests(
+        self, count: int, seed: int, offsets: Sequence[float] | None = None
+    ) -> list[Request]:
         systems = self.system_prompts(seed)
         rng = random.Random(f"w1-{seed}")
         out = []

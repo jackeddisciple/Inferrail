@@ -55,8 +55,8 @@ async def measure(
     """One open loop run: the same workload and schedule for the same seed.
     The engines' counters are read when the warmup ends and after the run,
     so the engine hit rate covers the same requests as the summary."""
-    requests = generate(workload, count, seed, **(params or {}))
     offsets = schedule.poisson(rate, count, seed)
+    requests = generate(workload, count, seed, offsets, **(params or {}))
     urls = list(engines)
 
     async def at_warmup() -> dict:

@@ -53,11 +53,12 @@ def test_w1_requests_share_one_of_a_few_long_system_prompts():
 
 
 def test_w2_turns_extend_their_own_history_in_order():
-    requests = MultiTurn(sessions=5, turns=(2, 6)).requests(300, seed=11)
+    offsets = schedule.poisson(25, 600, seed=11)
+    requests = MultiTurn(turns=(2, 6)).requests(600, seed=11, offsets=offsets)
     by_session: dict[str, list] = {}
     for r in requests:
         by_session.setdefault(r.session, []).append(r)
-    assert len(by_session) > 5
+    assert len(by_session) > 50
     for turns in by_session.values():
         assert [t.turn for t in turns] == list(range(len(turns)))
         for earlier, later in itertools.pairwise(turns):
@@ -69,6 +70,21 @@ def test_w2_turns_extend_their_own_history_in_order():
     assert len(openings) == len(by_session)
     interleaved = [r.session for r in requests[:20]]
     assert len(set(interleaved)) > 3
+
+
+def test_w2_waits_a_think_time_between_a_conversations_turns():
+    offsets = schedule.poisson(25, 1500, seed=0)
+    requests = MultiTurn().requests(1500, seed=0, offsets=offsets)
+    last: dict[str, float] = {}
+    gaps = []
+    for request, at in zip(requests, offsets, strict=True):
+        if request.session in last:
+            gaps.append(at - last[request.session])
+        last[request.session] = at
+    assert gaps, "no conversation got a second turn"
+    assert min(gaps) >= 10.0, min(gaps)
+    assert sum(r.turn > 0 for r in requests) > 600
+    assert requests == MultiTurn().requests(1500, seed=0, offsets=offsets)
 
 
 def test_w2_replays_sharegpt_conversations(tmp_path):
@@ -95,7 +111,7 @@ def test_w2_replays_sharegpt_conversations(tmp_path):
     path.write_text(json.dumps(data))
     conversations = load_sharegpt(path)
     assert conversations == [[("hi", "hello there"), ("how are you", "fine thanks")]]
-    workload = MultiTurn(sessions=1, conversations=tuple(tuple(c) for c in conversations))
+    workload = MultiTurn(conversations=tuple(tuple(c) for c in conversations), think_time=(0, 0))
     requests = workload.requests(4, seed=0)
     assert requests[0].messages[0].content.endswith(": hi")
     assert [m.content for m in requests[1].messages[1:]] == ["hello there", "how are you"]

@@ -1,6 +1,7 @@
 """Workload generators. Each yields chat requests in arrival order; the
 schedule decides when they are sent."""
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 from inferrail_bench.workloads.multi_turn import MultiTurn
@@ -24,10 +25,13 @@ WORKLOADS: dict[str, Spec] = {
 }
 
 
-def generate(name: str, count: int, seed: int, **params) -> list[Request]:
-    """`count` requests of workload `name`, the same for the same seed."""
+def generate(
+    name: str, count: int, seed: int, offsets: Sequence[float] | None = None, **params
+) -> list[Request]:
+    """`count` requests of workload `name` arriving at `offsets`, the same for
+    the same seed and schedule."""
     spec = WORKLOADS[name]
-    return spec.build(**{**spec.defaults, **params}).requests(count, seed)
+    return spec.build(**{**spec.defaults, **params}).requests(count, seed, offsets)
 
 
 __all__ = ["WORKLOADS", "Message", "MultiTurn", "Request", "SharedPrompt", "Unique", "generate"]

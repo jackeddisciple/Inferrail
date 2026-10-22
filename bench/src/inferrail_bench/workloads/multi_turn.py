@@ -1,10 +1,14 @@
 """W2: multi turn chat. Every turn resends the whole conversation so far, so
-reuse grows within a session. Sessions are interleaved: each arrival
-continues one of the active conversations, and a finished one is replaced by
-a new one, so arrivals stay Poisson while each session keeps its order."""
+reuse grows within a conversation. Each arrival continues a conversation
+whose user has finished thinking, at least `think_time` after its previous
+turn, so a reply can arrive before the next question is sent, or starts a
+new conversation when none is ready; arrivals stay Poisson and every
+conversation keeps its order."""
 
+import heapq
 import json
 import random
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -43,10 +47,10 @@ class _Session:
 
 @dataclass(frozen=True)
 class MultiTurn:
-    sessions: int = 16
     turns: tuple[int, int] = (3, 10)
     user_tokens: tuple[int, int] = (50, 300)
     assistant_tokens: tuple[int, int] = (50, 300)
+    think_time: tuple[float, float] = (10.0, 20.0)
     conversations: tuple[tuple[Turn, ...], ...] | None = None
 
     def _session(self, rng: random.Random, number: int, seed: int) -> _Session:
@@ -65,17 +69,24 @@ class MultiTurn:
         turns[0] = (f"Conversation {sid}: {first}", reply)
         return _Session(sid, turns)
 
-    def requests(self, count: int, seed: int) -> list[Request]:
+    def requests(
+        self, count: int, seed: int, offsets: Sequence[float] | None = None
+    ) -> list[Request]:
+        """`count` turns for arrivals at `offsets` (one per second if none)."""
+        offsets = offsets if offsets is not None else [float(i) for i in range(count)]
         rng = random.Random(f"w2-{seed}")
         started = 0
-        active = []
-        for _ in range(self.sessions):
-            active.append(self._session(rng, started, seed))
-            started += 1
+        thinking: list[tuple[float, int, _Session]] = []
+        ready: list[_Session] = []
         out = []
-        while len(out) < count:
-            slot = rng.randrange(len(active))
-            session = active[slot]
+        for at in offsets[:count]:
+            while thinking and thinking[0][0] <= at:
+                ready.append(heapq.heappop(thinking)[2])
+            if ready:
+                session = ready.pop(rng.randrange(len(ready)))
+            else:
+                session = self._session(rng, started, seed)
+                started += 1
             history: list[Message] = []
             for user, reply in session.turns[: session.position]:
                 history += [Message("user", user), Message("assistant", reply)]
@@ -90,7 +101,7 @@ class MultiTurn:
                 )
             )
             session.position += 1
-            if session.position == len(session.turns):
-                active[slot] = self._session(rng, started, seed)
-                started += 1
+            if session.position < len(session.turns):
+                due = at + rng.uniform(*self.think_time)
+                heapq.heappush(thinking, (due, len(out), session))
         return out

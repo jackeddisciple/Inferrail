@@ -2,6 +2,7 @@
 help and must not hurt."""
 
 import random
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from inferrail_bench.text import words
@@ -13,7 +14,9 @@ class Unique:
     prompt_tokens: tuple[int, int] = (100, 4000)
     output_tokens: tuple[int, int] = (32, 128)
 
-    def requests(self, count: int, seed: int) -> list[Request]:
+    def requests(
+        self, count: int, seed: int, offsets: Sequence[float] | None = None
+    ) -> list[Request]:
         rng = random.Random(f"w6-{seed}")
         out = []
         for i in range(count):
