@@ -3,6 +3,70 @@
 Notable changes to Inferrail. Versions follow
 [Semantic Versioning](https://semver.org).
 
+## [0.1.5] Bug Fixes and Improvements (22 October 2026)
+
+Fixes from an adversarial pass over the load collector, observability and
+the benchmark harness, and how they meet the gateway and simulator.
+
+### Fixed
+
+* Label values on the gateway metrics page were written unescaped, so a
+  model name containing a quote or a backslash, which model names may,
+  made the whole page unparseable for Prometheus.
+* A request recording metrics for a replica as it left the fleet could
+  create a series just after pruning had forgotten that replica, and the
+  series then stayed forever: a test of 3,000 discovery changes under
+  traffic left 42,000 stale series and a 4 MB page. Creation now happens
+  under the pruning lock.
+* Series of departed replicas were only removed while the page was
+  rendered, so a gateway nobody scraped grew with every discovery change.
+  They are now pruned every ten seconds.
+* The decision log read each candidate's state after the winner's lease
+  was taken, so a replica at its last free slot was logged as chosen but
+  not eligible, with the request itself counted in flight. Candidates are
+  now logged as the policy saw them.
+* `--check` built a whole gateway, creating the decision log file and
+  starting its writer. It now runs the same checks, including whether the
+  log could be opened, without touching the file system.
+* An `otlp_endpoint` without a path, the usual way to name a collector,
+  sent spans to the root, where collectors answer 404, and every span was
+  lost. Such endpoints now get the standard `/v1/traces` path.
+* Failed trace exports were silent. A warning is now logged when export
+  starts failing and a note when it recovers.
+* The compose stack published Grafana, which allows anonymous admin access,
+  along with Prometheus, Jaeger and the gateway, on every network
+  interface. They are now bound to localhost.
+* Benchmark harness:
+  * an engine that stopped answering its metrics aborted the run after it
+    had finished, and the whole comparison with it; such engines are now
+    left out of the engine hit rate and listed as missing,
+  * an engine that restarted during a run made its counter difference
+    negative and dragged the hit rate down; it is now left out,
+  * SGLang engines always reported an engine hit rate of zero; SGLang's
+    prompt and cached token counters are now read,
+  * time per output token was divided by the number of stream chunks,
+    overstating it whenever an engine sends several tokens per chunk; it
+    now uses the token count from usage,
+  * the engine hit rate included the warmup that the usage hit rate leaves
+    out, so the two disagreed; engines are now read when the warmup ends,
+  * W2 sent 97% of follow up turns before the previous reply had ended, so
+    it did not model conversations at all; each conversation now waits a
+    think time of 10 to 20 s between turns.
+
+### Changed
+
+* The committed baseline comparison was recorded again with the corrected
+  harness. W2 changes most: with real gaps between turns, cache blind
+  routing finds almost none of a conversation's history.
+* W2 takes `think_time` instead of a fixed number of interleaved
+  conversations, and every workload now receives the arrival schedule.
+
+### Added
+
+* A test that under a random mix of outcomes every request is counted in
+  exactly one metrics outcome and every gauge returns to zero, and a
+  regression test for each fix.
+
 ## [0.1.4] Load Signals, Observability and the Benchmark Harness (22 October 2026)
 
 The router can now see how busy every engine is, shows what it is doing on
@@ -340,7 +404,8 @@ The first release: project foundations and a faithful vLLM simulator.
   disconnect storms, malformed bodies, long prompts and a memory soak.
 * OpenAI Python SDK suite, sync and async, against the simulator binary.
 
-[0.1.4]: https://github.com/jackeddisciple/Inferrail/tree/main
+[0.1.5]: https://github.com/jackeddisciple/Inferrail/tree/main
+[0.1.4]: https://github.com/jackeddisciple/Inferrail/tree/1c79992445b589bad482d046cbbc94fe517c2e25
 [0.1.3]: https://github.com/jackeddisciple/Inferrail/tree/c6fe3ff568d5f9033b86294b7281f49ed2bcb7cc
 [0.1.2]: https://github.com/jackeddisciple/Inferrail/tree/d7b4d58b108f339496938df7649bd66592b2b8d9
 [0.1.1]: https://github.com/jackeddisciple/Inferrail/tree/664e148a663636837ea98cb32ddc8676dd8b7093

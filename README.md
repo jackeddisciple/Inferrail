@@ -12,8 +12,8 @@ most of its prompt in cache, without letting any replica overload.
 The goal is lower tail latency and fewer GPUs for the same traffic, proven
 with benchmarks anyone can rerun.
 
-> **Status: v0.1.4, load signals, observability and the benchmark
-> harness.** The gateway proxies chat and completions to a fleet of
+> **Status: v0.1.5, load signals, observability and the benchmark
+> harness, hardened.** The gateway proxies chat and completions to a fleet of
 > engines, streams responses untouched, retries before the first byte,
 > ejects failing replicas, discovers replicas through DNS and routes with
 > four baseline policies. It now reads every engine's load ten times a
@@ -48,7 +48,7 @@ the cache away. Inferrail treats routing as a cost estimate instead: for each
 replica, how long until this request's first token, given what is cached
 there and what is queued there?
 
-## What is in v0.1.4
+## What is in v0.1.5
 
 | Piece | What it does |
 | --- | --- |
@@ -259,9 +259,11 @@ about 160 ns.
 server span, and every attempt a `route` span (policy, candidates offered,
 winner, its in flight count and engine load, decision time) and an
 `upstream` client span, exported over OTLP HTTP and sampled by
-`trace_sample_ratio`. A client's W3C `traceparent` is continued, and the
-engine receives the gateway's span as its parent. Without an endpoint the
-spans are never created.
+`trace_sample_ratio`. A bare collector address such as
+`http://collector:4318` gets the standard `/v1/traces` path. A client's
+W3C `traceparent` is continued, and the engine receives the gateway's span
+as its parent. A warning is logged when export starts failing and a note
+when it recovers. Without an endpoint the spans are never created.
 
 **Decision log.** With `observability.decision_log.sample_rate` above zero,
 sampled requests write one JSON line per routing decision to
@@ -272,7 +274,8 @@ the disk falls behind, records are dropped and counted, never waited for.
 Prompts are never logged. See [ADR 006](docs/adr/006-observability.md).
 
 **Dashboard.** `make stack` builds the gateway and simulator image and
-brings up three simulators, the gateway, Prometheus, Grafana and Jaeger.
+brings up three simulators, the gateway, Prometheus, Grafana and Jaeger,
+published on localhost only.
 The provisioned dashboard ([`dashboards/inferrail.json`](dashboards/inferrail.json))
 shows TTFT per replica and per policy from both the gateway and the
 engines, in flight requests, engine queues and KV usage per replica, each
@@ -383,13 +386,15 @@ benchmark plan requires (see [ADR 007](docs/adr/007-benchmark-harness.md)):
   its queueing.
 * **Workloads.** W1: a handful of 2k to 8k token system prompts shared by
   every user, with 50 to 500 token questions. W2: multi turn chats whose
-  history is resent each turn, interleaved across active sessions, or
-  replayed from a ShareGPT file. W6: prompts that share nothing, the control
+  history is resent each turn, each user thinking 10 to 20 s before the
+  next question, generated or replayed from a ShareGPT file. W6: prompts that share nothing, the control
   where cache affinity must not hurt.
 * **Measurements.** TTFT, time per output token, inter token latency, end
   to end latency, throughput, goodput against the default SLO (TTFT at most
   2 s, TPOT at most 100 ms), the prefix hit rate from usage and from the
-  engines' own counters, errors, send lag and requests per replica.
+  engines' own counters (read from vLLM or SGLang over the same requests,
+  after the warmup), errors, send lag and requests per replica. Time per
+  output token counts tokens from usage, not stream chunks.
 * **Fair comparisons.** `compare` gives every policy the same requests and
   arrival times and a cold gateway and simulators per run, discards a
   warmup, and repeats with new seeds.
@@ -403,29 +408,33 @@ The committed results in [`bench/results/baselines`](bench/results/baselines)
 compare the four baselines on three simulators with the default latency
 model of an 8B model on one 24 GB GPU. Each workload runs at about 70% of
 what the fleet sustains: W1 with 32 system prompts (more than one
-replica's KV cache holds) at 6 req/s, W2 with 16 interleaved chats at
-25 req/s, and W6 at 9 req/s. Medians over three repetitions:
+replica's KV cache holds) at 6 req/s, W2 with users who think 10 to 20 s
+between turns at 25 req/s, and W6 at 9 req/s. Medians over three
+repetitions:
 
 | Policy | W1 TTFT p50 / p99 | W1 hit rate | W2 TTFT p50 / p99 | W2 hit rate | W6 TTFT p50 / p99 |
 | --- | --- | --- | --- | --- | --- |
-| `round_robin` | 511 / 1,842 ms | 0.39 | 101 / 470 ms | 0.46 | 313 / 846 ms |
-| `random` | 714 / 3,394 ms | 0.39 | 143 / 622 ms | 0.46 | 399 / 1,657 ms |
-| `least_request` | 776 / 2,207 ms | 0.40 | 138 / 601 ms | 0.46 | 363 / 1,194 ms |
-| `p2c` | 711 / 2,255 ms | 0.40 | 142 / 666 ms | 0.45 | 354 / 1,106 ms |
+| `round_robin` | 510 / 1,843 ms | 0.39 | 104 / 906 ms | 0.03 | 313 / 846 ms |
+| `random` | 712 / 3,392 ms | 0.39 | 134 / 1,589 ms | 0.03 | 397 / 1,656 ms |
+| `least_request` | 670 / 1,899 ms | 0.42 | 127 / 1,146 ms | 0.03 | 369 / 1,034 ms |
+| `p2c` | 708 / 2,256 ms | 0.40 | 131 / 1,301 ms | 0.03 | 352 / 1,105 ms |
 
 ![TTFT by policy on W1](bench/report/baselines/w1_ttft.png)
 
 Two things stand out. Under cache pressure every cache blind policy finds
-a warm prefix for only about 40% of prompt tokens, close to the one in
-three a replica's share of the traffic would give, and p99 TTFT reaches
-1.8 to 3.4 s, at or past the 2 s SLO: that gap is what the cache aware
-policies are built to close. Even among cache blind policies the load
-signal matters: least request and power of two choices balance requests
-in flight, which here are mostly decoding and say little about the prefill
-queue, so they trail plain round robin, and random's uneven spread is
-worst everywhere. No run lost a request, and the client sent every request
-within about 2 ms of its schedule at p99. The full report, with
-distributions and hit rates for every workload, is in
+a warm prefix for only about 40% of W1's prompt tokens, close to the one
+in three a replica's share of the traffic would give, and p99 TTFT
+reaches 1.8 to 3.4 s, at or past the 2 s SLO. Multi turn chat is worse:
+by the time a user asks again, the conversation's history has been evicted
+or the turn lands on another replica, so only 3% of it is reused. That gap
+is what the cache aware policies are built to close. Even among cache
+blind policies the load signal matters: least request and power of two
+choices balance requests in flight, which here are mostly decoding and say
+little about the prefill queue, so they trail plain round robin, and
+random's uneven spread is worst everywhere. No run lost a request, the
+engines' own hit rates match the ones measured from usage, and the client
+sent every request within about 2 ms of its schedule at p99. The full
+report, with distributions and hit rates for every workload, is in
 [`bench/report/baselines/report.md`](bench/report/baselines/report.md).
 
 ## Configuration
@@ -496,7 +505,9 @@ includes:
   one that does not serve the model; bytes the engine sends reach the client
   unchanged under any chunking; request bodies reach the engine byte for
   byte; no request, however malformed, gets a gateway failure; a request
-  succeeds whenever a healthy replica is within its attempts.
+  succeeds whenever a healthy replica is within its attempts; every request
+  is counted in exactly one metrics outcome; metrics of departed replicas
+  never outlive them, even when requests race their removal.
 * **Fuzzing**: random wire payloads must round trip, random engine schedules
   must keep FIFO admission and clean accounting, random HTTP requests must
   get responses that obey the vLLM contract, and hostile YAML fails fast.
