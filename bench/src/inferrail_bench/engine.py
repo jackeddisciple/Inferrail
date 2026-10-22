@@ -35,8 +35,17 @@ async def scrape(urls: list[str]) -> dict[str, dict[str, float] | None]:
 
 def hit_rate(before: dict, after: dict) -> dict:
     """Prompt tokens looked up and found between two scrapes, over the
-    engines that answered both; the others are listed as missing."""
-    counted = [u for u in after if before.get(u) is not None and after[u] is not None]
+    engines that answered both with counters that did not go backwards (an
+    engine that restarted starts from zero); the others are listed as
+    missing."""
+
+    def usable(url: str) -> bool:
+        old, new = before.get(url), after[url]
+        if old is None or new is None:
+            return False
+        return all(new[k] >= old[k] for k in ("queries", "hits"))
+
+    counted = [u for u in after if usable(u)]
     queries = sum(after[u]["queries"] - before[u]["queries"] for u in counted)
     hits = sum(after[u]["hits"] - before[u]["hits"] for u in counted)
     return {

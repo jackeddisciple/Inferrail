@@ -86,6 +86,13 @@ def test_an_engine_that_does_not_answer_is_left_out_not_fatal(tmp_path):
     }
 
 
+def test_an_engine_that_restarted_is_left_out_of_the_hit_rate():
+    before = {"a": {"queries": 100.0, "hits": 50.0}, "b": {"queries": 900.0, "hits": 800.0}}
+    after = {"a": {"queries": 300.0, "hits": 150.0}, "b": {"queries": 40.0, "hits": 10.0}}
+    rate = engine.hit_rate(before, after)
+    assert rate == {"queries": 200.0, "hits": 100.0, "hit_rate": 0.5, "missing": ["b"]}
+
+
 def test_engine_counters_come_from_the_vllm_page():
     page = (REPO_ROOT / "tests/fixtures/vllm/metrics.txt").read_text()
     assert engine.prefix_counters(page) == {"queries": 9238.0, "hits": 5040.0}
