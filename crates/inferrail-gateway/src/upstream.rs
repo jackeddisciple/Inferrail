@@ -11,6 +11,8 @@ use inferrail_core::config::UpstreamConfig;
 use inferrail_core::openai::ModelList;
 use inferrail_load::{EngineLoad, Scrape, ScrapeError};
 
+use crate::metrics::Metrics;
+
 pub(crate) type Client = hyper_util::client::legacy::Client<HttpConnector, Full<Bytes>>;
 
 pub(crate) fn client(config: &UpstreamConfig) -> Client {
@@ -84,6 +86,7 @@ const MAX_METRICS_PAGE: usize = 4 << 20;
 #[derive(Debug, Clone)]
 pub(crate) struct HttpScrape {
     pub(crate) client: Client,
+    pub(crate) metrics: Arc<Metrics>,
 }
 
 impl Scrape<Replica> for HttpScrape {
@@ -113,5 +116,10 @@ impl Scrape<Replica> for HttpScrape {
             .to_bytes();
         let text = std::str::from_utf8(&body).map_err(|_| ScrapeError::NotUtf8)?;
         Ok(inferrail_load::parse(text)?)
+    }
+
+    fn observed(&self, replica: &Replica, result: &Result<EngineLoad, ScrapeError>) {
+        let kind = result.as_ref().map_or_else(ScrapeError::kind, |_| "ok");
+        self.metrics.scraped(replica.id(), kind);
     }
 }

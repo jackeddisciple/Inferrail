@@ -101,6 +101,11 @@ impl GatewayError {
         self.status
     }
 
+    /// The OpenAI error type, such as `NotFoundError`.
+    pub fn kind(&self) -> &'static str {
+        self.kind
+    }
+
     pub fn message(&self) -> &str {
         &self.message
     }

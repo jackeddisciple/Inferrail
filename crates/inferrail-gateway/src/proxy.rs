@@ -11,10 +11,11 @@ use inferrail_control::{Lease, Nanos, Replica};
 use inferrail_core::ids::{ModelId, ReplicaId};
 use tokio::time::{Instant, sleep, timeout, timeout_at};
 
-use crate::body::{ResponseBody, UpstreamBody};
+use crate::body::{Recording, ResponseBody, UpstreamBody};
 use crate::errors::GatewayError;
 use crate::headers::{self, REPLICA};
 use crate::inspect::{InspectError, inspect};
+use crate::metrics::Routed;
 use crate::request_id::REQUEST_ID;
 use crate::{Shared, models, route};
 
@@ -22,9 +23,10 @@ pub(crate) async fn handle(
     shared: Arc<Shared>,
     request: Request<Incoming>,
 ) -> Result<Response<ResponseBody>, Infallible> {
+    let arrival = std::time::Instant::now();
     let id = shared.ids.resolve(request.headers());
     let version = request.version();
-    let mut response = match dispatch(&shared, request, &id).await {
+    let mut response = match dispatch(&shared, request, &id, arrival).await {
         Ok(response) => response,
         Err(err) => error_response(&err),
     };
@@ -62,14 +64,16 @@ async fn dispatch(
     shared: &Arc<Shared>,
     request: Request<Incoming>,
     id: &HeaderValue,
+    arrival: std::time::Instant,
 ) -> Result<Response<ResponseBody>, GatewayError> {
     match route_of(request.method(), request.uri().path()) {
-        Route::Proxy => proxy(shared, request, id).await,
+        Route::Proxy => proxy(shared, request, id, arrival).await,
         Route::Local(local) => {
             if !expects_continue(request.headers()) {
                 drain(request.into_body(), shared.config.server.max_body_bytes).await;
             }
-            match local? {
+            let local = local.inspect_err(|err| shared.metrics.rejected(None, err, false))?;
+            match local {
                 Local::Models => Ok(models::list(shared)),
                 Local::Health => Ok(Response::new(ResponseBody::empty())),
             }
@@ -122,10 +126,40 @@ pub(crate) fn error_response(err: &GatewayError) -> Response<ResponseBody> {
     response
 }
 
+/// What is known about a proxied request so far, for its metrics.
+#[derive(Debug, Default)]
+struct Seen {
+    model: Option<ModelId>,
+    replica: Option<ReplicaId>,
+}
+
 async fn proxy(
     shared: &Arc<Shared>,
     request: Request<Incoming>,
     id: &HeaderValue,
+    arrival: std::time::Instant,
+) -> Result<Response<ResponseBody>, GatewayError> {
+    let mut seen = Seen::default();
+    let result = attempt(shared, request, id, arrival, &mut seen).await;
+    match &result {
+        Ok(response) => {
+            if let (ResponseBody::Full(_), Some(model)) = (response.body(), &seen.model) {
+                shared
+                    .metrics
+                    .answered(model, seen.replica.as_ref(), response.status());
+            }
+        }
+        Err(err) => shared.metrics.rejected(seen.model.as_ref(), err, true),
+    }
+    result
+}
+
+async fn attempt(
+    shared: &Arc<Shared>,
+    request: Request<Incoming>,
+    id: &HeaderValue,
+    arrival: std::time::Instant,
+    seen: &mut Seen,
 ) -> Result<Response<ResponseBody>, GatewayError> {
     let deadline = Instant::now() + shared.config.server.request_timeout;
     let (parts, body) = request.into_parts();
@@ -134,6 +168,7 @@ async fn proxy(
         .await
         .map_err(|_| GatewayError::slow_body())??;
     let (model, body) = resolve_model(shared, body)?;
+    seen.model = Some(model.clone());
     if shared.config.logging.log_prompts {
         tracing::debug!(request_id = ?id, body = %String::from_utf8_lossy(&body), "request body");
     }
@@ -150,12 +185,24 @@ async fn proxy(
             sleep(pause).await;
         }
         let now = shared.clock.now();
+        let started = std::time::Instant::now();
         let lease = match route::select(&shared.registry, policy, &model, now, &tried, tokens) {
             Ok(lease) => lease,
             Err(err) => return last.unwrap_or(Err(err)),
         };
-        tried.push(lease.replica().id().clone());
-        match forward(shared, lease, &parts, body.clone(), id, deadline).await {
+        let routed = Routed {
+            model: model.clone(),
+            policy: policy.kind(),
+            replica: lease.replica().id().clone(),
+        };
+        shared.metrics.decided(&routed, started.elapsed());
+        if attempt > 0 {
+            shared.metrics.retried(&model);
+        }
+        tried.push(routed.replica.clone());
+        seen.replica = Some(routed.replica.clone());
+        let recording = Recording::new(routed, arrival);
+        match forward(shared, lease, recording, &parts, body.clone(), id, deadline).await {
             Attempt::Done(response) => return Ok(response),
             Attempt::Fatal(err) => return Err(err),
             Attempt::Retry(failure) => {
@@ -306,6 +353,7 @@ fn is_retryable(status: StatusCode) -> bool {
 async fn forward(
     shared: &Arc<Shared>,
     mut lease: Lease,
+    recording: Recording,
     parts: &Parts,
     body: Bytes,
     id: &HeaderValue,
@@ -382,7 +430,12 @@ async fn forward(
             ))),
         });
     }
-    let body = UpstreamBody::new(incoming, lease, Arc::clone(shared));
+    let stream = head
+        .headers
+        .get(header::CONTENT_TYPE)
+        .is_some_and(|v| v.as_bytes().starts_with(b"text/event-stream"));
+    let recording = recording.responded(status, stream);
+    let body = UpstreamBody::new(incoming, lease, Arc::clone(shared), recording);
     Attempt::Done(Response::from_parts(head, ResponseBody::Upstream(body)))
 }
 
@@ -406,6 +459,7 @@ pub(crate) fn record_failure(shared: &Shared, replica: &Replica) {
         return;
     }
     if let Some(ejection) = replica.health().eject(now, &shared.health) {
+        shared.metrics.ejected(replica.id());
         tracing::warn!(
             replica = %replica.id(),
             seconds = ejection.length.as_secs_f64(),

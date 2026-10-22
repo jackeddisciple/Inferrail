@@ -21,6 +21,7 @@ mod body;
 pub mod errors;
 pub mod headers;
 pub mod inspect;
+pub mod metrics;
 mod models;
 mod proxy;
 pub mod request_id;
@@ -57,6 +58,7 @@ pub(crate) struct Shared {
     started_unix: u64,
     resolver: Arc<dyn Resolve>,
     ejecting: Mutex<()>,
+    metrics: Arc<metrics::Metrics>,
 }
 
 impl Shared {
@@ -118,11 +120,24 @@ impl Gateway {
                 inferrail_policy::build(kind, model_seed),
             );
         }
+        let registry = Arc::new(Registry::new(ReplicaSpec::statics(&config)));
+        let clock = Clock::default();
+        let metrics = Arc::new(metrics::Metrics::new(metrics::FleetGauges {
+            registry: Arc::clone(&registry),
+            clock,
+            max_age: config.load.max_age,
+            policies: config
+                .models
+                .iter()
+                .map(|m| (m.name.clone(), config.policy_for(m)))
+                .collect(),
+        }));
         let shared = Shared {
-            registry: Arc::new(Registry::new(ReplicaSpec::statics(&config))),
+            registry,
             client: upstream::client(&config.upstream),
             ids: request_id::RequestIds::default(),
-            clock: Clock::default(),
+            clock,
+            metrics,
             health: HealthPolicy::from(&config.health),
             started_unix: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -144,6 +159,11 @@ impl Gateway {
 
     pub fn registry(&self) -> &Registry {
         &self.shared.registry
+    }
+
+    /// The gateway's Prometheus metrics in OpenMetrics text format.
+    pub fn render_metrics(&self) -> String {
+        self.shared.metrics.render()
     }
 
     /// The clock health and ejection deadlines are measured on.
@@ -199,6 +219,7 @@ impl Gateway {
                 move || registry.snapshot().replicas().to_vec(),
                 upstream::HttpScrape {
                     client: shared.client.clone(),
+                    metrics: Arc::clone(&shared.metrics),
                 },
                 CollectorConfig {
                     interval: shared.config.load.scrape_interval,

@@ -25,6 +25,7 @@ inferrail-control.workspace = true
 inferrail-core.workspace = true
 inferrail-load.workspace = true
 inferrail-policy.workspace = true
+prometheus-client.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -45,6 +46,10 @@ tower.workspace = true
 
 [[bench]]
 name = "inspect"
+harness = false
+
+[[bench]]
+name = "record"
 harness = false
 
 [lints]
