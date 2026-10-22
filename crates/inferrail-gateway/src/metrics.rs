@@ -43,13 +43,27 @@ pub enum Text {
     Fixed(&'static str),
 }
 
+/// `prometheus-client` writes label values verbatim, and model names may
+/// hold quotes and backslashes, so values are escaped here.
 impl EncodeLabelValue for Text {
     fn encode(&self, encoder: &mut LabelValueEncoder<'_>) -> fmt::Result {
-        encoder.write_str(match self {
+        let value = match self {
             Self::Model(id) => id.as_str(),
             Self::Replica(id) => id.as_str(),
             Self::Fixed(text) => text,
-        })
+        };
+        if !value.contains(['\\', '"', '\n']) {
+            return encoder.write_str(value);
+        }
+        for c in value.chars() {
+            match c {
+                '\\' => encoder.write_str("\\\\")?,
+                '"' => encoder.write_str("\\\"")?,
+                '\n' => encoder.write_str("\\n")?,
+                c => encoder.write_char(c)?,
+            }
+        }
+        Ok(())
     }
 }
 
@@ -566,7 +580,10 @@ impl Collector for FleetGauges {
             MetricType::Gauge,
         )?;
         for (model, policy) in &self.policies {
-            let labels = [("model", model.as_str()), ("policy", policy.as_str())];
+            let labels = [
+                ("model", Text::Model(model.clone())),
+                ("policy", Text::Fixed(policy.as_str())),
+            ];
             ConstGauge::new(1i64).encode(info.encode_family(&labels)?)?;
         }
         let mut build = encoder.encode_descriptor(
@@ -761,5 +778,38 @@ mod tests {
         assert!(!page.contains("pool-"), "{page}");
         assert!(page.len() < before + 4096, "{} vs {before}", page.len());
         assert!(m.series.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn label_values_are_escaped() {
+        let fleet = Arc::new(Registry::new(vec![spec("a", None)]));
+        let quoted = ModelId::new(r#"org/we"ird\name"#).unwrap();
+        let m = Metrics::new(FleetGauges {
+            registry: Arc::clone(&fleet),
+            clock: Clock::default(),
+            max_age: Duration::from_millis(250),
+            policies: vec![(quoted.clone(), PolicyKind::P2c)],
+        });
+        let routed = Routed {
+            model: quoted.clone(),
+            policy: PolicyKind::P2c,
+            replica: ReplicaId::new("a").unwrap(),
+        };
+        m.decided(&routed, Duration::from_micros(1));
+        m.finished(
+            &routed,
+            Outcome::Complete(StatusCode::OK),
+            Duration::from_millis(1),
+        );
+        m.rejected(Some(&quoted), &GatewayError::not_found(), true);
+        let page = m.render();
+        assert!(page.contains(r#"model="org/we\"ird\\name""#), "{page}");
+        assert!(!page.contains(r#"we"ird"#), "{page}");
+        let models: Vec<String> = samples(&page)
+            .filter_map(|s| s.label("model").map(|v| v.into_owned()))
+            .filter(|v| !v.is_empty())
+            .collect();
+        assert!(models.len() >= 5, "{models:?}");
+        assert!(models.iter().all(|v| v == quoted.as_str()), "{models:?}");
     }
 }
