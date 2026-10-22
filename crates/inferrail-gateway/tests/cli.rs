@@ -243,3 +243,52 @@ async fn exports_spans_over_otlp_when_configured() {
         "{batches:?}"
     );
 }
+
+#[test]
+fn check_leaves_no_trace_but_still_refuses_an_unwritable_decision_log() {
+    let dir = std::env::temp_dir().join(format!("inferrail-check-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("dir");
+    let log = dir.join("decisions.jsonl");
+    let config = |path: &Path| {
+        temp_config(
+            "decisions",
+            &format!(
+                "models: [{{name: m}}]\nreplicas: [{{id: r, url: 'http://h:1', models: [m]}}]\nobservability:\n  decision_log: {{path: '{}', sample_rate: 1.0}}\n",
+                path.display()
+            ),
+        )
+    };
+    let good = config(&log);
+    let out = Command::new(BIN)
+        .args(["--check", "-c"])
+        .arg(&good)
+        .output()
+        .expect("run");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!log.exists(), "--check created the decision log");
+
+    let missing = config(&dir.join("no/such/dir/decisions.jsonl"));
+    let out = Command::new(BIN)
+        .args(["--check", "-c"])
+        .arg(&missing)
+        .output()
+        .expect("run");
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("cannot open the decision log"));
+
+    let is_dir = config(&dir);
+    let out = Command::new(BIN)
+        .args(["--check", "-c"])
+        .arg(&is_dir)
+        .output()
+        .expect("run");
+    assert!(!out.status.success());
+    for path in [good, missing, is_dir] {
+        let _ = std::fs::remove_file(path);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

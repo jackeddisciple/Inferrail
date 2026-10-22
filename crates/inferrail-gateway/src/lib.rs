@@ -87,8 +87,9 @@ impl Gateway {
         Self::with_resolver(config, Arc::new(SystemResolver))
     }
 
-    /// Like [`Gateway::new`] with a custom resolver for DNS discovery.
-    pub fn with_resolver(config: Config, resolver: Arc<dyn Resolve>) -> Result<Self, BuildError> {
+    /// Every check startup makes, without opening files or starting
+    /// anything: what `--check` runs.
+    pub fn check(config: &Config) -> Result<(), BuildError> {
         config.validate().map_err(BuildError::Invalid)?;
         let urls = config
             .replicas
@@ -106,6 +107,19 @@ impl Gateway {
                 return Err(BuildError::Https(id.to_owned()));
             }
         }
+        let log = &config.observability.decision_log;
+        if let Some(path) = log.path.as_deref().filter(|_| log.sample_rate > 0.0) {
+            decision_log::writable(path).map_err(|source| BuildError::DecisionLog {
+                path: path.to_owned(),
+                source,
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Like [`Gateway::new`] with a custom resolver for DNS discovery.
+    pub fn with_resolver(config: Config, resolver: Arc<dyn Resolve>) -> Result<Self, BuildError> {
+        Self::check(&config)?;
         let seed = config
             .routing
             .seed

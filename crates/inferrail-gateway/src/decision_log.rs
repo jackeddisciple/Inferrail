@@ -78,6 +78,32 @@ pub(crate) fn candidates(
         .collect()
 }
 
+/// Whether `path` could be opened for appending, without creating it: its
+/// directory exists and it is not itself a directory.
+pub(crate) fn writable(path: &Path) -> io::Result<()> {
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    if !std::fs::metadata(dir)?.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotADirectory,
+            format!("{} is not a directory", dir.display()),
+        ));
+    }
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.is_dir() => Err(io::Error::new(
+            io::ErrorKind::IsADirectory,
+            "the path is a directory",
+        )),
+        Ok(meta) if meta.permissions().readonly() => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "the file is read only",
+        )),
+        _ => Ok(()),
+    }
+}
+
 pub(crate) fn unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

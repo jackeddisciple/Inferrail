@@ -55,9 +55,8 @@ async fn main() -> anyhow::Result<()> {
     let filter = args.log.as_deref().unwrap_or(&config.logging.level);
     let _telemetry = telemetry::init(filter, &config.observability)?;
     let addr = config.server.listen;
-    let gateway = Gateway::new(config)?;
     if args.check {
-        let config = gateway.config();
+        Gateway::check(&config)?;
         println!(
             "{}: {} models, {} replicas, {} DNS groups",
             args.config.display(),
@@ -67,6 +66,7 @@ async fn main() -> anyhow::Result<()> {
         );
         return Ok(());
     }
+    let gateway = Gateway::new(config)?;
     let listener = TcpListener::bind(addr)
         .await
         .with_context(|| format!("cannot bind {addr}"))?;
