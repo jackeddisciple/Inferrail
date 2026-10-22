@@ -88,6 +88,14 @@ def test_prometheus_scrapes_the_gateway_admin_port_and_every_engine():
         assert f"replica: {replica}" in text
 
 
+def test_published_ports_stay_on_localhost():
+    ports = re.findall(r'^\s+- "([^"]+)"$', COMPOSE.read_text(), re.M)
+    published = [p for p in ports if p.count(":") >= 1 and p.split(":")[-1].isdigit()]
+    assert published, "no published ports found"
+    for port in published:
+        assert port.startswith("127.0.0.1:"), port
+
+
 @pytest.mark.skipif(shutil.which("docker") is None, reason="docker CLI not installed")
 def test_compose_file_is_valid():
     result = subprocess.run(
