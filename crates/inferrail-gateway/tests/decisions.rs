@@ -105,8 +105,12 @@ async fn every_decision_is_logged_with_candidates_and_never_the_prompt() {
         let winner = candidates.iter().find(|c| c["replica"] == chosen).unwrap();
         assert_eq!(winner["eligible"], true);
         assert_eq!(winner["healthy"], true);
-        assert!(winner["in_flight"].as_u64().unwrap() >= 1);
-        assert!(winner["in_flight_tokens"].as_u64().unwrap() > 0);
+        let least = candidates
+            .iter()
+            .map(|c| c["in_flight"].as_u64().unwrap())
+            .min()
+            .unwrap();
+        assert_eq!(winner["in_flight"].as_u64().unwrap(), least);
         seen.insert(line["request_id"].as_str().unwrap().to_owned());
     }
     assert_eq!(seen, ids);
@@ -209,4 +213,23 @@ async fn no_log_without_a_rate() {
     assert_eq!(status, 200);
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(!path.exists());
+}
+
+#[tokio::test]
+async fn candidates_are_logged_as_the_policy_saw_them() {
+    let sim = Upstream::zero(&[MODEL]).await;
+    let path = log_path("before");
+    let text = decision_config(&path, 1.0);
+    let mut config = fleet(&urls(&[&sim]), &text);
+    config.replicas[0].max_concurrency = Some(1);
+    let gw = TestGateway::start(config).await;
+    let (status, _) = gw.post_json("/v1/chat/completions", &chat("x", 1)).await;
+    assert_eq!(status, 200);
+    let logged = lines(&path, 1).await;
+    let _ = std::fs::remove_file(&path);
+    let winner = &logged[0]["candidates"][0];
+    assert_eq!(logged[0]["chosen"], "r0");
+    assert_eq!(winner["eligible"], true, "{winner}");
+    assert_eq!(winner["in_flight"], 0, "{winner}");
+    assert_eq!(winner["in_flight_tokens"], 0, "{winner}");
 }

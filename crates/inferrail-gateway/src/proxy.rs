@@ -233,6 +233,15 @@ async fn attempt(
             inferrail.decision_ns = Empty,
         );
         let now = shared.clock.now();
+        let seen_by_policy = sampled.map(|_| {
+            decision_log::candidates(
+                &shared.registry.load(),
+                &model,
+                now,
+                &tried,
+                shared.config.load.max_age,
+            )
+        });
         let started = std::time::Instant::now();
         let selected = route_span
             .in_scope(|| route::select(&shared.registry, policy, &model, now, &tried, tokens));
@@ -247,7 +256,7 @@ async fn attempt(
             replica: lease.replica().id().clone(),
         };
         shared.metrics.decided(&routed, took);
-        if let Some(log) = sampled {
+        if let (Some(log), Some(candidates)) = (sampled, seen_by_policy) {
             log.record(Decision {
                 ts_ms: decision_log::unix_ms(),
                 request_id: id.to_str().unwrap_or_default().to_owned(),
@@ -256,13 +265,7 @@ async fn attempt(
                 attempt,
                 chosen: routed.replica.clone(),
                 decision_ns: u64::try_from(took.as_nanos()).unwrap_or(u64::MAX),
-                candidates: decision_log::candidates(
-                    &shared.registry.load(),
-                    &model,
-                    now,
-                    &tried,
-                    shared.config.load.max_age,
-                ),
+                candidates,
             });
         }
         if !route_span.is_disabled() {
