@@ -48,10 +48,13 @@ class Record:
 
     @property
     def tpot(self) -> float:
-        """Mean time per output token after the first."""
-        if len(self.token_times) < 2:
+        """Mean time per output token after the first. Engines may send
+        several tokens in one chunk, so the count comes from usage when the
+        engine reports it, and from the chunks only otherwise."""
+        tokens = self.completion_tokens or len(self.token_times)
+        if tokens < 2 or not self.token_times:
             return math.nan
-        return (self.token_times[-1] - self.token_times[0]) / (len(self.token_times) - 1)
+        return (self.token_times[-1] - self.token_times[0]) / (tokens - 1)
 
     @property
     def itl(self) -> list[float]:

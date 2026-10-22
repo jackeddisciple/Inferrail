@@ -46,9 +46,9 @@ def _event(payload: dict | str) -> bytes:
     return _chunk(f"data: {text}\n\n".encode())
 
 
-def sse(first: float, gap: float, tokens: int, replica: str = "r0") -> Handler:
-    """Streams `tokens` content chunks, the first after `first` seconds and
-    the rest `gap` apart, then usage and [DONE]."""
+def sse(first: float, gap: float, tokens: int, replica: str = "r0", per_chunk: int = 1) -> Handler:
+    """Streams `tokens` content chunks of `per_chunk` tokens each, the first
+    after `first` seconds and the rest `gap` apart, then usage and [DONE]."""
 
     async def handler(writer: asyncio.StreamWriter) -> None:
         writer.write(
@@ -64,11 +64,12 @@ def sse(first: float, gap: float, tokens: int, replica: str = "r0") -> Handler:
         for i in range(tokens):
             if i:
                 await asyncio.sleep(gap)
-            writer.write(_event({"choices": [{"index": 0, "delta": {"content": f" t{i}"}}]}))
+            text = "".join(f" t{i}.{k}" for k in range(per_chunk))
+            writer.write(_event({"choices": [{"index": 0, "delta": {"content": text}}]}))
             await writer.drain()
         usage = {
             "prompt_tokens": 40,
-            "completion_tokens": tokens,
+            "completion_tokens": tokens * per_chunk,
             "prompt_tokens_details": {"cached_tokens": 32},
         }
         writer.write(_event({"choices": [], "usage": usage}))

@@ -37,6 +37,20 @@ def test_ttft_itl_and_tpot_match_the_server_timing():
         assert r.lag < 0.02
 
 
+def test_tpot_counts_tokens_not_chunks_when_engines_batch_them():
+    async def main():
+        server, url = await serve(sse(first=0.02, gap=0.03, tokens=6, per_chunk=3))
+        async with server:
+            return await runner.run(url, "m", [REQUEST], [0.0])
+
+    [record] = run(main())
+    assert record.ok, record.error
+    assert len(record.token_times) == 6
+    assert record.completion_tokens == 18
+    assert record.tpot == pytest.approx(5 * 0.03 / 17, rel=0.3)
+    assert statistics.median(record.itl) == pytest.approx(0.03, abs=0.01)
+
+
 def test_errors_and_unreachable_servers_end_up_in_the_record():
     async def main():
         server, url = await serve(status(503, '{"error": {"message": "full"}}'))
