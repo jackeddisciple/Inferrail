@@ -527,3 +527,15 @@ pub async fn wait_until(limit: Duration, mut done: impl FnMut() -> bool) -> Dura
     }
     started.elapsed()
 }
+
+/// Serves the gateway's admin routes on an ephemeral port; returns its URL.
+pub async fn serve_admin(gateway: &Gateway) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let base = format!("http://{}", listener.local_addr().expect("addr"));
+    tokio::spawn(
+        gateway
+            .clone()
+            .serve_admin(listener, std::future::pending::<()>()),
+    );
+    base
+}

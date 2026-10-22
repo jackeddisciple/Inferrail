@@ -17,6 +17,7 @@ use inferrail_policy::RoutingPolicy;
 use tokio::net::TcpListener;
 use tokio::task::JoinSet;
 
+mod admin;
 mod body;
 pub mod errors;
 pub mod headers;
@@ -159,6 +160,18 @@ impl Gateway {
 
     pub fn registry(&self) -> &Registry {
         &self.shared.registry
+    }
+
+    /// Serves `GET /metrics` and `GET /health` on the admin listener until
+    /// `shutdown` resolves.
+    pub async fn serve_admin(
+        self,
+        listener: TcpListener,
+        shutdown: impl Future<Output = ()> + Send + 'static,
+    ) -> std::io::Result<()> {
+        axum::serve(listener, admin::router(self.shared))
+            .with_graceful_shutdown(shutdown)
+            .await
     }
 
     /// The gateway's Prometheus metrics in OpenMetrics text format.

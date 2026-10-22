@@ -17,6 +17,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+axum.workspace = true
 clap.workspace = true
 http-body-util.workspace = true
 hyper.workspace = true
@@ -35,9 +36,9 @@ tracing-subscriber.workspace = true
 xxhash-rust.workspace = true
 
 [dev-dependencies]
-axum.workspace = true
 criterion.workspace = true
 futures.workspace = true
+insta.workspace = true
 inferrail-sim.workspace = true
 proptest.workspace = true
 reqwest.workspace = true

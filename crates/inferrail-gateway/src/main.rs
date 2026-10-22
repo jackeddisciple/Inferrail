@@ -73,13 +73,24 @@ async fn main() -> anyhow::Result<()> {
     let listener = TcpListener::bind(addr)
         .await
         .with_context(|| format!("cannot bind {addr}"))?;
+    let admin_addr = gateway.config().server.admin_listen;
+    let admin_listener = TcpListener::bind(admin_addr)
+        .await
+        .with_context(|| format!("cannot bind {admin_addr}"))?;
     tracing::info!(
         %addr,
+        admin = %admin_addr,
         models = gateway.config().models.len(),
         replicas = gateway.registry().load().replicas().len(),
         "inferrail-gateway listening"
     );
+    let (stop, mut stopped) = tokio::sync::watch::channel(());
+    let admin = tokio::spawn(gateway.clone().serve_admin(admin_listener, async move {
+        let _ = stopped.changed().await;
+    }));
     gateway.serve(listener, shutdown_signal()).await?;
+    drop(stop);
+    admin.await??;
     Ok(())
 }
 

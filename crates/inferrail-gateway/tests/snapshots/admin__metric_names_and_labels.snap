@@ -1,0 +1,60 @@
+---
+source: crates/inferrail-gateway/tests/admin.rs
+expression: shape(&page)
+---
+TYPE inferrail_build_info gauge
+TYPE inferrail_client_disconnects counter
+TYPE inferrail_ejections counter
+TYPE inferrail_load_scrapes counter
+TYPE inferrail_model_policy gauge
+TYPE inferrail_replica_ejected gauge
+TYPE inferrail_replica_engine_kv_usage gauge
+TYPE inferrail_replica_engine_prefix_cache_hits counter
+TYPE inferrail_replica_engine_prefix_cache_queries counter
+TYPE inferrail_replica_engine_running gauge
+TYPE inferrail_replica_engine_waiting gauge
+TYPE inferrail_replica_healthy gauge
+TYPE inferrail_replica_in_flight gauge
+TYPE inferrail_replica_in_flight_tokens gauge
+TYPE inferrail_replica_load_age_seconds gauge
+TYPE inferrail_replica_load_stale gauge
+TYPE inferrail_replica_pending gauge
+TYPE inferrail_replica_prefill_tokens gauge
+TYPE inferrail_request_duration_seconds histogram
+TYPE inferrail_request_errors counter
+TYPE inferrail_requests counter
+TYPE inferrail_routing_decision_seconds histogram
+TYPE inferrail_routing_decisions counter
+TYPE inferrail_ttft_seconds histogram
+TYPE inferrail_upstream_retries counter
+inferrail_build_info{version}
+inferrail_client_disconnects_total{model}
+inferrail_ejections_total{replica}
+inferrail_load_scrapes_total{replica,result}
+inferrail_model_policy{model,policy}
+inferrail_replica_ejected{replica}
+inferrail_replica_engine_kv_usage{replica}
+inferrail_replica_engine_prefix_cache_hits_total{replica}
+inferrail_replica_engine_prefix_cache_queries_total{replica}
+inferrail_replica_engine_running{replica}
+inferrail_replica_engine_waiting{replica}
+inferrail_replica_healthy{replica}
+inferrail_replica_in_flight_tokens{replica}
+inferrail_replica_in_flight{replica}
+inferrail_replica_load_age_seconds{replica}
+inferrail_replica_load_stale{replica}
+inferrail_replica_pending{replica}
+inferrail_replica_prefill_tokens{replica}
+inferrail_request_duration_seconds_bucket{model,policy,replica}
+inferrail_request_duration_seconds_count{model,policy,replica}
+inferrail_request_duration_seconds_sum{model,policy,replica}
+inferrail_request_errors_total{model,reason}
+inferrail_requests_total{model,replica,status}
+inferrail_routing_decision_seconds_bucket{policy}
+inferrail_routing_decision_seconds_count{policy}
+inferrail_routing_decision_seconds_sum{policy}
+inferrail_routing_decisions_total{model,policy,replica}
+inferrail_ttft_seconds_bucket{model,policy,replica}
+inferrail_ttft_seconds_count{model,policy,replica}
+inferrail_ttft_seconds_sum{model,policy,replica}
+inferrail_upstream_retries_total{model}

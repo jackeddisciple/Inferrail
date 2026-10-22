@@ -27,6 +27,7 @@ http-body-util = "0.1.5"
 humantime-serde = "1.1.1"
 hyper = { version = "1.12.0", features = ["client", "http1", "http2", "server"] }
 hyper-util = { version = "0.1.21", features = ["client-legacy", "http1", "http2", "server-auto", "server-graceful", "service", "tokio"] }
+insta = "1.49.0"
 prometheus-client = "0.25.1"
 proptest = "1.12"
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "stream"] }

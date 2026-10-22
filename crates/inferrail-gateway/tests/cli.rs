@@ -89,12 +89,13 @@ fn check_accepts_shipped_configs_and_rejects_bad_ones() {
 #[tokio::test]
 async fn serves_and_exits_cleanly_on_sigterm() {
     let sim = Upstream::zero(&[MODEL]).await;
-    let port = {
+    let free = || {
         let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         probe.local_addr().unwrap().port()
     };
+    let (port, admin) = (free(), free());
     let text = format!(
-        "server:\n  listen: 127.0.0.1:{port}\nmodels:\n  - name: {MODEL}\nreplicas:\n  - id: r0\n    url: {}\n    models: [{MODEL}]\n",
+        "server:\n  listen: 127.0.0.1:{port}\n  admin_listen: 127.0.0.1:{admin}\nmodels:\n  - name: {MODEL}\nreplicas:\n  - id: r0\n    url: {}\n    models: [{MODEL}]\n",
         sim.url()
     );
     let path = temp_config("serve", &text);
@@ -125,6 +126,15 @@ async fn serves_and_exits_cleanly_on_sigterm() {
         .await
         .unwrap();
     assert_eq!(reply["usage"]["completion_tokens"], 3);
+    let metrics = client
+        .get(format!("http://127.0.0.1:{admin}/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(metrics.contains("inferrail_requests_total{"), "{metrics}");
     let status = Command::new("kill")
         .arg(child.id().to_string())
         .status()
