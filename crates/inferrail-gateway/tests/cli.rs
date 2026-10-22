@@ -177,18 +177,20 @@ async fn exported(endpoint: impl Fn(std::net::SocketAddr) -> String) -> Vec<(Str
                     .and_then(|v| v.to_str().ok())
                     .unwrap_or_default()
                     .to_owned();
-                sink.lock().unwrap().push((kind, body.len()));
+                sink.lock().expect("test setup").push((kind, body.len()));
             }
         }),
     );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let otlp = endpoint(listener.local_addr().unwrap());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("test setup");
+    let otlp = endpoint(listener.local_addr().expect("test setup"));
     tokio::spawn(async move { axum::serve(listener, collector).await });
 
     let sim = Upstream::zero(&[MODEL]).await;
     let free = || {
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        probe.local_addr().unwrap().port()
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("test setup");
+        probe.local_addr().expect("test setup").port()
     };
     let (port, admin) = (free(), free());
     let text = format!(
@@ -218,16 +220,16 @@ async fn exported(endpoint: impl Fn(std::net::SocketAddr) -> String) -> Vec<(Str
         .json(&chat("traced", 2))
         .send()
         .await
-        .unwrap();
+        .expect("test setup");
     assert_eq!(reply.status(), 200);
-    reply.bytes().await.unwrap();
+    reply.bytes().await.expect("test setup");
     Command::new("kill")
         .arg(child.id().to_string())
         .status()
-        .unwrap();
+        .expect("test setup");
     let started = Instant::now();
     let exit = loop {
-        if let Some(exit) = child.try_wait().unwrap() {
+        if let Some(exit) = child.try_wait().expect("test setup") {
             break exit;
         }
         assert!(
@@ -238,8 +240,7 @@ async fn exported(endpoint: impl Fn(std::net::SocketAddr) -> String) -> Vec<(Str
     };
     let _ = std::fs::remove_file(&path);
     assert!(exit.success(), "{exit:?}");
-    let batches = received.lock().unwrap().clone();
-    batches
+    received.lock().expect("test setup").clone()
 }
 
 #[cfg(unix)]
