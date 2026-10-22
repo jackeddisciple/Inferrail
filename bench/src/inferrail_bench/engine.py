@@ -1,14 +1,21 @@
 """Prefix cache counters read straight from engines, for the hit rate the
-engines themselves report."""
+engines themselves report: vLLM's prefix cache queries and hits, or
+SGLang's prompt and cached tokens."""
 
 import asyncio
 import re
 
 import httpx2
 
+
+def _family(*names: str) -> re.Pattern:
+    joined = "|".join(re.escape(n) for n in names)
+    return re.compile(rf"^(?:{joined})(?:\{{[^}}]*\}})?\s+(\S+)", re.M)
+
+
 _COUNTERS = {
-    "queries": re.compile(r"^vllm:prefix_cache_queries_total(?:\{[^}]*\})?\s+(\S+)", re.M),
-    "hits": re.compile(r"^vllm:prefix_cache_hits_total(?:\{[^}]*\})?\s+(\S+)", re.M),
+    "queries": _family("vllm:prefix_cache_queries_total", "sglang:prompt_tokens_total"),
+    "hits": _family("vllm:prefix_cache_hits_total", "sglang:cached_tokens_total"),
 }
 
 

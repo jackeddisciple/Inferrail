@@ -93,9 +93,11 @@ def test_an_engine_that_restarted_is_left_out_of_the_hit_rate():
     assert rate == {"queries": 200.0, "hits": 100.0, "hit_rate": 0.5, "missing": ["b"]}
 
 
-def test_engine_counters_come_from_the_vllm_page():
+def test_engine_counters_come_from_vllm_and_sglang_pages():
     page = (REPO_ROOT / "tests/fixtures/vllm/metrics.txt").read_text()
     assert engine.prefix_counters(page) == {"queries": 9238.0, "hits": 5040.0}
+    sglang = (REPO_ROOT / "tests/fixtures/sglang/metrics.txt").read_text()
+    assert engine.prefix_counters(sglang) == {"queries": 1500.0, "hits": 640.0}
     before = {"a": {"queries": 100.0, "hits": 10.0}, "b": {"queries": 0.0, "hits": 0.0}}
     after = {"a": {"queries": 300.0, "hits": 110.0}, "b": {"queries": 200.0, "hits": 100.0}}
     assert engine.hit_rate(before, after) == {
