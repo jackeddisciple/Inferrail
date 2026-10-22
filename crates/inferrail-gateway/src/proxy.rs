@@ -14,6 +14,7 @@ use tracing::field::Empty;
 use tracing::{Instrument, Span};
 
 use crate::body::{Recording, ResponseBody, UpstreamBody};
+use crate::decision_log::{self, Decision};
 use crate::errors::GatewayError;
 use crate::headers::{self, REPLICA};
 use crate::inspect::{InspectError, inspect};
@@ -202,6 +203,10 @@ async fn attempt(
     }
     let policy = shared.policy(&model)?;
     let tokens = estimate_tokens(body.len());
+    let sampled = shared
+        .decisions
+        .as_ref()
+        .filter(|log| log.sampled(id.as_bytes()));
     let mut tried: Vec<ReplicaId> = Vec::new();
     let mut last: Option<Result<Response<ResponseBody>, GatewayError>> = None;
     for attempt in 0..shared.config.retry.max_attempts {
@@ -242,6 +247,24 @@ async fn attempt(
             replica: lease.replica().id().clone(),
         };
         shared.metrics.decided(&routed, took);
+        if let Some(log) = sampled {
+            log.record(Decision {
+                ts_ms: decision_log::unix_ms(),
+                request_id: id.to_str().unwrap_or_default().to_owned(),
+                model: model.clone(),
+                policy: policy.kind().as_str(),
+                attempt,
+                chosen: routed.replica.clone(),
+                decision_ns: u64::try_from(took.as_nanos()).unwrap_or(u64::MAX),
+                candidates: decision_log::candidates(
+                    &shared.registry.load(),
+                    &model,
+                    now,
+                    &tried,
+                    shared.config.load.max_age,
+                ),
+            });
+        }
         if !route_span.is_disabled() {
             describe(&route_span, shared, &lease, candidates, took);
         }

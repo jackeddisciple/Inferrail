@@ -142,6 +142,7 @@ pub struct Metrics {
     ttft: Histograms<RouteLabels>,
     duration: Histograms<RouteLabels>,
     decision_time: Histograms<PolicyLabels>,
+    decision_log: (Counter, Counter),
     series: Mutex<HashMap<ReplicaId, Vec<Series>>>,
 }
 
@@ -164,6 +165,7 @@ impl Metrics {
             ttft: histograms(|| Histogram::new(TTFT_BUCKETS)),
             duration: histograms(|| Histogram::new(DURATION_BUCKETS)),
             decision_time: histograms(|| Histogram::new(DECISION_BUCKETS)),
+            decision_log: (Counter::default(), Counter::default()),
             series: Mutex::default(),
         };
         let mut registry = MetricRegistry::default();
@@ -217,8 +219,23 @@ impl Metrics {
             "Time to pick a replica and take a lease on it.",
             this.decision_time.clone(),
         );
+        registry.register(
+            "inferrail_decision_log_records",
+            "Routing decisions queued for the decision log.",
+            this.decision_log.0.clone(),
+        );
+        registry.register(
+            "inferrail_decision_log_dropped",
+            "Sampled routing decisions dropped because the log writer fell behind.",
+            this.decision_log.1.clone(),
+        );
         registry.register_collector(Box::new(fleet));
         Self { registry, ..this }
+    }
+
+    /// The counters the decision log updates: records queued, and dropped.
+    pub fn decision_counters(&self) -> (Counter, Counter) {
+        self.decision_log.clone()
     }
 
     fn track(&self, replica: &ReplicaId, series: Series) {

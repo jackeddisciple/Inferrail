@@ -19,6 +19,7 @@ use tokio::task::JoinSet;
 
 mod admin;
 mod body;
+mod decision_log;
 pub mod errors;
 pub mod headers;
 pub mod inspect;
@@ -39,6 +40,11 @@ pub enum BuildError {
     Invalid(ConfigIssues),
     #[error("replica {0} uses https; TLS to engines is not supported yet")]
     Https(String),
+    #[error("cannot open the decision log {path}: {source}")]
+    DecisionLog {
+        path: std::path::PathBuf,
+        source: std::io::Error,
+    },
 }
 
 /// A configured gateway. Cheap to clone; clones share all state.
@@ -61,6 +67,7 @@ pub(crate) struct Shared {
     resolver: Arc<dyn Resolve>,
     ejecting: Mutex<()>,
     metrics: Arc<metrics::Metrics>,
+    decisions: Option<decision_log::DecisionLog>,
 }
 
 impl Shared {
@@ -134,7 +141,22 @@ impl Gateway {
                 .map(|m| (m.name.clone(), config.policy_for(m)))
                 .collect(),
         }));
+        let log = &config.observability.decision_log;
+        let decisions = match &log.path {
+            Some(path) if log.sample_rate > 0.0 => {
+                let (written, dropped) = metrics.decision_counters();
+                Some(
+                    decision_log::DecisionLog::open(path, log.sample_rate, written, dropped)
+                        .map_err(|source| BuildError::DecisionLog {
+                            path: path.clone(),
+                            source,
+                        })?,
+                )
+            }
+            _ => None,
+        };
         let shared = Shared {
+            decisions,
             registry,
             client: upstream::client(&config.upstream),
             ids: request_id::RequestIds::default(),
