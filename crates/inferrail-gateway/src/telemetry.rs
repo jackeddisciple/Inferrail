@@ -2,6 +2,9 @@
 //! output never shows and which only an OTLP exporter switches on, so with
 //! no endpoint configured they cost the hot path nothing.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
 use hyper::header::{HeaderMap, HeaderName, HeaderValue};
 use inferrail_core::config::ObservabilityConfig;
 use opentelemetry::global;
@@ -9,8 +12,9 @@ use opentelemetry::propagation::{Extractor, Injector};
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::Resource;
+use opentelemetry_sdk::error::OTelSdkResult;
 use opentelemetry_sdk::propagation::TraceContextPropagator;
-use opentelemetry_sdk::trace::{Sampler, SdkTracerProvider};
+use opentelemetry_sdk::trace::{Sampler, SdkTracerProvider, SpanData, SpanExporter};
 use tracing::Span;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use tracing_subscriber::filter::{EnvFilter, LevelFilter, Targets};
@@ -63,6 +67,52 @@ where
         .with_filter(Targets::new().with_target(SPAN_TARGET, LevelFilter::TRACE))
 }
 
+/// An exporter that says when trace export starts failing and when it
+/// recovers, once each, instead of dropping spans in silence.
+#[derive(Debug)]
+pub struct Reported<E> {
+    inner: E,
+    failing: AtomicBool,
+}
+
+impl<E> Reported<E> {
+    pub fn new(inner: E) -> Self {
+        Self {
+            inner,
+            failing: AtomicBool::new(false),
+        }
+    }
+}
+
+impl<E: SpanExporter> SpanExporter for Reported<E> {
+    async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
+        let spans = batch.len();
+        let result = self.inner.export(batch).await;
+        match &result {
+            Err(err) if !self.failing.swap(true, Ordering::Relaxed) => {
+                tracing::warn!(error = %err, spans, "cannot export traces; spans are dropped until the collector answers");
+            }
+            Ok(()) if self.failing.swap(false, Ordering::Relaxed) => {
+                tracing::info!("trace export recovered");
+            }
+            _ => {}
+        }
+        result
+    }
+
+    fn shutdown_with_timeout(&self, timeout: Duration) -> OTelSdkResult {
+        self.inner.shutdown_with_timeout(timeout)
+    }
+
+    fn force_flush(&self) -> OTelSdkResult {
+        self.inner.force_flush()
+    }
+
+    fn set_resource(&mut self, resource: &Resource) {
+        self.inner.set_resource(resource);
+    }
+}
+
 /// The URL spans are posted to. A bare collector address gets the standard
 /// `/v1/traces` path, as `OTEL_EXPORTER_OTLP_ENDPOINT` does; a URL with a
 /// path is used as given.
@@ -90,7 +140,7 @@ pub fn init(level: &str, config: &ObservabilityConfig) -> Result<Telemetry, Tele
             global::set_text_map_propagator(TraceContextPropagator::new());
             Some(
                 SdkTracerProvider::builder()
-                    .with_batch_exporter(exporter)
+                    .with_batch_exporter(Reported::new(exporter))
                     .with_sampler(sampler)
                     .with_resource(
                         Resource::builder()
@@ -158,6 +208,56 @@ pub(crate) fn propagate(headers: &mut HeaderMap) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use opentelemetry_sdk::error::OTelSdkError;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Debug, Clone, Default)]
+    struct Flaky(Arc<Mutex<Vec<bool>>>);
+
+    impl SpanExporter for Flaky {
+        async fn export(&self, _batch: Vec<SpanData>) -> OTelSdkResult {
+            match self.0.lock().unwrap().remove(0) {
+                true => Ok(()),
+                false => Err(OTelSdkError::InternalFailure("refused".into())),
+            }
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn export_failures_and_recovery_are_logged_once_each() {
+        let log = Captured::default();
+        let writer = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let script = Flaky::default();
+        *script.0.lock().unwrap() = vec![true, false, false, false, true, true, false];
+        let reported = Reported::new(script);
+        let mut results = Vec::new();
+        for _ in 0..7 {
+            results.push(reported.export(Vec::new()).await.is_ok());
+        }
+        assert_eq!(results, [true, false, false, false, true, true, false]);
+        let text = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(text.matches("cannot export traces").count(), 2, "{text}");
+        assert_eq!(text.matches("trace export recovered").count(), 1, "{text}");
+    }
 
     #[test]
     fn bare_collector_addresses_get_the_traces_path() {
