@@ -17,6 +17,7 @@ use tracing_subscriber::filter::{EnvFilter, LevelFilter, Targets};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{Layer, Registry};
+use url::Url;
 
 /// The target of every span that describes a request's route.
 pub const SPAN_TARGET: &str = "inferrail::span";
@@ -62,6 +63,18 @@ where
         .with_filter(Targets::new().with_target(SPAN_TARGET, LevelFilter::TRACE))
 }
 
+/// The URL spans are posted to. A bare collector address gets the standard
+/// `/v1/traces` path, as `OTEL_EXPORTER_OTLP_ENDPOINT` does; a URL with a
+/// path is used as given.
+pub fn traces_endpoint(endpoint: &Url) -> String {
+    if endpoint.path() == "/" {
+        let mut url = endpoint.clone();
+        url.set_path("/v1/traces");
+        return url.into();
+    }
+    endpoint.as_str().to_owned()
+}
+
 /// Installs logging at `level` and, when an OTLP endpoint is configured, a
 /// batch exporter for routing spans with W3C trace context propagation.
 pub fn init(level: &str, config: &ObservabilityConfig) -> Result<Telemetry, TelemetryError> {
@@ -69,7 +82,7 @@ pub fn init(level: &str, config: &ObservabilityConfig) -> Result<Telemetry, Tele
         Some(endpoint) => {
             let exporter = opentelemetry_otlp::SpanExporter::builder()
                 .with_http()
-                .with_endpoint(endpoint.as_str())
+                .with_endpoint(traces_endpoint(endpoint))
                 .build()?;
             let sampler = Sampler::ParentBased(Box::new(Sampler::TraceIdRatioBased(
                 config.trace_sample_ratio,
@@ -140,4 +153,27 @@ pub(crate) fn propagate(headers: &mut HeaderMap) {
     }
     let context = span.context();
     global::get_text_map_propagator(|p| p.inject_context(&context, &mut HeadersMut(headers)));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bare_collector_addresses_get_the_traces_path() {
+        for (given, used) in [
+            ("http://collector:4318", "http://collector:4318/v1/traces"),
+            ("http://collector:4318/", "http://collector:4318/v1/traces"),
+            (
+                "http://collector:4318/v1/traces",
+                "http://collector:4318/v1/traces",
+            ),
+            (
+                "https://otel.example/custom/path",
+                "https://otel.example/custom/path",
+            ),
+        ] {
+            assert_eq!(traces_endpoint(&given.parse().unwrap()), used, "{given}");
+        }
+    }
 }

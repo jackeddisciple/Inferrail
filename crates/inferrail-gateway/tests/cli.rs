@@ -159,9 +159,10 @@ async fn serves_and_exits_cleanly_on_sigterm() {
     assert!(exit.success(), "{exit:?}");
 }
 
+/// Runs the binary with `endpoint(collector address)` as its OTLP endpoint,
+/// sends one request, stops it and returns what reached `/v1/traces`.
 #[cfg(unix)]
-#[tokio::test]
-async fn exports_spans_over_otlp_when_configured() {
+async fn exported(endpoint: impl Fn(std::net::SocketAddr) -> String) -> Vec<(String, usize)> {
     use std::sync::{Arc, Mutex};
 
     let received: Arc<Mutex<Vec<(String, usize)>>> = Arc::default();
@@ -181,7 +182,7 @@ async fn exports_spans_over_otlp_when_configured() {
         }),
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let otlp = format!("http://{}/v1/traces", listener.local_addr().unwrap());
+    let otlp = endpoint(listener.local_addr().unwrap());
     tokio::spawn(async move { axum::serve(listener, collector).await });
 
     let sim = Upstream::zero(&[MODEL]).await;
@@ -225,23 +226,46 @@ async fn exports_spans_over_otlp_when_configured() {
         .status()
         .unwrap();
     let started = Instant::now();
-    while received.lock().unwrap().is_empty() {
+    let exit = loop {
+        if let Some(exit) = child.try_wait().unwrap() {
+            break exit;
+        }
         assert!(
-            started.elapsed() < Duration::from_secs(10),
-            "no spans exported"
+            started.elapsed() < Duration::from_secs(15),
+            "no exit after SIGTERM"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    let exit = child.wait().unwrap();
+    };
     let _ = std::fs::remove_file(&path);
     assert!(exit.success(), "{exit:?}");
     let batches = received.lock().unwrap().clone();
+    batches
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn exports_spans_over_otlp_when_configured() {
+    let batches = exported(|addr| format!("http://{addr}/v1/traces")).await;
+    assert!(!batches.is_empty(), "no spans exported");
     assert!(
         batches
             .iter()
             .all(|(kind, len)| kind == "application/x-protobuf" && *len > 0),
         "{batches:?}"
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_base_otlp_endpoint_gets_the_traces_path() {
+    for endpoint in [
+        |addr| format!("http://{addr}"),
+        |addr| format!("http://{addr}/"),
+    ] as [fn(std::net::SocketAddr) -> String; 2]
+    {
+        let batches = exported(endpoint).await;
+        assert!(!batches.is_empty(), "no spans reached /v1/traces");
+    }
 }
 
 #[test]
