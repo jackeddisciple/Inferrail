@@ -14,5 +14,11 @@
     rendered by `prometheus_client` 0.26.0 from the metric definitions in
     vLLM's `v1/metrics/loggers.py`. `make_metrics_fixture.py` rebuilds it.
 
+* `sglang/`: what SGLang v0.5.21 serves on `/metrics` for a server with two
+  data parallel ranks and priority scheduling, rendered by `prometheus_client`
+  in multiprocess mode from the definitions in that version's
+  `srt/observability/metrics_collector.py`. `make_metrics_fixture.py`
+  rebuilds it; the `pid` label changes from run to run.
+
 When a real engine run is available, replace the derived vLLM files with
 live recordings from the pinned version and keep the tests unchanged.

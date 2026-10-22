@@ -947,6 +947,11 @@ version = "0.1.3"
 [[package]]
 name = "inferrail-load"
 version = "0.1.3"
+dependencies = [
+ "criterion",
+ "proptest",
+ "thiserror",
+]
 
 [[package]]
 name = "inferrail-policy"
