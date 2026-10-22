@@ -86,6 +86,46 @@ def test_an_engine_that_does_not_answer_is_left_out_not_fatal(tmp_path):
     }
 
 
+def test_the_engine_hit_rate_leaves_out_the_warmup():
+    """The fake engine misses on every request in its first half second and
+    hits on every one after, so only a scrape at the end of the warmup sees
+    the same hit rate as usage."""
+    import asyncio
+    import time
+
+    from fakes import serve
+
+    from inferrail_bench.cli import measure
+
+    state = {"start": None, "queries": 0, "hits": 0}
+    stream = sse(first=0.0, gap=0.0, tokens=1)
+
+    async def chat(writer):
+        now = time.perf_counter()
+        state["start"] = state["start"] or now
+        state["queries"] += 100
+        state["hits"] += 100 if now - state["start"] > 0.5 else 0
+        await stream(writer)
+
+    async def metrics(writer):
+        page = (
+            f"vllm:prefix_cache_queries_total {state['queries']}.0\n"
+            f"vllm:prefix_cache_hits_total {state['hits']}.0\n"
+        ).encode()
+        writer.write(b"HTTP/1.1 200 OK\r\ncontent-length: %d\r\n\r\n" % len(page) + page)
+        await writer.drain()
+
+    async def main():
+        server, url = await serve(chat, paths={"/metrics": metrics})
+        async with server:
+            return await measure(url, "m", "w6", 40, 60, seed=4, warmup=0.55, engines=[url])
+
+    _, summary = asyncio.run(main())
+    rate = summary["engine"]["hit_rate"]
+    assert rate > 0.9, summary["engine"]
+    assert summary["engine"]["queries"] < state["queries"]
+
+
 def test_an_engine_that_restarted_is_left_out_of_the_hit_rate():
     before = {"a": {"queries": 100.0, "hits": 50.0}, "b": {"queries": 900.0, "hits": 800.0}}
     after = {"a": {"queries": 300.0, "hits": 150.0}, "b": {"queries": 40.0, "hits": 10.0}}

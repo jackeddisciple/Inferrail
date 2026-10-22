@@ -7,28 +7,35 @@ from collections.abc import Awaitable, Callable
 Handler = Callable[[asyncio.StreamWriter], Awaitable[None]]
 
 
-async def _read_request(reader: asyncio.StreamReader) -> bytes:
+async def _read_request(reader: asyncio.StreamReader) -> str:
     head = await reader.readuntil(b"\r\n\r\n")
     length = 0
     for line in head.split(b"\r\n"):
         if line.lower().startswith(b"content-length:"):
             length = int(line.split(b":")[1])
-    return await reader.readexactly(length)
+    await reader.readexactly(length)
+    return head.split(b" ")[1].decode()
 
 
-async def serve(handler: Handler, gate: asyncio.Lock | None = None):
+async def serve(
+    handler: Handler, gate: asyncio.Lock | None = None, paths: dict[str, Handler] | None = None
+):
+    """Answers every request with `handler`, or with `paths[path]` when the
+    path is listed."""
+
     async def on_connection(reader, writer):
         try:
             while True:
                 try:
-                    await _read_request(reader)
+                    path = await _read_request(reader)
                 except (asyncio.IncompleteReadError, ConnectionError):
                     return
+                chosen = (paths or {}).get(path, handler)
                 if gate is None:
-                    await handler(writer)
+                    await chosen(writer)
                 else:
                     async with gate:
-                        await handler(writer)
+                        await chosen(writer)
         finally:
             writer.close()
 

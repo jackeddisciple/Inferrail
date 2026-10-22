@@ -52,14 +52,27 @@ async def measure(
     engines: Sequence[str] = (),
     params: dict | None = None,
 ) -> tuple[list, dict]:
-    """One open loop run: the same workload and schedule for the same seed."""
+    """One open loop run: the same workload and schedule for the same seed.
+    The engines' counters are read when the warmup ends and after the run,
+    so the engine hit rate covers the same requests as the summary."""
     requests = generate(workload, count, seed, **(params or {}))
     offsets = schedule.poisson(rate, count, seed)
-    before = await engine.scrape(list(engines)) if engines else None
+    urls = list(engines)
+
+    async def at_warmup() -> dict:
+        await asyncio.sleep(runner.LEAD + warmup)
+        return await engine.scrape(urls)
+
+    before = asyncio.create_task(at_warmup()) if urls else None
     records = await runner.run(base_url, model, requests, offsets)
     summary = summarize(records, warmup=warmup)
     if before is not None:
-        summary["engine"] = engine.hit_rate(before, await engine.scrape(list(engines)))
+        after = await engine.scrape(urls)
+        if before.done():
+            summary["engine"] = engine.hit_rate(before.result(), after)
+        else:
+            before.cancel()
+            summary["engine"] = engine.hit_rate(dict.fromkeys(urls), after)
     return records, summary
 
 
