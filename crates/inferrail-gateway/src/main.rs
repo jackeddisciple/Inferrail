@@ -3,9 +3,8 @@ use std::path::PathBuf;
 use anyhow::Context;
 use clap::Parser;
 use inferrail_core::config::Config;
-use inferrail_gateway::Gateway;
+use inferrail_gateway::{Gateway, telemetry};
 use tokio::net::TcpListener;
-use tracing_subscriber::EnvFilter;
 
 /// KV cache aware router for OpenAI compatible inference engines.
 #[derive(Debug, Parser)]
@@ -54,9 +53,7 @@ async fn main() -> anyhow::Result<()> {
     let config = Config::load(&args.config)
         .with_context(|| format!("cannot load {}", args.config.display()))?;
     let filter = args.log.as_deref().unwrap_or(&config.logging.level);
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_new(filter).context("invalid log filter")?)
-        .init();
+    let _telemetry = telemetry::init(filter, &config.observability)?;
     let addr = config.server.listen;
     let gateway = Gateway::new(config)?;
     if args.check {

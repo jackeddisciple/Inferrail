@@ -28,6 +28,7 @@ mod proxy;
 pub mod request_id;
 mod route;
 mod server;
+pub mod telemetry;
 mod upstream;
 
 pub use body::ResponseBody;

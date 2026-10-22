@@ -7,9 +7,10 @@ use inferrail_policy::{Candidate, RouteContext, RoutingPolicy};
 use crate::errors::GatewayError;
 
 /// Picks a replica for `model` and takes a lease on it for a request of
-/// about `tokens` prompt tokens. Only replicas that serve the model, are
-/// routable and have room are ever offered to the policy; untried ones are
-/// preferred over ones this request already used.
+/// about `tokens` prompt tokens, returning it with the number of replicas
+/// offered to the policy. Only replicas that serve the model, are routable
+/// and have room are ever offered; untried ones are preferred over ones this
+/// request already used.
 pub(crate) fn select(
     registry: &Registry,
     policy: &dyn RoutingPolicy,
@@ -17,7 +18,7 @@ pub(crate) fn select(
     now: Nanos,
     tried: &[ReplicaId],
     tokens: u32,
-) -> Result<Lease, GatewayError> {
+) -> Result<(Lease, usize), GatewayError> {
     let fleet = registry.load();
     let pool = fleet.serving(model);
     let routable = pool.iter().filter(|r| r.is_routable(now));
@@ -25,6 +26,7 @@ pub(crate) fn select(
     if eligible.iter().any(|r| !tried.contains(r.id())) {
         eligible.retain(|r| !tried.contains(r.id()));
     }
+    let offered = eligible.len();
     let mut candidates: Vec<Candidate<'_>> = Vec::with_capacity(eligible.len());
     while !eligible.is_empty() {
         candidates.clear();
@@ -40,7 +42,7 @@ pub(crate) fn select(
             break;
         };
         if let Some(lease) = eligible[i].try_acquire(tokens) {
-            return Ok(lease);
+            return Ok((lease, offered));
         }
         eligible.remove(i);
     }
@@ -155,7 +157,7 @@ mod tests {
                     .any(|r| r.is_routable(now) && r.has_room());
                 for _ in 0..4 {
                     match select(&registry, policy.as_ref(), &model, now, &tried, 0) {
-                        Ok(lease) => {
+                        Ok((lease, _)) => {
                             let replica = lease.replica();
                             prop_assert!(replica.serves(&model));
                             prop_assert!(replica.is_routable(now));
@@ -190,7 +192,9 @@ mod tests {
             .map(|id| ReplicaId::new(id).unwrap())
             .collect();
         for _ in 0..5 {
-            let lease = select(&registry, policy.as_ref(), &model, 1, &tried, 0).unwrap();
+            let (lease, offered) =
+                select(&registry, policy.as_ref(), &model, 1, &tried, 0).unwrap();
+            assert_eq!(offered, 1);
             assert_eq!(lease.replica().id().as_str(), "r1");
         }
         let all: Vec<ReplicaId> = (0..3)

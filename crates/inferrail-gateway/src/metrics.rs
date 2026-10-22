@@ -289,22 +289,17 @@ impl Metrics {
     /// A proxied response ended: completely, broken by the engine, or
     /// abandoned by the client.
     pub fn finished(&self, routed: &Routed, outcome: Outcome, took: Duration) {
-        let status = match outcome {
-            Outcome::Complete(status) => status_class(status),
-            Outcome::Aborted => "aborted",
-            Outcome::Cancelled => {
-                self.disconnects
-                    .get_or_create(&ModelLabels {
-                        model: Text::Model(routed.model.clone()),
-                    })
-                    .inc();
-                "cancelled"
-            }
-        };
+        if let Outcome::Cancelled = outcome {
+            self.disconnects
+                .get_or_create(&ModelLabels {
+                    model: Text::Model(routed.model.clone()),
+                })
+                .inc();
+        }
         self.request(
             Text::Model(routed.model.clone()),
             Some(&routed.replica),
-            status,
+            outcome.as_str(),
         );
         self.observe(&self.duration, routed, took);
     }
@@ -397,6 +392,16 @@ pub enum Outcome {
     Complete(StatusCode),
     Aborted,
     Cancelled,
+}
+
+impl Outcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Complete(status) => status_class(status),
+            Self::Aborted => "aborted",
+            Self::Cancelled => "cancelled",
+        }
+    }
 }
 
 fn status_class(status: StatusCode) -> &'static str {

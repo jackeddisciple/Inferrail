@@ -37,16 +37,19 @@ pub(crate) struct Recording {
     status: StatusCode,
     stream: bool,
     started: bool,
+    span: tracing::Span,
 }
 
 impl Recording {
-    pub(crate) fn new(routed: Routed, arrival: Instant) -> Self {
+    /// `span` is the request's span, which stays open until the body ends.
+    pub(crate) fn new(routed: Routed, arrival: Instant, span: tracing::Span) -> Self {
         Self {
             routed,
             arrival,
             status: StatusCode::OK,
             stream: false,
             started: false,
+            span,
         }
     }
 
@@ -101,9 +104,13 @@ impl UpstreamBody {
 
     fn finish(&mut self, outcome: impl FnOnce(StatusCode) -> Outcome) {
         if let Some(r) = self.recording.take() {
+            let outcome = outcome(r.status);
+            if let Outcome::Aborted | Outcome::Cancelled = outcome {
+                r.span.record("inferrail.outcome", outcome.as_str());
+            }
             self.shared
                 .metrics
-                .finished(&r.routed, outcome(r.status), r.arrival.elapsed());
+                .finished(&r.routed, outcome, r.arrival.elapsed());
         }
     }
 }

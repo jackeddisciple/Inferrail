@@ -154,3 +154,88 @@ async fn serves_and_exits_cleanly_on_sigterm() {
     let _ = std::fs::remove_file(&path);
     assert!(exit.success(), "{exit:?}");
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn exports_spans_over_otlp_when_configured() {
+    use std::sync::{Arc, Mutex};
+
+    let received: Arc<Mutex<Vec<(String, usize)>>> = Arc::default();
+    let sink = Arc::clone(&received);
+    let collector = axum::Router::new().route(
+        "/v1/traces",
+        axum::routing::post(move |headers: hyper::HeaderMap, body: axum::body::Bytes| {
+            let sink = Arc::clone(&sink);
+            async move {
+                let kind = headers
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or_default()
+                    .to_owned();
+                sink.lock().unwrap().push((kind, body.len()));
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let otlp = format!("http://{}/v1/traces", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, collector).await });
+
+    let sim = Upstream::zero(&[MODEL]).await;
+    let free = || {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        probe.local_addr().unwrap().port()
+    };
+    let (port, admin) = (free(), free());
+    let text = format!(
+        "server:\n  listen: 127.0.0.1:{port}\n  admin_listen: 127.0.0.1:{admin}\nmodels:\n  - name: {MODEL}\nreplicas:\n  - id: r0\n    url: {}\n    models: [{MODEL}]\nobservability:\n  otlp_endpoint: {otlp}\n  service_name: gateway-under-test\n",
+        sim.url()
+    );
+    let path = temp_config("otlp", &text);
+    let mut child = Command::new(BIN)
+        .arg("-c")
+        .arg(&path)
+        .env("INFERRAIL_LOG", "warn")
+        .stdout(Stdio::null())
+        .spawn()
+        .expect("spawn");
+    let client = reqwest::Client::new();
+    let base = format!("http://127.0.0.1:{port}");
+    let started = Instant::now();
+    while client.get(format!("{base}/health")).send().await.is_err() {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "gateway never came up"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let reply = client
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&chat("traced", 2))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reply.status(), 200);
+    reply.bytes().await.unwrap();
+    Command::new("kill")
+        .arg(child.id().to_string())
+        .status()
+        .unwrap();
+    let started = Instant::now();
+    while received.lock().unwrap().is_empty() {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "no spans exported"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let exit = child.wait().unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert!(exit.success(), "{exit:?}");
+    let batches = received.lock().unwrap().clone();
+    assert!(
+        batches
+            .iter()
+            .all(|(kind, len)| kind == "application/x-protobuf" && *len > 0),
+        "{batches:?}"
+    );
+}

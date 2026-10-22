@@ -10,6 +10,8 @@ use hyper::{Method, Request, Response, StatusCode};
 use inferrail_control::{Lease, Nanos, Replica};
 use inferrail_core::ids::{ModelId, ReplicaId};
 use tokio::time::{Instant, sleep, timeout, timeout_at};
+use tracing::field::Empty;
+use tracing::{Instrument, Span};
 
 use crate::body::{Recording, ResponseBody, UpstreamBody};
 use crate::errors::GatewayError;
@@ -17,6 +19,7 @@ use crate::headers::{self, REPLICA};
 use crate::inspect::{InspectError, inspect};
 use crate::metrics::Routed;
 use crate::request_id::REQUEST_ID;
+use crate::telemetry::{self, SPAN_TARGET};
 use crate::{Shared, models, route};
 
 pub(crate) async fn handle(
@@ -26,10 +29,30 @@ pub(crate) async fn handle(
     let arrival = std::time::Instant::now();
     let id = shared.ids.resolve(request.headers());
     let version = request.version();
-    let mut response = match dispatch(&shared, request, &id, arrival).await {
+    let span = tracing::info_span!(
+        target: SPAN_TARGET,
+        "request",
+        otel.kind = "server",
+        http.request.method = %request.method(),
+        url.path = %request.uri().path(),
+        http.response.status_code = Empty,
+        gen_ai.request.model = Empty,
+        inferrail.request_id = Empty,
+        inferrail.attempts = Empty,
+        inferrail.outcome = Empty,
+    );
+    telemetry::adopt_parent(&span, request.headers());
+    let mut response = match dispatch(&shared, request, &id, arrival)
+        .instrument(span.clone())
+        .await
+    {
         Ok(response) => response,
         Err(err) => error_response(&err),
     };
+    if !span.is_disabled() {
+        span.record("http.response.status_code", response.status().as_u16());
+        span.record("inferrail.request_id", id.to_str().unwrap_or_default());
+    }
     *response.version_mut() = version;
     response.headers_mut().insert(REQUEST_ID, id);
     Ok(response)
@@ -131,6 +154,7 @@ pub(crate) fn error_response(err: &GatewayError) -> Response<ResponseBody> {
 struct Seen {
     model: Option<ModelId>,
     replica: Option<ReplicaId>,
+    attempts: u32,
 }
 
 async fn proxy(
@@ -141,6 +165,9 @@ async fn proxy(
 ) -> Result<Response<ResponseBody>, GatewayError> {
     let mut seen = Seen::default();
     let result = attempt(shared, request, id, arrival, &mut seen).await;
+    if seen.attempts > 0 {
+        Span::current().record("inferrail.attempts", seen.attempts);
+    }
     match &result {
         Ok(response) => {
             if let (ResponseBody::Full(_), Some(model)) = (response.body(), &seen.model) {
@@ -168,6 +195,7 @@ async fn attempt(
         .await
         .map_err(|_| GatewayError::slow_body())??;
     let (model, body) = resolve_model(shared, body)?;
+    Span::current().record("gen_ai.request.model", model.as_str());
     seen.model = Some(model.clone());
     if shared.config.logging.log_prompts {
         tracing::debug!(request_id = ?id, body = %String::from_utf8_lossy(&body), "request body");
@@ -184,10 +212,28 @@ async fn attempt(
             }
             sleep(pause).await;
         }
+        seen.attempts = attempt + 1;
+        let route_span = tracing::info_span!(
+            target: SPAN_TARGET,
+            "route",
+            inferrail.policy = policy.kind().as_str(),
+            inferrail.attempt = attempt,
+            inferrail.candidates = Empty,
+            inferrail.replica = Empty,
+            inferrail.replica.in_flight = Empty,
+            inferrail.engine.running = Empty,
+            inferrail.engine.waiting = Empty,
+            inferrail.engine.kv_usage = Empty,
+            inferrail.load.age_ms = Empty,
+            inferrail.decision_ns = Empty,
+        );
         let now = shared.clock.now();
         let started = std::time::Instant::now();
-        let lease = match route::select(&shared.registry, policy, &model, now, &tried, tokens) {
-            Ok(lease) => lease,
+        let selected = route_span
+            .in_scope(|| route::select(&shared.registry, policy, &model, now, &tried, tokens));
+        let took = started.elapsed();
+        let (lease, candidates) = match selected {
+            Ok(selected) => selected,
             Err(err) => return last.unwrap_or(Err(err)),
         };
         let routed = Routed {
@@ -195,14 +241,30 @@ async fn attempt(
             policy: policy.kind(),
             replica: lease.replica().id().clone(),
         };
-        shared.metrics.decided(&routed, started.elapsed());
+        shared.metrics.decided(&routed, took);
+        if !route_span.is_disabled() {
+            describe(&route_span, shared, &lease, candidates, took);
+        }
+        drop(route_span);
         if attempt > 0 {
             shared.metrics.retried(&model);
         }
         tried.push(routed.replica.clone());
         seen.replica = Some(routed.replica.clone());
-        let recording = Recording::new(routed, arrival);
-        match forward(shared, lease, recording, &parts, body.clone(), id, deadline).await {
+        let upstream_span = tracing::info_span!(
+            target: SPAN_TARGET,
+            "upstream",
+            otel.kind = "client",
+            server.address = lease.replica().endpoint().origin(),
+            inferrail.replica = routed.replica.as_str(),
+            http.response.status_code = Empty,
+            error.type = Empty,
+        );
+        let recording = Recording::new(routed, arrival, Span::current());
+        let forwarded = forward(shared, lease, recording, &parts, body.clone(), id, deadline)
+            .instrument(upstream_span)
+            .await;
+        match forwarded {
             Attempt::Done(response) => return Ok(response),
             Attempt::Fatal(err) => return Err(err),
             Attempt::Retry(failure) => {
@@ -216,6 +278,25 @@ async fn attempt(
             "no response before the request timeout",
         ))
     })
+}
+
+/// Puts the decision on its span: how many replicas were offered, which one
+/// won, and its load at that moment.
+fn describe(span: &Span, shared: &Shared, lease: &Lease, candidates: usize, took: Duration) {
+    let replica = lease.replica();
+    let load = replica.load(Instant::now(), shared.config.load.max_age);
+    span.record("inferrail.candidates", candidates);
+    span.record("inferrail.replica", replica.id().as_str());
+    span.record("inferrail.replica.in_flight", load.in_flight);
+    span.record("inferrail.decision_ns", took.as_nanos() as u64);
+    if let Some(engine) = load.engine {
+        span.record("inferrail.engine.running", engine.running);
+        span.record("inferrail.engine.waiting", engine.waiting);
+        span.record("inferrail.engine.kv_usage", engine.kv_usage);
+    }
+    if let Some(age) = load.age {
+        span.record("inferrail.load.age_ms", age.as_secs_f64() * 1e3);
+    }
 }
 
 /// Prompt tokens a body of `len` bytes holds, at about four bytes a token,
@@ -330,6 +411,7 @@ fn upstream_request(
     headers.clone_from(&parts.headers);
     headers::for_upstream(headers);
     headers.insert(REQUEST_ID, id.clone());
+    telemetry::propagate(headers);
     Ok(request)
 }
 
@@ -377,6 +459,7 @@ async fn forward(
         }
     };
     let Some(answer) = waiting.await else {
+        Span::current().record("error.type", "replica_down");
         tracing::debug!(replica = %replica.id(), "replica failed its health checks while the request waited");
         return Attempt::Retry(Err(GatewayError::bad_gateway(format!(
             "replica {} failed its health checks before responding",
@@ -386,6 +469,7 @@ async fn forward(
     let response = match answer {
         Ok(Ok(response)) => response,
         Ok(Err(err)) => {
+            Span::current().record("error.type", "connection");
             record_failure(shared, &replica);
             tracing::debug!(replica = %replica.id(), error = %err, "upstream request failed");
             return Attempt::Retry(Err(GatewayError::bad_gateway(format!(
@@ -394,6 +478,7 @@ async fn forward(
             ))));
         }
         Err(_) => {
+            Span::current().record("error.type", "timeout");
             record_failure(shared, &replica);
             return Attempt::Fatal(GatewayError::timeout(
                 "no response before the request timeout",
@@ -402,6 +487,7 @@ async fn forward(
     };
     lease.responded();
     let status = response.status();
+    Span::current().record("http.response.status_code", status.as_u16());
     if status.is_server_error() {
         record_failure(shared, &replica);
     } else {
