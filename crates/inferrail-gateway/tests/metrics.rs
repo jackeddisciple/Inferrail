@@ -197,3 +197,105 @@ async fn replica_gauges_show_gateway_and_engine_load() {
     })
     .await;
 }
+
+/// Under a random mix of full and streamed answers, clients leaving early,
+/// engine 400s, unknown models and a replica that always answers 503, every
+/// request lands in exactly one outcome and every gauge returns to zero.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_outcome_is_counted_exactly_once() {
+    for seed in 1..=3u64 {
+        let latency = LatencyModel {
+            decode_token_secs: 0.003,
+            ..LatencyModel::ZERO
+        };
+        let sims = [
+            Upstream::spawn(sim_config(&[MODEL], latency)).await,
+            Upstream::spawn(sim_config(&[MODEL], latency)).await,
+            Upstream::spawn(sim_config(&[MODEL], latency)).await,
+        ];
+        sims[2].set_request_fault(Fault::Status(503));
+        let gw = TestGateway::start(fleet(
+            &urls(&[&sims[0], &sims[1], &sims[2]]),
+            &format!("{FAST_HEALTH}  max_ejection_percent: 0\n"),
+        ))
+        .await;
+        let mut state = seed;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut tasks = Vec::new();
+        for i in 0..90 {
+            let kind = next() % 5;
+            let (client, url) = (gw.client.clone(), gw.url("/v1/chat/completions"));
+            tasks.push(tokio::spawn(async move {
+                let body = match kind {
+                    0 => chat(&format!("full {i}"), 3),
+                    1 => streaming(chat(&format!("stream {i}"), 3)),
+                    2 => streaming(chat(&format!("leave {i}"), 400)),
+                    3 => json!({"model": MODEL, "messages": [], "max_tokens": 1, "n": 2}),
+                    _ => json!({"model": "ghost", "messages": []}),
+                };
+                let response = client.post(url).json(&body).send().await.expect("sent");
+                let status = response.status().as_u16();
+                if kind == 2 {
+                    let mut bytes = response.bytes_stream();
+                    bytes.next().await.expect("first chunk").expect("chunk");
+                } else {
+                    response.bytes().await.expect("body");
+                }
+                (kind, status)
+            }));
+        }
+        let mut count = [0u32; 5];
+        for task in tasks {
+            let (kind, status) = task.await.unwrap();
+            let want = match kind {
+                0..=2 => 200,
+                3 => 400,
+                _ => 404,
+            };
+            assert_eq!(status, want, "kind {kind}");
+            count[kind as usize] += 1;
+        }
+        gw.wait_idle().await;
+        let [full, stream, leave, bad, ghost] = count.map(f64::from);
+        let page = gw.gateway.render_metrics();
+        let requests = |status| sum(&page, "inferrail_requests_total", &[("status", status)]);
+        assert_eq!(requests("2xx"), full + stream, "seed {seed}");
+        assert_eq!(requests("cancelled"), leave, "seed {seed}");
+        assert_eq!(requests("4xx"), bad + ghost, "seed {seed}");
+        assert_eq!(requests("5xx") + requests("aborted"), 0.0, "seed {seed}");
+        assert_eq!(
+            sum(&page, "inferrail_ttft_seconds_count", &[]),
+            stream + leave
+        );
+        assert_eq!(
+            sum(&page, "inferrail_request_duration_seconds_count", &[]),
+            full + stream + leave + bad
+        );
+        assert_eq!(sum(&page, "inferrail_client_disconnects_total", &[]), leave);
+        assert_eq!(
+            sum(&page, "inferrail_routing_decisions_total", &[]),
+            full + stream + leave + bad + sum(&page, "inferrail_upstream_retries_total", &[])
+        );
+        assert_eq!(
+            sum(
+                &page,
+                "inferrail_request_errors_total",
+                &[("reason", "NotFoundError")]
+            ),
+            ghost
+        );
+        for gauge in [
+            "inferrail_replica_in_flight",
+            "inferrail_replica_pending",
+            "inferrail_replica_in_flight_tokens",
+            "inferrail_replica_prefill_tokens",
+        ] {
+            assert_eq!(sum(&page, gauge, &[]), 0.0, "{gauge}");
+        }
+    }
+}
