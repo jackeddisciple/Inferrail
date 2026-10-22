@@ -138,6 +138,7 @@ async fn proxy(
         tracing::debug!(request_id = ?id, body = %String::from_utf8_lossy(&body), "request body");
     }
     let policy = shared.policy(&model)?;
+    let tokens = estimate_tokens(body.len());
     let mut tried: Vec<ReplicaId> = Vec::new();
     let mut last: Option<Result<Response<ResponseBody>, GatewayError>> = None;
     for attempt in 0..shared.config.retry.max_attempts {
@@ -149,7 +150,7 @@ async fn proxy(
             sleep(pause).await;
         }
         let now = shared.clock.now();
-        let lease = match route::select(&shared.registry, policy, &model, now, &tried) {
+        let lease = match route::select(&shared.registry, policy, &model, now, &tried, tokens) {
             Ok(lease) => lease,
             Err(err) => return last.unwrap_or(Err(err)),
         };
@@ -168,6 +169,12 @@ async fn proxy(
             "no response before the request timeout",
         ))
     })
+}
+
+/// Prompt tokens a body of `len` bytes holds, at about four bytes a token,
+/// until requests are tokenized at the edge.
+fn estimate_tokens(len: usize) -> u32 {
+    u32::try_from(len.div_ceil(4)).unwrap_or(u32::MAX)
 }
 
 fn backoff(base: Duration, attempt: u32) -> Duration {

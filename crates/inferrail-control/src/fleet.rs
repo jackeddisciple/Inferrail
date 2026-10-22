@@ -181,7 +181,7 @@ mod tests {
             ["s", "pool-10.0.0.1-8000", "pool-10.0.0.2-8000"]
         );
         let survivor = Arc::clone(registry.load().get("pool-10.0.0.2-8000").unwrap());
-        let _lease = survivor.try_acquire().unwrap();
+        let _lease = survivor.try_acquire(0).unwrap();
 
         let change = registry.set_group(&group, vec![member("pool", 2), member("pool", 3)]);
         assert_eq!(

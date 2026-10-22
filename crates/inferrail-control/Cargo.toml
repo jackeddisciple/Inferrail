@@ -11,6 +11,7 @@ publish.workspace = true
 [dependencies]
 arc-swap.workspace = true
 inferrail-core.workspace = true
+inferrail-load.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 url.workspace = true

@@ -6,15 +6,17 @@ use inferrail_policy::{Candidate, RouteContext, RoutingPolicy};
 
 use crate::errors::GatewayError;
 
-/// Picks a replica for `model` and takes a lease on it. Only replicas that
-/// serve the model, are routable and have room are ever offered to the
-/// policy; untried ones are preferred over ones this request already used.
+/// Picks a replica for `model` and takes a lease on it for a request of
+/// about `tokens` prompt tokens. Only replicas that serve the model, are
+/// routable and have room are ever offered to the policy; untried ones are
+/// preferred over ones this request already used.
 pub(crate) fn select(
     registry: &Registry,
     policy: &dyn RoutingPolicy,
     model: &ModelId,
     now: Nanos,
     tried: &[ReplicaId],
+    tokens: u32,
 ) -> Result<Lease, GatewayError> {
     let fleet = registry.load();
     let pool = fleet.serving(model);
@@ -37,7 +39,7 @@ pub(crate) fn select(
         let Some(i) = policy.choose(&ctx).filter(|&i| i < eligible.len()) else {
             break;
         };
-        if let Some(lease) = eligible[i].try_acquire() {
+        if let Some(lease) = eligible[i].try_acquire(tokens) {
             return Ok(lease);
         }
         eligible.remove(i);
@@ -126,7 +128,7 @@ mod tests {
                 replica.health().record_failure(10, &policy());
                 replica.health().eject(10, &policy());
             }
-            held.extend((0..m.held).filter_map(|_| replica.try_acquire()));
+            held.extend((0..m.held).filter_map(|_| replica.try_acquire(0)));
         }
         (registry, held)
     }
@@ -152,7 +154,7 @@ mod tests {
                     .iter()
                     .any(|r| r.is_routable(now) && r.has_room());
                 for _ in 0..4 {
-                    match select(&registry, policy.as_ref(), &model, now, &tried) {
+                    match select(&registry, policy.as_ref(), &model, now, &tried, 0) {
                         Ok(lease) => {
                             let replica = lease.replica();
                             prop_assert!(replica.serves(&model));
@@ -188,13 +190,13 @@ mod tests {
             .map(|id| ReplicaId::new(id).unwrap())
             .collect();
         for _ in 0..5 {
-            let lease = select(&registry, policy.as_ref(), &model, 1, &tried).unwrap();
+            let lease = select(&registry, policy.as_ref(), &model, 1, &tried, 0).unwrap();
             assert_eq!(lease.replica().id().as_str(), "r1");
         }
         let all: Vec<ReplicaId> = (0..3)
             .map(|i| ReplicaId::new(format!("r{i}")).unwrap())
             .collect();
-        assert!(select(&registry, policy.as_ref(), &model, 1, &all).is_ok());
+        assert!(select(&registry, policy.as_ref(), &model, 1, &all, 0).is_ok());
     }
 
     #[test]
@@ -209,12 +211,12 @@ mod tests {
         let (registry, _held) = build(&members);
         let policy = inferrail_policy::build(PolicyKind::P2c, 0);
         let model = ModelId::new("a").unwrap();
-        let err = select(&registry, policy.as_ref(), &model, 1, &[]).unwrap_err();
+        let err = select(&registry, policy.as_ref(), &model, 1, &[], 0).unwrap_err();
         assert!(err.message().contains("at capacity"), "{}", err.message());
 
         members[0].probe_down = true;
         let (registry, _held) = build(&members);
-        let err = select(&registry, policy.as_ref(), &model, 1, &[]).unwrap_err();
+        let err = select(&registry, policy.as_ref(), &model, 1, &[], 0).unwrap_err();
         assert!(
             err.message().contains("no healthy replica"),
             "{}",
@@ -223,6 +225,6 @@ mod tests {
         assert!(err.retry_after().is_some());
 
         let other = ModelId::new("b").unwrap();
-        assert!(select(&registry, policy.as_ref(), &other, 1, &[]).is_err());
+        assert!(select(&registry, policy.as_ref(), &other, 1, &[], 0).is_err());
     }
 }

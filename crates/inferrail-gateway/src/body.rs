@@ -63,7 +63,13 @@ impl Body for ResponseBody {
                             crate::proxy::record_failure(&body.shared, lease.replica());
                         }
                     }
-                    Some(Ok(_)) => {}
+                    Some(Ok(frame)) => {
+                        if frame.is_data()
+                            && let Some(lease) = body.lease.as_mut()
+                        {
+                            lease.first_byte();
+                        }
+                    }
                 }
                 Poll::Ready(frame)
             }

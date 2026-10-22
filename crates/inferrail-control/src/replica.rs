@@ -1,10 +1,12 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::time::Duration;
 
 use arc_swap::ArcSwapOption;
 use inferrail_core::config::{Config, ReplicaConfig};
 use inferrail_core::ids::{ModelId, ReplicaId};
 use inferrail_core::openai::ModelCard;
+use inferrail_load::{LoadCell, ReplicaLoad};
 use tokio::time::Instant;
 use url::Url;
 
@@ -103,8 +105,11 @@ pub struct Replica {
     in_flight: AtomicU32,
     pending: AtomicU32,
     peak_in_flight: AtomicU32,
+    in_flight_tokens: AtomicU64,
+    prefill_tokens: AtomicU64,
     health: Health,
     cards: ArcSwapOption<Cards>,
+    engine_load: LoadCell,
 }
 
 /// The engine's own `/v1/models` answer, as last fetched.
@@ -122,8 +127,30 @@ impl Replica {
             in_flight: AtomicU32::new(0),
             pending: AtomicU32::new(0),
             peak_in_flight: AtomicU32::new(0),
+            in_flight_tokens: AtomicU64::new(0),
+            prefill_tokens: AtomicU64::new(0),
             health: Health::default(),
             cards: ArcSwapOption::empty(),
+            engine_load: LoadCell::default(),
+        }
+    }
+
+    /// The engine's own load reports, as published by the collector.
+    pub fn engine_load(&self) -> &LoadCell {
+        &self.engine_load
+    }
+
+    /// The gateway's counters merged with the engine's latest report, which
+    /// only counts while it is at most `max_age` old.
+    pub fn load(&self, now: Instant, max_age: Duration) -> ReplicaLoad {
+        let latest = self.engine_load.latest();
+        ReplicaLoad {
+            in_flight: self.in_flight(),
+            pending: self.pending(),
+            in_flight_tokens: self.in_flight_tokens(),
+            prefill_tokens: self.prefill_tokens(),
+            engine: latest.filter(|s| s.age(now) <= max_age).map(|s| s.load),
+            age: latest.map(|s| s.age(now)),
         }
     }
 
@@ -178,6 +205,14 @@ impl Replica {
         self.pending.load(Ordering::Relaxed)
     }
 
+    pub fn in_flight_tokens(&self) -> u64 {
+        self.in_flight_tokens.load(Ordering::Relaxed)
+    }
+
+    pub fn prefill_tokens(&self) -> u64 {
+        self.prefill_tokens.load(Ordering::Relaxed)
+    }
+
     /// The most requests ever in flight at once, as seen by the lease that
     /// reached it.
     pub fn peak_in_flight(&self) -> u32 {
@@ -193,9 +228,10 @@ impl Replica {
             && max_pending.is_none_or(|cap| self.pending() < cap)
     }
 
-    /// Reserves an in flight slot and a pending slot, or nothing when either
-    /// cap is reached. The caps can never be exceeded, even under races.
-    pub fn try_acquire(self: &Arc<Self>) -> Option<Lease> {
+    /// Reserves an in flight slot and a pending slot for a request of about
+    /// `tokens` prompt tokens, or nothing when either cap is reached. The caps
+    /// can never be exceeded, even under races.
+    pub fn try_acquire(self: &Arc<Self>, tokens: u32) -> Option<Lease> {
         let limits = self.spec.limits;
         let in_flight = increment_below(&self.in_flight, limits.max_concurrency)?;
         if increment_below(&self.pending, limits.max_pending).is_none() {
@@ -203,9 +239,14 @@ impl Replica {
             return None;
         }
         self.peak_in_flight.fetch_max(in_flight, Ordering::Relaxed);
+        let tokens = u64::from(tokens);
+        self.in_flight_tokens.fetch_add(tokens, Ordering::Relaxed);
+        self.prefill_tokens.fetch_add(tokens, Ordering::Relaxed);
         Some(Lease {
             replica: Arc::clone(self),
             pending: true,
+            prefilling: true,
+            tokens,
         })
     }
 }
@@ -224,11 +265,13 @@ fn increment_below(counter: &AtomicU32, cap: Option<u32>) -> Option<u32> {
 }
 
 /// A request's claim on a replica: in flight until dropped, pending until
-/// the upstream response head arrives.
+/// the upstream response head arrives, prefilling until its first body byte.
 #[derive(Debug)]
 pub struct Lease {
     replica: Arc<Replica>,
     pending: bool,
+    prefilling: bool,
+    tokens: u64,
 }
 
 impl Lease {
@@ -241,11 +284,27 @@ impl Lease {
             self.replica.pending.fetch_sub(1, Ordering::Relaxed);
         }
     }
+
+    pub fn first_byte(&mut self) {
+        if std::mem::take(&mut self.prefilling) {
+            self.replica
+                .prefill_tokens
+                .fetch_sub(self.tokens, Ordering::Relaxed);
+        }
+    }
+
+    pub fn tokens(&self) -> u64 {
+        self.tokens
+    }
 }
 
 impl Drop for Lease {
     fn drop(&mut self) {
         self.responded();
+        self.first_byte();
+        self.replica
+            .in_flight_tokens
+            .fetch_sub(self.tokens, Ordering::Relaxed);
         self.replica.in_flight.fetch_sub(1, Ordering::Relaxed);
     }
 }
@@ -253,6 +312,8 @@ impl Drop for Lease {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use inferrail_load::{Engine, EngineLoad};
+    use proptest::prelude::*;
 
     pub(crate) fn spec(id: &str, url: &str, models: &[&str]) -> ReplicaSpec {
         ReplicaSpec {
@@ -304,8 +365,8 @@ pub(crate) mod tests {
     #[test]
     fn leases_balance_both_counters() {
         let replica = capped(None, None);
-        let mut a = replica.try_acquire().unwrap();
-        let b = replica.try_acquire().unwrap();
+        let mut a = replica.try_acquire(0).unwrap();
+        let b = replica.try_acquire(0).unwrap();
         assert_eq!((replica.in_flight(), replica.pending()), (2, 2));
         a.responded();
         a.responded();
@@ -320,23 +381,23 @@ pub(crate) mod tests {
     #[test]
     fn concurrency_cap_refuses_and_reports_no_room() {
         let replica = capped(Some(2), None);
-        let first = replica.try_acquire().unwrap();
-        let _second = replica.try_acquire().unwrap();
+        let first = replica.try_acquire(0).unwrap();
+        let _second = replica.try_acquire(0).unwrap();
         assert!(!replica.has_room());
-        assert!(replica.try_acquire().is_none());
+        assert!(replica.try_acquire(0).is_none());
         drop(first);
         assert!(replica.has_room());
-        assert!(replica.try_acquire().is_some());
+        assert!(replica.try_acquire(0).is_some());
     }
 
     #[test]
     fn pending_cap_rolls_back_the_in_flight_slot() {
         let replica = capped(Some(10), Some(1));
-        let mut first = replica.try_acquire().unwrap();
-        assert!(replica.try_acquire().is_none());
+        let mut first = replica.try_acquire(0).unwrap();
+        assert!(replica.try_acquire(0).is_none());
         assert_eq!(replica.in_flight(), 1);
         first.responded();
-        let _second = replica.try_acquire().unwrap();
+        let _second = replica.try_acquire(0).unwrap();
         assert_eq!((replica.in_flight(), replica.pending()), (2, 1));
     }
 
@@ -352,8 +413,11 @@ pub(crate) mod tests {
                 std::thread::spawn(move || {
                     let mut granted = 0u32;
                     for i in 0..20_000u32 {
-                        if let Some(mut lease) = replica.try_acquire() {
+                        if let Some(mut lease) = replica.try_acquire(i % 7) {
                             granted += 1;
+                            if (i + t) % 2 == 0 {
+                                lease.first_byte();
+                            }
                             hi.fetch_max(replica.in_flight(), Ordering::Relaxed);
                             hp.fetch_max(replica.pending(), Ordering::Relaxed);
                             if (i + t) % 3 == 0 {
@@ -372,6 +436,137 @@ pub(crate) mod tests {
         assert!((1..=4).contains(&replica.peak_in_flight()));
         assert!(high_pending.load(Ordering::Relaxed) <= 3);
         assert_eq!((replica.in_flight(), replica.pending()), (0, 0));
+        assert_eq!(
+            (replica.in_flight_tokens(), replica.prefill_tokens()),
+            (0, 0)
+        );
+    }
+
+    #[derive(Debug, Clone)]
+    enum Op {
+        Acquire(u32),
+        Responded(usize),
+        FirstByte(usize),
+        Drop(usize),
+    }
+
+    fn op() -> impl Strategy<Value = Op> {
+        prop_oneof![
+            (0u32..5000).prop_map(Op::Acquire),
+            any::<usize>().prop_map(Op::Responded),
+            any::<usize>().prop_map(Op::FirstByte),
+            any::<usize>().prop_map(Op::Drop),
+        ]
+    }
+
+    #[derive(Debug, Default)]
+    struct Reference {
+        leases: Vec<(u64, bool, bool)>,
+    }
+
+    impl Reference {
+        fn counters(&self) -> (u32, u32, u64, u64) {
+            let in_flight = self.leases.len() as u32;
+            let pending = self.leases.iter().filter(|l| l.1).count() as u32;
+            let tokens = self.leases.iter().map(|l| l.0).sum();
+            let prefill = self.leases.iter().filter(|l| l.2).map(|l| l.0).sum();
+            (in_flight, pending, tokens, prefill)
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn counters_match_a_reference_under_any_lease_sequence(
+            ops in prop::collection::vec(op(), 0..80),
+            cap in prop::option::of(1u32..6),
+        ) {
+            let replica = capped(cap, None);
+            let mut leases: Vec<Lease> = Vec::new();
+            let mut model = Reference::default();
+            for op in ops {
+                match op {
+                    Op::Acquire(tokens) => match replica.try_acquire(tokens) {
+                        Some(lease) => {
+                            leases.push(lease);
+                            model.leases.push((u64::from(tokens), true, true));
+                        }
+                        None => prop_assert_eq!(Some(model.leases.len() as u32), cap),
+                    },
+                    Op::Responded(i) if !leases.is_empty() => {
+                        let i = i % leases.len();
+                        leases[i].responded();
+                        model.leases[i].1 = false;
+                    }
+                    Op::FirstByte(i) if !leases.is_empty() => {
+                        let i = i % leases.len();
+                        leases[i].first_byte();
+                        model.leases[i].2 = false;
+                    }
+                    Op::Drop(i) if !leases.is_empty() => {
+                        let i = i % leases.len();
+                        drop(leases.swap_remove(i));
+                        model.leases.swap_remove(i);
+                    }
+                    _ => {}
+                }
+                prop_assert_eq!(
+                    (replica.in_flight(), replica.pending(), replica.in_flight_tokens(), replica.prefill_tokens()),
+                    model.counters()
+                );
+            }
+            drop(leases);
+            prop_assert_eq!(
+                (replica.in_flight(), replica.pending(), replica.in_flight_tokens(), replica.prefill_tokens()),
+                (0, 0, 0, 0)
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn load_merges_counters_with_a_fresh_engine_report() {
+        let replica = capped(None, None);
+        let max_age = Duration::from_millis(250);
+        let mut lease = replica.try_acquire(120).unwrap();
+        lease.responded();
+        let _other = replica.try_acquire(30).unwrap();
+        let load = replica.load(Instant::now(), max_age);
+        assert_eq!(
+            (
+                load.in_flight,
+                load.pending,
+                load.in_flight_tokens,
+                load.prefill_tokens
+            ),
+            (2, 1, 150, 150)
+        );
+        assert!(load.is_stale());
+        assert_eq!(load.age, None);
+
+        lease.first_byte();
+        replica.engine_load().publish(
+            EngineLoad {
+                engine: Engine::Vllm,
+                running: 7,
+                waiting: 2,
+                kv_usage: 0.4,
+                prefix_queries: 10,
+                prefix_hits: 5,
+                preemptions: 0,
+                kv_capacity_tokens: Some(1000),
+            },
+            Instant::now(),
+        );
+        tokio::time::advance(Duration::from_millis(100)).await;
+        let load = replica.load(Instant::now(), max_age);
+        assert_eq!(load.prefill_tokens, 30);
+        assert_eq!(load.engine.map(|e| (e.running, e.waiting)), Some((7, 2)));
+        assert_eq!(load.age, Some(Duration::from_millis(100)));
+
+        tokio::time::advance(Duration::from_millis(200)).await;
+        let load = replica.load(Instant::now(), max_age);
+        assert!(load.is_stale());
+        assert_eq!(load.age, Some(Duration::from_millis(300)));
+        assert_eq!(load.in_flight, 2);
     }
 
     #[test]

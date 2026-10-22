@@ -87,7 +87,7 @@ async fn members_join_and_leave_while_survivors_keep_their_state() {
     assert_eq!(served_by(&gw, 6).await, first);
 
     let survivor = gw.replica(&member(&sims[1]));
-    let held = survivor.try_acquire().unwrap();
+    let held = survivor.try_acquire(0).unwrap();
     dns.answer(&[&sims[1], &sims[2]]);
     let registry = gw.gateway.registry();
     let joined = wait_until(Duration::from_secs(2), || {
