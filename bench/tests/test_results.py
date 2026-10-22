@@ -60,12 +60,43 @@ def test_warmup_leaves_out_the_first_seconds():
     assert warm["ttft_s"]["max"] == pytest.approx(0.1)
 
 
+def test_an_engine_that_does_not_answer_is_left_out_not_fatal(tmp_path):
+    import asyncio
+
+    from fakes import serve
+
+    from inferrail_bench.cli import measure
+
+    async def main():
+        server, url = await serve(sse(first=0.01, gap=0.0, tokens=2))
+        async with server:
+            return await measure(url, "m", "w6", 200, 5, seed=0, engines=["http://127.0.0.1:9"])
+
+    records, summary = asyncio.run(main())
+    assert all(r.ok for r in records)
+    assert summary["engine"]["missing"] == ["http://127.0.0.1:9"]
+    assert summary["engine"]["queries"] == 0
+    before = {"a": {"queries": 1.0, "hits": 1.0}, "b": None}
+    after = {"a": {"queries": 5.0, "hits": 3.0}, "b": {"queries": 9.0, "hits": 9.0}}
+    assert engine.hit_rate(before, after) == {
+        "queries": 4.0,
+        "hits": 2.0,
+        "hit_rate": 0.5,
+        "missing": ["b"],
+    }
+
+
 def test_engine_counters_come_from_the_vllm_page():
     page = (REPO_ROOT / "tests/fixtures/vllm/metrics.txt").read_text()
     assert engine.prefix_counters(page) == {"queries": 9238.0, "hits": 5040.0}
     before = {"a": {"queries": 100.0, "hits": 10.0}, "b": {"queries": 0.0, "hits": 0.0}}
     after = {"a": {"queries": 300.0, "hits": 110.0}, "b": {"queries": 200.0, "hits": 100.0}}
-    assert engine.hit_rate(before, after) == {"queries": 400.0, "hits": 200.0, "hit_rate": 0.5}
+    assert engine.hit_rate(before, after) == {
+        "queries": 400.0,
+        "hits": 200.0,
+        "hit_rate": 0.5,
+        "missing": [],
+    }
 
 
 def test_documents_round_trip_with_environment(tmp_path):
