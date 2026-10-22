@@ -3,6 +3,110 @@
 Notable changes to Inferrail. Versions follow
 [Semantic Versioning](https://semver.org).
 
+## [0.1.4] Load Signals, Observability and the Benchmark Harness (22 October 2026)
+
+The router can now see how busy every engine is, shows what it is doing on
+a dashboard and in traces, and comes with a harness that compares policies
+on the simulator.
+
+### Added
+
+#### `inferrail-load`
+
+* Parsers for the `/metrics` pages of vLLM v0.31.0 and SGLang v0.5.21:
+  running and waiting requests, KV cache usage, prefix cache counters,
+  preemptions and KV capacity, summed over data parallel ranks. The engine
+  is recognized by its metric prefix, and a page missing a required family
+  is an error rather than an idle engine. A full vLLM page parses in about
+  23 µs.
+* A collector that scrapes every replica in parallel every
+  `load.scrape_interval` (100 ms), each scrape bounded by a timeout and a
+  4 MiB page limit.
+* Load snapshots published per replica through `arc-swap`. A report older
+  than `load.max_age` (250 ms) is treated as missing, so routing falls back
+  to the gateway's own counts instead of trusting stale data.
+
+#### `inferrail-gateway`
+
+* Prometheus metrics in OpenMetrics format on `server.admin_listen` at
+  `/metrics`, which is now bound: requests by model, replica and outcome,
+  TTFT and duration histograms by model, policy and replica, routing
+  decisions and decision time, retries, client disconnects, ejections,
+  scrape results, and per replica gauges for health, in flight requests and
+  prompt tokens, and the engine's own running, waiting, KV usage, prefix
+  cache counters and report age. Series of replicas that leave the fleet
+  are removed.
+* OpenTelemetry tracing over OTLP HTTP when `observability.otlp_endpoint` is
+  set: a server span per request, and per attempt a `route` span with the
+  policy, candidates, winner, its load and the decision time, and an
+  `upstream` client span. The client's W3C trace context is continued and
+  passed on to the engine. Without an endpoint the spans cost nothing and
+  trace headers pass through untouched.
+* A sampled decision log: JSON lines with the policy, attempt, winner and
+  every candidate's load, sampled by request id and written by a separate
+  thread through a bounded channel, never holding up a request and never
+  containing prompt text.
+* Per replica counts of estimated prompt tokens in flight and still waiting
+  for their first response byte.
+
+#### Configuration
+
+* `load` section: `enabled`, `scrape_interval`, `scrape_timeout` and
+  `max_age`, validated so one slow scrape cannot make a replica look stale.
+* `observability` section: `otlp_endpoint`, `service_name`,
+  `trace_sample_ratio` and `decision_log` with `path` and `sample_rate`.
+
+#### Benchmark harness (`bench/`)
+
+* `inferrail-bench run`, `compare` and `plot`. Open loop Poisson arrivals,
+  with latency measured from each request's scheduled time and send lag
+  recorded, so a slow server cannot hide its queueing.
+* Workloads W1 (shared system prompts), W2 (interleaved multi turn chat,
+  optionally replayed from ShareGPT) and W6 (unique prompts).
+* A streaming client that records TTFT, time per output token, inter token
+  latency, usage with cached tokens and the replica that served each
+  request.
+* Results as JSON with the environment (commit, binary versions, config
+  hash, machine), a summary with percentiles, goodput against the TTFT and
+  TPOT SLO and both the usage and engine reported hit rates, and every
+  request in columns.
+* `compare` runs every policy on the same schedules with a cold gateway and
+  simulators per run; `make baselines` reproduces the committed comparison
+  of the four baselines in `bench/results/baselines`, and `make report`
+  regenerates `bench/report/baselines`.
+
+#### Deployment
+
+* `deploy/compose`: gateway, three simulators, Prometheus, Grafana and
+  Jaeger with `make stack`, and the first dashboard in
+  `dashboards/inferrail.json` showing TTFT, load and routing per replica.
+
+#### Tests
+
+* Parser tests on the vLLM and SGLang fixtures, properties that arbitrary
+  input never panics and that rendered pages parse to reference totals, a
+  reference model for lease token counters, and collector tests on a paused
+  clock.
+* Integration tests for snapshot freshness, killed and hostile engines,
+  metrics, a snapshot of every metric name and label set, span attributes
+  and trace propagation, OTLP export from the binary, and the decision log.
+* A test that every dashboard query names a metric the gateway or vLLM
+  exports, and harness tests for workloads, Poisson statistics, timing,
+  coordinated omission and reports.
+* Stress tests: snapshot ages under load, 64 replicas scraped at once,
+  metrics scraped during 2,000 streams, hostile metrics pages, discovery
+  churn, overhead with every observability feature on, and the harness at
+  300 requests per second.
+* ADR 005 (load collector), ADR 006 (observability) and ADR 007 (benchmark
+  methodology).
+
+### Changed
+
+* tokio moves to 1.54.1, since 1.54.0 was yanked.
+* The gateway binary installs its logging through the new telemetry setup;
+  routing spans never appear in the log output.
+* The e2e fixtures share process management with the harness.
+
 ## [0.1.3] Bug fixes and Improvements (21 October 2026)
 
 Fixes from a second sweep over the gateway, policies and control plane.
@@ -236,7 +340,8 @@ The first release: project foundations and a faithful vLLM simulator.
   disconnect storms, malformed bodies, long prompts and a memory soak.
 * OpenAI Python SDK suite, sync and async, against the simulator binary.
 
-[0.1.3]: https://github.com/jackeddisciple/Inferrail/tree/main
+[0.1.4]: https://github.com/jackeddisciple/Inferrail/tree/main
+[0.1.3]: https://github.com/jackeddisciple/Inferrail/tree/c6fe3ff568d5f9033b86294b7281f49ed2bcb7cc
 [0.1.2]: https://github.com/jackeddisciple/Inferrail/tree/d7b4d58b108f339496938df7649bd66592b2b8d9
 [0.1.1]: https://github.com/jackeddisciple/Inferrail/tree/664e148a663636837ea98cb32ddc8676dd8b7093
 [0.1.0]: https://github.com/jackeddisciple/Inferrail/tree/1bb0c4501423ae6499844e25290da8a7b04793aa

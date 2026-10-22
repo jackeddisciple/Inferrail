@@ -12,13 +12,16 @@ most of its prompt in cache, without letting any replica overload.
 The goal is lower tail latency and fewer GPUs for the same traffic, proven
 with benchmarks anyone can rerun.
 
-> **Status: v0.1.3, gateway and baselines.** The gateway is usable: it
-> proxies chat and completions to a fleet of engines, streams responses
-> untouched, retries before the first byte, ejects failing replicas,
-> discovers replicas through DNS and routes with four baseline policies.
-> The KV index and the cost model come next, so the cache aware policies
-> currently route by their documented fallback, power of two choices. See
-> [Roadmap](#roadmap).
+> **Status: v0.1.4, load signals, observability and the benchmark
+> harness.** The gateway proxies chat and completions to a fleet of
+> engines, streams responses untouched, retries before the first byte,
+> ejects failing replicas, discovers replicas through DNS and routes with
+> four baseline policies. It now reads every engine's load ten times a
+> second, exports Prometheus metrics, OpenTelemetry traces and a decision
+> log, and ships with a dashboard and a harness that compares policies on
+> the simulator. The KV index and the cost model come next, so the cache
+> aware policies still route by their documented fallback, power of two
+> choices. See [Roadmap](#roadmap).
 
 ## Why this exists
 
@@ -45,18 +48,20 @@ the cache away. Inferrail treats routing as a cost estimate instead: for each
 replica, how long until this request's first token, given what is cached
 there and what is queued there?
 
-## What is in v0.1.3
+## What is in v0.1.4
 
 | Piece | What it does |
 | --- | --- |
-| `inferrail-gateway` | OpenAI compatible proxy on hyper: chat and completions, streaming pass through, model list, request IDs, retries before the first byte, health checks, outlier ejection, breakers, DNS discovery, graceful shutdown |
+| `inferrail-gateway` | OpenAI compatible proxy on hyper: chat and completions, streaming pass through, model list, request IDs, retries before the first byte, health checks, outlier ejection, breakers, DNS discovery, graceful shutdown, Prometheus metrics on an admin port, OpenTelemetry traces and a sampled decision log |
+| `inferrail-load` | Reads vLLM and SGLang `/metrics` pages, scrapes every replica ten times a second and publishes load snapshots that are never used once stale |
 | `inferrail-policy` | The `RoutingPolicy` trait and the round robin, random, least request and power of two choices baselines, chosen per model |
-| `inferrail-control` | Lock free replica registry, health state with exponential ejection backoff, the active health checker and DNS discovery |
+| `inferrail-control` | Lock free replica registry with request and prompt token counters, health state with exponential ejection backoff, the active health checker and DNS discovery |
 | `inferrail-core` | Lossless OpenAI wire types, an incremental SSE decoder and validated YAML configuration |
 | `inferrail-sim` | A CPU mock of vLLM v0.31.0 with the same HTTP API, streaming bytes and Prometheus metrics, a calibrated latency model and a real prefix cache |
-| Other crates | `tokenize`, `index`, `events`, `load` and `calibrate` compile as stubs with the boundaries the router will use |
-| `bench/` | Python 3.12 package managed by uv; today it holds the OpenAI SDK suites, run against the simulator and through the gateway |
-| CI | fmt, clippy with warnings denied, nextest, doc tests, ruff, pytest, `cargo audit`, `cargo machete`, and the official OpenAI SDK against the simulator and the gateway on every push |
+| Other crates | `tokenize`, `index`, `events` and `calibrate` compile as stubs with the boundaries the router will use |
+| `bench/` | The benchmark harness (`inferrail-bench`): open loop workloads W1, W2 and W6, TTFT, TPOT and ITL measurement, JSON results, charts and policy comparisons on simulators, plus the OpenAI SDK suites |
+| `deploy/compose`, `dashboards/` | Gateway, simulators, Prometheus, Grafana and Jaeger in one `make stack`, with the first dashboard |
+| CI | fmt, clippy with warnings denied, nextest, doc tests, ruff, pytest, `cargo audit`, `cargo machete`, and the official OpenAI SDK and the harness against the simulator and the gateway on every push |
 
 ## Quick start
 
@@ -109,6 +114,29 @@ already sending can break. The gateway retries every request that had not
 started on another replica, ejects the dead one within milliseconds and
 readmits it once it is back.
 `inferrail-gateway --check --config <file>` validates a config and exits.
+
+The gateway's metrics are on the admin port:
+
+```sh
+curl -s localhost:9090/metrics | grep inferrail_replica_engine
+```
+
+To see everything on a dashboard, bring up the full stack with Docker
+(gateway, three simulators, Prometheus, Grafana and Jaeger):
+
+```sh
+make stack        # Grafana on :3000, gateway on :8080, Jaeger on :16686
+make stack-down
+```
+
+To measure the gateway like a benchmark would, drive it open loop:
+
+```sh
+cd bench
+uv run inferrail-bench run --base-url http://localhost:8080 --model sim \
+  --workload w1 --rate 20 --requests 600 --out results/try/w1.json
+uv run inferrail-bench plot results/try/w1.json --out report/try
+```
 
 ## The gateway
 
@@ -177,6 +205,79 @@ running streams finish for up to `server.shutdown_timeout`, then closes what
 is left; a request a client sends on an idle connection at that very moment
 can be lost, so put the gateway behind something that retries, or drain it
 from the load balancer first.
+
+## Load signals
+
+The gateway knows two things about each replica's load. Its own counters
+are always current: requests in flight, requests still waiting for a
+response head, and estimated prompt tokens in flight and still waiting for
+their first byte (four bytes of request body per token until requests are
+tokenized at the edge). The engine's own view comes from its Prometheus
+page: running and waiting requests, KV cache usage, prefix cache counters,
+preemptions and KV capacity.
+
+**Engines.** vLLM v0.31.0 and SGLang v0.5.21 are read natively; the engine
+is recognized by its metric prefix, data parallel ranks are summed, and
+SGLang's per priority breakdowns are skipped. A page that lacks a required
+family is reported as unreadable rather than taken as an idle engine, so a
+renamed metric after an engine upgrade shows up in the scrape counters
+instead of quietly skewing routing.
+
+**Freshness.** Every replica is scraped in parallel every
+`load.scrape_interval` (100 ms), each scrape bounded by
+`load.scrape_timeout` and a 4 MiB page limit. A report older than
+`load.max_age` (250 ms) is treated as missing: routing degrades to the
+gateway's own counts instead of trusting stale numbers. A dead, hung or
+garbage spewing engine is logged once when it stops answering and once when
+it recovers, and never delays the other scrapes. Under 1,000 requests per
+second the oldest report any reader saw was 102 ms; with 64 replicas
+scraped at once it was 112 ms. See
+[ADR 005](docs/adr/005-load-collector.md).
+
+## Observability
+
+**Metrics.** `GET /metrics` on `server.admin_listen` (127.0.0.1:9090 by
+default) serves OpenMetrics, apart from the client port:
+
+| Metric | Labels | Meaning |
+| --- | --- | --- |
+| `inferrail_requests_total` | model, replica, status | inference requests by outcome: a status class, `aborted` when the engine broke a started response, `cancelled` when the client left |
+| `inferrail_ttft_seconds` | model, policy, replica | arrival to first byte of a streamed response |
+| `inferrail_request_duration_seconds` | model, policy, replica | arrival to the end of the response |
+| `inferrail_routing_decisions_total` | model, policy, replica | the policy's choices, one per attempt |
+| `inferrail_routing_decision_seconds` | policy | time to choose and take a lease |
+| `inferrail_upstream_retries_total`, `inferrail_client_disconnects_total` | model | retries before the first byte, abandoned responses |
+| `inferrail_request_errors_total` | model, reason | errors the gateway answered itself |
+| `inferrail_ejections_total`, `inferrail_load_scrapes_total` | replica (and result) | passive ejections, engine scrapes |
+| `inferrail_replica_*` | replica | health, ejection, in flight requests and prompt tokens, the engine's running, waiting, KV usage and prefix cache counters, and the age of its report |
+
+Replica gauges are read from the fleet when Prometheus scrapes, series of
+replicas that leave are removed, and recording one streamed request costs
+about 160 ns.
+
+**Traces.** With `observability.otlp_endpoint` set, every request becomes a
+server span, and every attempt a `route` span (policy, candidates offered,
+winner, its in flight count and engine load, decision time) and an
+`upstream` client span, exported over OTLP HTTP and sampled by
+`trace_sample_ratio`. A client's W3C `traceparent` is continued, and the
+engine receives the gateway's span as its parent. Without an endpoint the
+spans are never created.
+
+**Decision log.** With `observability.decision_log.sample_rate` above zero,
+sampled requests write one JSON line per routing decision to
+`decision_log.path`: the policy, the attempt, the winner and every
+candidate's state and load. Requests are sampled by id, so all attempts of
+a request are kept together. A writer thread drains a bounded queue; if
+the disk falls behind, records are dropped and counted, never waited for.
+Prompts are never logged. See [ADR 006](docs/adr/006-observability.md).
+
+**Dashboard.** `make stack` builds the gateway and simulator image and
+brings up three simulators, the gateway, Prometheus, Grafana and Jaeger.
+The provisioned dashboard ([`dashboards/inferrail.json`](dashboards/inferrail.json))
+shows TTFT per replica and per policy from both the gateway and the
+engines, in flight requests, engine queues and KV usage per replica, each
+policy's traffic share, prefix cache hit rates, decision time, retries,
+ejections and errors.
 
 ## Routing policies
 
@@ -270,6 +371,63 @@ KV events and caching of generated blocks. Requests that need `n > 1`,
 logprobs, `echo` or `best_of` get a 400 naming the parameter instead of an
 answer that silently differs from vLLM; stop strings are ignored.
 
+## Benchmark harness
+
+`bench/` holds `inferrail-bench`, which measures policies the way the
+benchmark plan requires (see [ADR 007](docs/adr/007-benchmark-harness.md)):
+
+* **Open loop.** Requests arrive on a seeded Poisson schedule and each is
+  sent at its time whatever the earlier ones are doing. TTFT and end to end
+  latency count from the scheduled time, and the gap between scheduled and
+  actual send time is recorded, so a server that falls behind cannot hide
+  its queueing.
+* **Workloads.** W1: a handful of 2k to 8k token system prompts shared by
+  every user, with 50 to 500 token questions. W2: multi turn chats whose
+  history is resent each turn, interleaved across active sessions, or
+  replayed from a ShareGPT file. W6: prompts that share nothing, the control
+  where cache affinity must not hurt.
+* **Measurements.** TTFT, time per output token, inter token latency, end
+  to end latency, throughput, goodput against the default SLO (TTFT at most
+  2 s, TPOT at most 100 ms), the prefix hit rate from usage and from the
+  engines' own counters, errors, send lag and requests per replica.
+* **Fair comparisons.** `compare` gives every policy the same requests and
+  arrival times and a cold gateway and simulators per run, discards a
+  warmup, and repeats with new seeds.
+
+```sh
+make baselines   # every baseline on W1, W2 and W6, 3 repetitions
+make report      # charts and report.md from bench/results
+```
+
+The committed results in [`bench/results/baselines`](bench/results/baselines)
+compare the four baselines on three simulators with the default latency
+model of an 8B model on one 24 GB GPU. Each workload runs at about 70% of
+what the fleet sustains: W1 with 32 system prompts (more than one
+replica's KV cache holds) at 6 req/s, W2 with 16 interleaved chats at
+25 req/s, and W6 at 9 req/s. Medians over three repetitions:
+
+| Policy | W1 TTFT p50 / p99 | W1 hit rate | W2 TTFT p50 / p99 | W2 hit rate | W6 TTFT p50 / p99 |
+| --- | --- | --- | --- | --- | --- |
+| `round_robin` | 511 / 1,842 ms | 0.39 | 101 / 470 ms | 0.46 | 313 / 846 ms |
+| `random` | 714 / 3,394 ms | 0.39 | 143 / 622 ms | 0.46 | 399 / 1,657 ms |
+| `least_request` | 776 / 2,207 ms | 0.40 | 138 / 601 ms | 0.46 | 363 / 1,194 ms |
+| `p2c` | 711 / 2,255 ms | 0.40 | 142 / 666 ms | 0.45 | 354 / 1,106 ms |
+
+![TTFT by policy on W1](bench/report/baselines/w1_ttft.png)
+
+Two things stand out. Under cache pressure every cache blind policy finds
+a warm prefix for only about 40% of prompt tokens, close to the one in
+three a replica's share of the traffic would give, and p99 TTFT reaches
+1.8 to 3.4 s, at or past the 2 s SLO: that gap is what the cache aware
+policies are built to close. Even among cache blind policies the load
+signal matters: least request and power of two choices balance requests
+in flight, which here are mostly decoding and say little about the prefill
+queue, so they trail plain round robin, and random's uneven spread is
+worst everywhere. No run lost a request, and the client sent every request
+within about 2 ms of its schedule at p99. The full report, with
+distributions and hit rates for every workload, is in
+[`bench/report/baselines/report.md`](bench/report/baselines/report.md).
+
 ## Configuration
 
 The gateway reads one YAML file. Only `models` and at least one replica or
@@ -304,6 +462,15 @@ health:
 retry:
   max_attempts: 3
   backoff: 25ms
+load:
+  scrape_interval: 100ms
+  max_age: 250ms
+observability:
+  otlp_endpoint: http://localhost:4318/v1/traces
+  trace_sample_ratio: 0.1
+  decision_log:
+    path: /var/log/inferrail/decisions.jsonl
+    sample_rate: 0.01
 ```
 
 See [`deploy/inferrail.example.yaml`](deploy/inferrail.example.yaml) for every
@@ -321,8 +488,10 @@ includes:
   stability, block hash chaining, the prefix cache LRU, latency
   monotonicity, config round trips, uniform policy choices under fixed seeds,
   least request always picking a minimum, power of two choices never picking
-  a unique maximum, fleet membership and replica health against naive
-  reference models, and the request splice changing nothing but the model.
+  a unique maximum, fleet membership, replica health and lease token
+  counters against naive reference models, the request splice changing
+  nothing but the model, metrics pages that never crash the parser, and
+  rendered pages that always parse back to the reference totals.
 * **Gateway invariants**: no policy ever routes to an unhealthy replica or
   one that does not serve the model; bytes the engine sends reach the client
   unchanged under any chunking; request bodies reach the engine byte for
@@ -334,7 +503,18 @@ includes:
 * **Integration tests** against three in process simulators that can be
   killed for real or made to refuse, close, hang, delay or fail on demand:
   routing, retries, ejection and readmission, DNS joins and leaves, breakers,
-  disconnects, graceful shutdown, header timeouts and log hygiene.
+  disconnects, graceful shutdown, header timeouts and log hygiene; load
+  snapshots that stay under 250 ms old, engines that die or serve hostile
+  metrics pages; every metric and its labels (a snapshot test), span
+  attributes and trace propagation through an in memory exporter, real OTLP
+  export from the binary, and the decision log.
+* **Consistency tests**: every dashboard query names a metric the gateway or
+  vLLM exports, and the compose stack and its configs are valid.
+* **Harness tests**: workload shapes and determinism, Poisson statistics,
+  TTFT, TPOT and ITL against servers with known timing, coordinated
+  omission against a server that falls behind, a blocked client loop
+  showing up as lag, results, reports and a full comparison on real
+  binaries.
 * **SDK tests** (`make e2e`): the official OpenAI Python SDK, sync and async,
   against the simulator binary and through the gateway binary in front of
   three simulators.
@@ -344,7 +524,8 @@ includes:
 | Scenario | Result |
 | --- | --- |
 | 2,000 concurrent streams through the gateway over 3 simulators | all complete in 0.3 to 0.7 s, zero errors, even spread |
-| Open loop at 2,000 and 5,000 req/s, 10,000 requests each | the gateway adds 0.04 to 0.12 ms at p50 and under 0.6 ms at p99 |
+| Open loop at 2,000 and 5,000 req/s, 10,000 requests each, with metrics and load scraping on | the gateway adds about 0.1 ms at p50 and under 0.25 ms at p99 |
+| The same at 5,000 req/s with the decision log at full sampling and traces exported to an unreachable collector | the gateway adds 0.15 ms at p50 and 0.34 ms at p99; 15,000 decisions logged, none dropped |
 | A simulator killed under 1,000 req/s, then restarted | zero errors for requests sent after the kill, ejected within 10 ms, back in rotation within 60 ms |
 | A replica that hangs, with requests waiting on it | they move to another replica as soon as probes mark it down |
 | Requests that make every engine fail | at most half the replicas are ejected; the pool never empties |
@@ -357,6 +538,12 @@ includes:
 | 1,000 concurrent streams through the async SDK, direct and via the gateway | all complete with exact usage |
 | 2,000 concurrent SSE streams straight to one simulator | all complete in 0.55 s, zero errors |
 | 35,000 request simulator soak | resident memory grew under 20 MB |
+| Engine load reports under 1,000 req/s through 3 simulators | every reader saw a report under 102 ms old (p99 100 ms); never stale |
+| 64 replicas scraped every 100 ms under 2,000 req/s | oldest report 112 ms, zero errors |
+| `/metrics` scraped 100 times a second during 2,000 concurrent streams | every stream completes; counters and histograms consistent on every scrape |
+| 20 replicas serving 50 MB or endless metrics pages for 5 s | the healthy replica's report never older than 104 ms; each scrape capped at 4 MiB and 100 ms |
+| 8,000 replicas churned through discovery | the metrics page never exceeds 40 KB and renders in 0.05 ms |
+| The harness driving zero latency simulators at 300 req/s | every request sent within 2.2 ms of its schedule at p99 |
 
 The suite runs clean ten times in a row with every core saturated.
 
@@ -365,18 +552,21 @@ The suite runs clean ten times in a row with every core saturated.
 ```
 crates/
   inferrail-core/        wire types, SSE codec, configuration
-  inferrail-gateway/     the router: proxy, retries, health, discovery wiring
+  inferrail-gateway/     the router: proxy, retries, health, metrics, traces
   inferrail-policy/      routing policy trait and baseline policies
   inferrail-control/     replica registry, health, ejection, DNS discovery
+  inferrail-load/        engine metrics parsing, scraping, load snapshots
   inferrail-sim/         mock vLLM engine (binary and library)
   inferrail-tokenize/    chat templates, tokenization, block hashing
   inferrail-index/       KV block index
   inferrail-events/      engine KV event subscribers
-  inferrail-load/        engine metrics scraping, load snapshots
   inferrail-calibrate/   engine profiler that fits the cost model
-bench/                   Python tooling and the OpenAI SDK suites
-tests/fixtures/          OpenAI and vLLM reference payloads
-deploy/                  example and local configurations
+bench/                   benchmark harness and the OpenAI SDK suites
+  results/               raw results of committed runs
+  report/                charts and reports generated from them
+dashboards/              Grafana dashboard JSON
+deploy/                  example, local and compose configurations
+tests/fixtures/          OpenAI, vLLM and SGLang reference payloads
 docs/adr/                architecture decision records
 ```
 
@@ -391,9 +581,10 @@ committed, rerunnable benchmarks, not a claim.
   zero copy streaming, retries before the first byte, health checks, outlier
   ejection, breakers, DNS discovery, cancellation, and four baseline
   policies behind one trait.
-* **Load signals and observability.** Engine metrics scraping merged with
-  the gateway's own counts, Prometheus metrics, OpenTelemetry traces with
-  routing attributes, Grafana dashboards, and a benchmark harness that
+* **Load signals and observability.** Shipped in v0.1.4: vLLM and SGLang
+  metrics scraped ten times a second and merged with the gateway's own
+  counts, Prometheus metrics, OpenTelemetry traces with routing attributes,
+  a sampled decision log, a Grafana dashboard, and a benchmark harness that
   compares the baselines on the simulator.
 * **Tokens and hashes.** Real chat templates and tokenizers with byte level
   parity against Python `transformers`, and chained XXH3 128 bit block hashes

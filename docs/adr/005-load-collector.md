@@ -33,7 +33,7 @@ hope.
 * Every replica is scraped once per `load.scrape_interval` (100 ms), all in
   parallel, each bounded by `load.scrape_timeout` (100 ms) and a 4 MiB page
   limit. A sample is stamped with the time its request was sent.
-* Each replica holds its latest sample in an arc-swap cell. Readers never
+* Each replica holds its latest sample in an `arc-swap` cell. Readers never
   lock, and a reader asking for load gets the engine's report only while it
   is at most `load.max_age` (250 ms) old. Older reports are treated as
   missing, never as current. Validation requires `max_age` to cover an
