@@ -68,3 +68,20 @@ retry:
 logging:
   level: info
   log_prompts: false
+
+# Engine /metrics pages are scraped every scrape_interval; samples older than
+# max_age are ignored and routing falls back to the gateway's own counts.
+load:
+  enabled: true
+  scrape_interval: 100ms
+  scrape_timeout: 100ms
+  max_age: 250ms
+
+# Prometheus metrics are always served on server.admin_listen at /metrics.
+observability:
+  # otlp_endpoint: http://localhost:4318/v1/traces
+  service_name: inferrail-gateway
+  trace_sample_ratio: 1.0
+  decision_log:
+    # path: /var/log/inferrail/decisions.jsonl
+    sample_rate: 0.0

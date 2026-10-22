@@ -9,6 +9,7 @@ use crate::ids::ModelId;
 
 pub const MAX_BLOCK_SIZE: u32 = 4096;
 pub const MAX_RETRY_ATTEMPTS: u32 = 10;
+pub const MIN_SCRAPE_INTERVAL: Duration = Duration::from_millis(10);
 const LOG_LEVELS: [&str; 5] = ["trace", "debug", "info", "warn", "error"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -152,6 +153,8 @@ impl Config {
         self.check_routing(&mut c);
         self.check_health(&mut c);
         self.check_retry(&mut c);
+        self.check_load(&mut c);
+        self.check_observability(&mut c);
         if !LOG_LEVELS.contains(&self.logging.level.as_str()) {
             c.push(
                 "logging.level",
@@ -323,6 +326,56 @@ impl Config {
         }
         if health.max_ejection_percent > 100 {
             c.push("health.max_ejection_percent", "must be at most 100");
+        }
+    }
+
+    fn check_load(&self, c: &mut Collector) {
+        let load = &self.load;
+        if load.scrape_interval < MIN_SCRAPE_INTERVAL {
+            c.push("load.scrape_interval", "must be at least 10ms");
+        }
+        c.positive("load.scrape_timeout", load.scrape_timeout);
+        if load.scrape_timeout > load.scrape_interval {
+            c.push(
+                "load.scrape_timeout",
+                "must not exceed load.scrape_interval",
+            );
+        }
+        if load.max_age < load.scrape_interval.saturating_add(load.scrape_timeout) {
+            c.push(
+                "load.max_age",
+                "must be at least load.scrape_interval plus load.scrape_timeout, or one slow scrape makes a healthy replica look stale",
+            );
+        }
+    }
+
+    fn check_observability(&self, c: &mut Collector) {
+        let otel = &self.observability;
+        if let Some(url) = &otel.otlp_endpoint
+            && (!matches!(url.scheme(), "http" | "https") || url.host().is_none())
+        {
+            c.push(
+                "observability.otlp_endpoint",
+                "must be an http or https URL with a host",
+            );
+        }
+        if otel.service_name.trim().is_empty() {
+            c.push("observability.service_name", "must not be empty");
+        }
+        if !(0.0..=1.0).contains(&otel.trace_sample_ratio) {
+            c.push("observability.trace_sample_ratio", "must be in [0, 1]");
+        }
+        let log = &otel.decision_log;
+        if !(0.0..=1.0).contains(&log.sample_rate) {
+            c.push(
+                "observability.decision_log.sample_rate",
+                "must be in [0, 1]",
+            );
+        } else if log.sample_rate > 0.0 && log.path.is_none() {
+            c.push(
+                "observability.decision_log.path",
+                "is required when sample_rate is above zero",
+            );
         }
     }
 
@@ -745,6 +798,67 @@ discovery:
     }
 
     #[test]
+    fn load_timings_are_consistent() {
+        let mut config = base();
+        config.load.scrape_interval = Duration::from_millis(5);
+        config.load.scrape_timeout = Duration::from_millis(5);
+        config.load.max_age = Duration::from_secs(1);
+        assert_eq!(
+            only_issue(&config),
+            "load.scrape_interval: must be at least 10ms"
+        );
+
+        let mut config = base();
+        config.load.scrape_timeout = Duration::from_millis(150);
+        config.load.max_age = Duration::from_secs(1);
+        assert_eq!(
+            only_issue(&config),
+            "load.scrape_timeout: must not exceed load.scrape_interval"
+        );
+
+        let mut config = base();
+        config.load.scrape_timeout = Duration::ZERO;
+        assert!(only_issue(&config).starts_with("load.scrape_timeout"));
+
+        let mut config = base();
+        config.load.max_age = Duration::from_millis(199);
+        assert!(only_issue(&config).starts_with("load.max_age"));
+        config.load.max_age = Duration::from_millis(200);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn observability_settings_are_checked() {
+        let mut config = base();
+        config.observability.otlp_endpoint = Some("ftp://collector:4318".parse().unwrap());
+        config.observability.service_name = " ".into();
+        config.observability.trace_sample_ratio = 1.5;
+        config.observability.decision_log.sample_rate = f64::NAN;
+        let found = issues(&config);
+        assert_eq!(found.len(), 4, "{found:?}");
+        for path in [
+            "observability.otlp_endpoint",
+            "observability.service_name",
+            "observability.trace_sample_ratio",
+            "observability.decision_log.sample_rate",
+        ] {
+            assert!(found.iter().any(|i| i.starts_with(path)), "{path}");
+        }
+
+        let mut config = base();
+        config.observability.decision_log.sample_rate = 0.01;
+        assert_eq!(
+            only_issue(&config),
+            "observability.decision_log.path: is required when sample_rate is above zero"
+        );
+        config.observability.decision_log.path = Some("/tmp/d.jsonl".into());
+        config.observability.otlp_endpoint =
+            Some("http://collector:4318/v1/traces".parse().unwrap());
+        config.observability.trace_sample_ratio = 0.0;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
     fn all_problems_are_reported_together() {
         let text = r#"
 models:
@@ -795,6 +909,8 @@ retry:
             block_shift in 0u32..8,
             refresh_ms in 1u64..60_000,
             cap in proptest::option::of(1u32..10_000),
+            scrape_ms in 10u64..2_000,
+            sample in 0.0f64..=1.0,
         ) {
             let mut text = String::from("models:\n");
             for m in 0..models {
@@ -818,6 +934,13 @@ retry:
                 }
             }
             text.push_str(&format!("routing:\n  epsilon: {epsilon}\n  kappa: {kappa}\n"));
+            text.push_str(&format!(
+                "load:\n  scrape_interval: {scrape_ms}ms\n  scrape_timeout: {scrape_ms}ms\n  max_age: {}ms\n",
+                scrape_ms * 2
+            ));
+            text.push_str(&format!(
+                "observability:\n  trace_sample_ratio: {sample}\n  decision_log:\n    path: /tmp/d.jsonl\n    sample_rate: {sample}\n"
+            ));
             let config = Config::from_yaml_str(&text).unwrap();
             let again = Config::from_yaml_str(&config.to_yaml_string().unwrap()).unwrap();
             prop_assert_eq!(again, config);

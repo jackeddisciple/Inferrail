@@ -38,4 +38,6 @@ fn example_documents_the_defaults() {
     assert_eq!(config.logging, Default::default());
     assert_eq!(config.server, Default::default());
     assert_eq!(config.upstream, Default::default());
+    assert_eq!(config.load, Default::default());
+    assert_eq!(config.observability, Default::default());
 }

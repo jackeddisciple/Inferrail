@@ -12,7 +12,9 @@ use crate::ids::{ModelId, ReplicaId};
 
 mod validate;
 
-pub use validate::{ConfigIssue, ConfigIssues, MAX_BLOCK_SIZE, MAX_RETRY_ATTEMPTS};
+pub use validate::{
+    ConfigIssue, ConfigIssues, MAX_BLOCK_SIZE, MAX_RETRY_ATTEMPTS, MIN_SCRAPE_INTERVAL,
+};
 
 pub const DEFAULT_BLOCK_SIZE: u32 = 16;
 pub const DEFAULT_EPSILON: f64 = 0.25;
@@ -53,6 +55,10 @@ pub struct Config {
     pub retry: RetryConfig,
     #[serde(default)]
     pub logging: LoggingConfig,
+    #[serde(default)]
+    pub load: LoadConfig,
+    #[serde(default)]
+    pub observability: ObservabilityConfig,
 }
 
 impl Config {
@@ -346,6 +352,60 @@ impl Default for LoggingConfig {
     }
 }
 
+/// How often engine `/metrics` pages are scraped, and how old a sample may
+/// be before routing stops trusting it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct LoadConfig {
+    pub enabled: bool,
+    #[serde(with = "humantime_serde")]
+    pub scrape_interval: Duration,
+    #[serde(with = "humantime_serde")]
+    pub scrape_timeout: Duration,
+    #[serde(with = "humantime_serde")]
+    pub max_age: Duration,
+}
+
+impl Default for LoadConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            scrape_interval: Duration::from_millis(100),
+            scrape_timeout: Duration::from_millis(100),
+            max_age: Duration::from_millis(250),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ObservabilityConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub otlp_endpoint: Option<Url>,
+    pub service_name: String,
+    pub trace_sample_ratio: f64,
+    pub decision_log: DecisionLogConfig,
+}
+
+impl Default for ObservabilityConfig {
+    fn default() -> Self {
+        Self {
+            otlp_endpoint: None,
+            service_name: "inferrail-gateway".to_owned(),
+            trace_sample_ratio: 1.0,
+            decision_log: DecisionLogConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct DecisionLogConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<PathBuf>,
+    pub sample_rate: f64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -380,6 +440,42 @@ replicas:
         assert_eq!(config.server.header_read_timeout, Duration::from_secs(30));
         assert_eq!(config.server.shutdown_timeout, Duration::from_secs(30));
         assert!(config.discovery.dns.is_empty());
+        assert!(config.load.enabled);
+        assert_eq!(config.load.scrape_interval, Duration::from_millis(100));
+        assert_eq!(config.load.scrape_timeout, Duration::from_millis(100));
+        assert_eq!(config.load.max_age, Duration::from_millis(250));
+        assert_eq!(config.observability.otlp_endpoint, None);
+        assert_eq!(config.observability.service_name, "inferrail-gateway");
+        assert_eq!(config.observability.trace_sample_ratio, 1.0);
+        assert_eq!(
+            config.observability.decision_log,
+            DecisionLogConfig::default()
+        );
+    }
+
+    #[test]
+    fn load_and_observability_settings_parse() {
+        let config = Config::from_yaml_str(&format!(
+            "{MINIMAL}load:\n  scrape_interval: 50ms\n  scrape_timeout: 40ms\n  max_age: 1s\nobservability:\n  otlp_endpoint: http://jaeger:4318/v1/traces\n  service_name: edge\n  trace_sample_ratio: 0.25\n  decision_log:\n    path: /tmp/decisions.jsonl\n    sample_rate: 0.5\n"
+        ))
+        .unwrap();
+        assert_eq!(config.load.scrape_interval, Duration::from_millis(50));
+        assert_eq!(config.load.scrape_timeout, Duration::from_millis(40));
+        assert_eq!(config.load.max_age, Duration::from_secs(1));
+        let otel = &config.observability;
+        assert_eq!(
+            otel.otlp_endpoint.as_ref().map(Url::as_str),
+            Some("http://jaeger:4318/v1/traces")
+        );
+        assert_eq!(otel.service_name, "edge");
+        assert_eq!(otel.trace_sample_ratio, 0.25);
+        assert_eq!(
+            otel.decision_log.path.as_deref(),
+            Some(Path::new("/tmp/decisions.jsonl"))
+        );
+        assert_eq!(otel.decision_log.sample_rate, 0.5);
+        let again = Config::from_yaml_str(&config.to_yaml_string().unwrap()).unwrap();
+        assert_eq!(again, config);
     }
 
     #[test]
@@ -429,6 +525,9 @@ replicas:
             "server:\n  listen_addr: 0.0.0.0:1\n",
             "upstream:\n  http3: true\n",
             "discovery:\n  consul: []\n",
+            "load:\n  interval: 1s\n",
+            "observability:\n  jaeger: true\n",
+            "observability:\n  decision_log:\n    rate: 1\n",
             "discovery:\n  dns:\n    - name: p\n      url: http://p:1\n      models: [meta-llama/Llama-3.1-8B-Instruct]\n      ttl: 5s\n",
         ] {
             let err = Config::from_yaml_str(&format!("{MINIMAL}{extra}")).unwrap_err();
