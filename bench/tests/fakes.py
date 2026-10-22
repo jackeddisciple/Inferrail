@@ -90,3 +90,28 @@ def status(code: int, body: str) -> Handler:
         await writer.drain()
 
     return handler
+
+
+class Background:
+    """A fake server on its own event loop thread, for code that runs its
+    own loop, such as the CLI."""
+
+    def __init__(self, handler: Handler):
+        import threading
+
+        self._loop = asyncio.new_event_loop()
+        self._ready = threading.Event()
+        self._thread = threading.Thread(target=self._run, args=(handler,), daemon=True)
+        self._thread.start()
+        self._ready.wait(5)
+
+    def _run(self, handler: Handler) -> None:
+        asyncio.set_event_loop(self._loop)
+        self.server, self.url = self._loop.run_until_complete(serve(handler))
+        self._ready.set()
+        self._loop.run_forever()
+
+    def close(self) -> None:
+        self._loop.call_soon_threadsafe(self.server.close)
+        self._loop.call_soon_threadsafe(self._loop.stop)
+        self._thread.join(5)
