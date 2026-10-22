@@ -12,6 +12,7 @@ use inferrail_control::{
 };
 use inferrail_core::config::{Config, ConfigIssues};
 use inferrail_core::ids::ModelId;
+use inferrail_load::{CollectorConfig, run_collector};
 use inferrail_policy::RoutingPolicy;
 use tokio::net::TcpListener;
 use tokio::task::JoinSet;
@@ -192,6 +193,19 @@ impl Gateway {
             },
             shared.clock,
         ));
+        if shared.config.load.enabled {
+            let registry = Arc::clone(&shared.registry);
+            background.spawn(run_collector(
+                move || registry.snapshot().replicas().to_vec(),
+                upstream::HttpScrape {
+                    client: shared.client.clone(),
+                },
+                CollectorConfig {
+                    interval: shared.config.load.scrape_interval,
+                    timeout: shared.config.load.scrape_timeout,
+                },
+            ));
+        }
         server::serve(shared, listener, shutdown).await
     }
 }

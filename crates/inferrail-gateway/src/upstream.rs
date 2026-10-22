@@ -9,6 +9,7 @@ use hyper_util::rt::{TokioExecutor, TokioTimer};
 use inferrail_control::{Probe, Replica};
 use inferrail_core::config::UpstreamConfig;
 use inferrail_core::openai::ModelList;
+use inferrail_load::{EngineLoad, Scrape, ScrapeError};
 
 pub(crate) type Client = hyper_util::client::legacy::Client<HttpConnector, Full<Bytes>>;
 
@@ -74,5 +75,43 @@ impl Probe for HttpProbe {
             let _ = tokio::time::timeout(timeout, self.refresh_cards(&replica)).await;
         }
         healthy
+    }
+}
+
+const MAX_METRICS_PAGE: usize = 4 << 20;
+
+/// `GET /metrics`, read as vLLM or SGLang load.
+#[derive(Debug, Clone)]
+pub(crate) struct HttpScrape {
+    pub(crate) client: Client,
+}
+
+impl Scrape<Replica> for HttpScrape {
+    async fn scrape(&self, replica: Arc<Replica>) -> Result<EngineLoad, ScrapeError> {
+        let request = Request::get(replica.endpoint().uri_for("/metrics"))
+            .header(hyper::header::ACCEPT, "text/plain; version=0.0.4")
+            .body(Full::default())
+            .map_err(|err| ScrapeError::Unreachable(err.to_string()))?;
+        let response = self
+            .client
+            .request(request)
+            .await
+            .map_err(|err| ScrapeError::Unreachable(err.to_string()))?;
+        if !response.status().is_success() {
+            return Err(ScrapeError::Status(response.status().as_u16()));
+        }
+        let body = Limited::new(response.into_body(), MAX_METRICS_PAGE)
+            .collect()
+            .await
+            .map_err(|err| {
+                if err.is::<http_body_util::LengthLimitError>() {
+                    ScrapeError::TooLarge(MAX_METRICS_PAGE)
+                } else {
+                    ScrapeError::Unreachable(err.to_string())
+                }
+            })?
+            .to_bytes();
+        let text = std::str::from_utf8(&body).map_err(|_| ScrapeError::NotUtf8)?;
+        Ok(inferrail_load::parse(text)?)
     }
 }

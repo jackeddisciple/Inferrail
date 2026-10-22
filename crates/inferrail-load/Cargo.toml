@@ -12,6 +12,7 @@ publish.workspace = true
 arc-swap.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true

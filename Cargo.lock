@@ -927,6 +927,7 @@ dependencies = [
  "hyper-util",
  "inferrail-control",
  "inferrail-core",
+ "inferrail-load",
  "inferrail-policy",
  "inferrail-sim",
  "proptest",
@@ -954,6 +955,7 @@ dependencies = [
  "proptest",
  "thiserror",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

@@ -6,7 +6,7 @@ use arc_swap::ArcSwapOption;
 use inferrail_core::config::{Config, ReplicaConfig};
 use inferrail_core::ids::{ModelId, ReplicaId};
 use inferrail_core::openai::ModelCard;
-use inferrail_load::{LoadCell, ReplicaLoad};
+use inferrail_load::{LoadCell, ReplicaLoad, Target};
 use tokio::time::Instant;
 use url::Url;
 
@@ -248,6 +248,16 @@ impl Replica {
             prefilling: true,
             tokens,
         })
+    }
+}
+
+impl Target for Replica {
+    fn name(&self) -> &str {
+        self.spec.id.as_str()
+    }
+
+    fn cell(&self) -> &LoadCell {
+        &self.engine_load
     }
 }
 

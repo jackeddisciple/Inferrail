@@ -274,6 +274,11 @@ impl RawUpstream {
                                 fetches.fetch_add(1, Ordering::SeqCst);
                                 return Ok(Response::new(Body::from("not a model list")));
                             }
+                            "/metrics" => {
+                                let mut response = Response::new(Body::empty());
+                                *response.status_mut() = hyper::StatusCode::NOT_FOUND;
+                                return Ok(response);
+                            }
                             _ => {}
                         }
                         let (parts, body) = request.into_parts();
