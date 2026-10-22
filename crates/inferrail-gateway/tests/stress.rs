@@ -11,33 +11,7 @@ use common::*;
 use futures::StreamExt;
 use hyper::body::Bytes;
 use inferrail_sim::latency::LatencyModel;
-use serde_json::{Value, json};
-
-fn percentile(sorted: &[Duration], p: f64) -> Duration {
-    if sorted.is_empty() {
-        return Duration::ZERO;
-    }
-    sorted[((sorted.len() - 1) as f64 * p).round() as usize]
-}
-
-fn summary(mut latencies: Vec<Duration>) -> [Duration; 3] {
-    latencies.sort();
-    [
-        percentile(&latencies, 0.50),
-        percentile(&latencies, 0.99),
-        percentile(&latencies, 0.999),
-    ]
-}
-
-fn rss_kib() -> u64 {
-    std::process::Command::new("ps")
-        .args(["-o", "rss=", "-p", &std::process::id().to_string()])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(0)
-}
+use serde_json::json;
 
 /// Deterministic xorshift so failures replay exactly.
 struct Rng(u64);
@@ -80,61 +54,6 @@ async fn drained(sims: &[Upstream], gw: &TestGateway) {
     }
     let fleet = gw.gateway.registry().load();
     assert!(fleet.replicas().iter().all(|r| r.pending() == 0));
-}
-
-#[derive(Debug, Default)]
-struct Run {
-    latencies: Vec<Duration>,
-    service: Vec<Duration>,
-    lag: Vec<Duration>,
-    errors: u64,
-}
-
-/// Open loop: request `i` is due at `start + i / rate` whatever happened to
-/// earlier ones; latency counts from the due time, so stalls are not hidden.
-async fn open_loop(
-    client: &reqwest::Client,
-    url: String,
-    rate: u64,
-    total: u64,
-    body: impl Fn(u64) -> Value,
-) -> Run {
-    let interval = Duration::from_nanos(1_000_000_000 / rate);
-    let started = tokio::time::Instant::now();
-    let mut tasks = Vec::with_capacity(total as usize);
-    let mut lag = Vec::with_capacity(total as usize);
-    for i in 0..total {
-        let due = started + interval * i as u32;
-        tokio::time::sleep_until(due).await;
-        lag.push(tokio::time::Instant::now() - due);
-        let (client, url, body) = (client.clone(), url.clone(), body(i));
-        tasks.push(tokio::spawn(async move {
-            let sent = tokio::time::Instant::now();
-            let ok = match client.post(url).json(&body).send().await {
-                Ok(r) if r.status() == 200 => r.bytes().await.is_ok(),
-                _ => false,
-            };
-            let done = tokio::time::Instant::now();
-            (ok, done - due, done - sent)
-        }));
-    }
-    let mut run = Run {
-        lag,
-        ..Run::default()
-    };
-    for task in tasks {
-        let (ok, latency, service) = task.await.expect("task");
-        if !ok {
-            run.errors += 1;
-        }
-        run.latencies.push(latency);
-        run.service.push(service);
-    }
-    run
-}
-
-fn ms(d: Duration) -> f64 {
-    d.as_secs_f64() * 1e3
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -557,4 +476,311 @@ async fn bodies_in_tiny_chunks_cost_about_their_size() {
         held
     );
     assert!(held < 32 * 1024, "held {held} KiB for an 8 MiB body");
+}
+
+const MAX_AGE: Duration = Duration::from_millis(250);
+
+/// Samples every replica's engine load age every 5 ms until `stop`, and
+/// returns all ages seen; a missing or stale report fails the test.
+async fn watch_ages(
+    replicas: Vec<Arc<inferrail_control::Replica>>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+) -> Vec<Duration> {
+    let mut ages = Vec::new();
+    while !stop.load(Ordering::Relaxed) {
+        let now = tokio::time::Instant::now();
+        for replica in &replicas {
+            let load = replica.load(now, MAX_AGE);
+            assert!(!load.is_stale(), "{} stale at {:?}", replica.id(), load.age);
+            ages.push(load.age.unwrap_or_default());
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    ages
+}
+
+async fn scraped(gw: &TestGateway) -> Vec<Arc<inferrail_control::Replica>> {
+    let replicas: Vec<_> = gw.gateway.registry().load().replicas().to_vec();
+    let all = replicas.clone();
+    wait_until(Duration::from_secs(5), move || {
+        all.iter().all(|r| r.engine_load().latest().is_some())
+    })
+    .await;
+    replicas
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "stress"]
+async fn load_snapshots_stay_fresh_under_open_loop_load() {
+    let sims = sims(3, decode(2.0)).await;
+    let gw = TestGateway::start(fleet(&urls(&sims.iter().collect::<Vec<_>>()), "")).await;
+    let replicas = scraped(&gw).await;
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let watcher = tokio::spawn(watch_ages(replicas, Arc::clone(&stop)));
+    let run = open_loop(
+        &gw.client,
+        gw.url("/v1/chat/completions"),
+        1_000,
+        5_000,
+        |i| chat(&format!("fresh {i}"), 8),
+    )
+    .await;
+    stop.store(true, Ordering::Relaxed);
+    let mut ages = watcher.await.expect("watcher");
+    assert_eq!(run.errors, 0);
+    ages.sort();
+    let [p50, p99, _] = summary(ages.clone());
+    let worst = *ages.last().unwrap();
+    println!(
+        "load snapshots under 1000 req/s x 5000: {} samples, age p50 {:.1} ms p99 {:.1} ms max {:.1} ms",
+        ages.len(),
+        ms(p50),
+        ms(p99),
+        ms(worst)
+    );
+    assert!(worst < MAX_AGE, "{worst:?}");
+    drained(&sims, &gw).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "stress"]
+async fn sixty_four_replicas_are_scraped_well_within_the_age_limit() {
+    let sims = sims(64, LatencyModel::ZERO).await;
+    let gw = TestGateway::start(fleet(&urls(&sims.iter().collect::<Vec<_>>()), "")).await;
+    let replicas = scraped(&gw).await;
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let watcher = tokio::spawn(watch_ages(replicas, Arc::clone(&stop)));
+    let rss = rss_kib();
+    let run = open_loop(
+        &gw.client,
+        gw.url("/v1/chat/completions"),
+        2_000,
+        6_000,
+        |i| chat(&format!("wide {i}"), 2),
+    )
+    .await;
+    stop.store(true, Ordering::Relaxed);
+    let mut ages = watcher.await.expect("watcher");
+    assert_eq!(run.errors, 0);
+    ages.sort();
+    let [p50, p99, _] = summary(ages.clone());
+    let worst = *ages.last().unwrap();
+    let [g50, g99, _] = summary(run.service);
+    println!(
+        "64 replicas scraped every 100 ms under 2000 req/s: age p50 {:.1} ms p99 {:.1} ms max {:.1} ms; request p50 {:.3} ms p99 {:.3} ms; RSS +{} KiB",
+        ms(p50),
+        ms(p99),
+        ms(worst),
+        ms(g50),
+        ms(g99),
+        rss_kib().saturating_sub(rss)
+    );
+    assert!(worst < MAX_AGE, "{worst:?}");
+    let page = gw.gateway.render_metrics();
+    assert_eq!(page.matches("inferrail_replica_load_stale{").count(), 64);
+}
+
+fn sample_sum(
+    page: &str,
+    name: &str,
+    filter: impl Fn(&inferrail_load::parse::Sample<'_>) -> bool,
+) -> f64 {
+    inferrail_load::parse::samples(page)
+        .filter(|s| s.name == name && filter(s))
+        .map(|s| s.value)
+        .sum()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "stress"]
+async fn metrics_scraped_a_hundred_times_a_second_during_two_thousand_streams() {
+    let sims = sims(3, decode(2.0)).await;
+    let gw = TestGateway::start(fleet(&urls(&sims.iter().collect::<Vec<_>>()), "")).await;
+    let admin = serve_admin(&gw.gateway).await;
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let scraper = {
+        let (client, stop) = (gw.client.clone(), Arc::clone(&stop));
+        tokio::spawn(async move {
+            let mut scrapes = 0u32;
+            let mut ticker = tokio::time::interval(Duration::from_millis(10));
+            while !stop.load(Ordering::Relaxed) {
+                ticker.tick().await;
+                let page = client
+                    .get(format!("{admin}/metrics"))
+                    .send()
+                    .await
+                    .expect("scrape")
+                    .text()
+                    .await
+                    .expect("page");
+                for s in inferrail_load::parse::samples(&page) {
+                    if s.name == "inferrail_ttft_seconds_count" {
+                        let inf = sample_sum(&page, "inferrail_ttft_seconds_bucket", |b| {
+                            b.label("le").as_deref() == Some("+Inf")
+                                && b.label("replica") == s.label("replica")
+                        });
+                        assert_eq!(inf, s.value, "torn histogram");
+                    }
+                }
+                scrapes += 1;
+            }
+            scrapes
+        })
+    };
+    let mut tasks = Vec::new();
+    for i in 0..2_000 {
+        let (client, url) = (gw.client.clone(), gw.url("/v1/chat/completions"));
+        let body = streaming(chat(&format!("scraped stream {i}"), 32));
+        tasks.push(tokio::spawn(async move {
+            client.post(url).json(&body).send().await?.text().await
+        }));
+    }
+    for task in tasks {
+        let text = task.await.unwrap().expect("stream");
+        assert!(text.ends_with("data: [DONE]\n\n"));
+    }
+    stop.store(true, Ordering::Relaxed);
+    let scrapes = scraper.await.expect("scraper");
+    gw.wait_idle().await;
+    let page = gw.gateway.render_metrics();
+    let ok = sample_sum(&page, "inferrail_requests_total", |s| {
+        s.label("status").as_deref() == Some("2xx")
+    });
+    let ttft = sample_sum(&page, "inferrail_ttft_seconds_count", |_| true);
+    println!("2000 streams with {scrapes} metrics scrapes: {ok} counted, {ttft} TTFT samples");
+    assert!(scrapes > 20);
+    assert_eq!(ok, 2_000.0);
+    assert_eq!(ttft, 2_000.0);
+    drained(&sims, &gw).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "stress"]
+async fn hostile_metrics_pages_cost_bounded_memory() {
+    use axum::body::Body;
+    use axum::routing::get;
+    let sim = Upstream::zero(&[MODEL]).await;
+    let mut text = format!(
+        "models:\n  - name: {MODEL}\n  - name: other\nreplicas:\n  - id: good\n    url: {}\n    models: [{MODEL}]\n",
+        sim.url()
+    );
+    for i in 0..20 {
+        let app = axum::Router::new()
+            .route("/health", get(|| async { "" }))
+            .route(
+                "/metrics",
+                get(move || async move {
+                    if i % 2 == 0 {
+                        Body::from_stream(futures::stream::iter(
+                            (0..50).map(|_| Ok::<_, std::io::Error>(vec![b'#'; 1 << 20])),
+                        ))
+                    } else {
+                        Body::from_stream(futures::stream::unfold((), |()| async {
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                            Some((Ok::<_, std::io::Error>(b"vllm:x 1\n".to_vec()), ()))
+                        }))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let url = format!("http://{}", listener.local_addr().expect("addr"));
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        text.push_str(&format!(
+            "  - id: bad{i}\n    url: {url}\n    models: [other]\n"
+        ));
+    }
+    let gw = TestGateway::start(config(&text)).await;
+    let good = gw.replica("good");
+    let base = rss_kib();
+    let started = Instant::now();
+    let mut worst = Duration::ZERO;
+    while started.elapsed() < Duration::from_secs(5) {
+        if let Some(sample) = good.engine_load().latest() {
+            worst = worst.max(sample.age(tokio::time::Instant::now()));
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let grown = rss_kib().saturating_sub(base);
+    let page = gw.gateway.render_metrics();
+    let too_large = sample_sum(&page, "inferrail_load_scrapes_total", |s| {
+        s.label("result").as_deref() == Some("too_large")
+    });
+    let timeouts = sample_sum(&page, "inferrail_load_scrapes_total", |s| {
+        s.label("result").as_deref() == Some("timeout")
+    });
+    println!(
+        "20 hostile metrics pages for 5 s: {too_large} oversized, {timeouts} timed out, healthy replica age max {:.1} ms, RSS +{grown} KiB",
+        ms(worst)
+    );
+    assert!(worst < MAX_AGE);
+    assert!(too_large > 100.0 && timeouts > 100.0);
+    assert!(grown < 200 * 1024, "{grown} KiB");
+    let (status, _) = gw.post_json("/v1/chat/completions", &chat("fine", 2)).await;
+    assert_eq!(status, 200);
+}
+
+#[test]
+#[ignore = "stress"]
+fn discovery_churn_keeps_the_metrics_page_bounded() {
+    use hyper::StatusCode;
+    use inferrail_control::{Clock, Limits, Origin, Registry, ReplicaSpec};
+    use inferrail_core::config::PolicyKind;
+    use inferrail_core::ids::{ModelId, ReplicaId};
+    use inferrail_gateway::metrics::{FleetGauges, Metrics, Outcome, Routed};
+
+    let spec = |id: &str| ReplicaSpec {
+        id: ReplicaId::new(id).unwrap(),
+        url: format!("http://{id}:8000").parse().unwrap(),
+        models: vec![ModelId::new("m").unwrap()],
+        origin: Origin::Dns(ReplicaId::new("pool").unwrap()),
+        limits: Limits::default(),
+        kv_capacity_blocks: None,
+    };
+    let fleet = Arc::new(Registry::new(Vec::new()));
+    let metrics = Metrics::new(FleetGauges {
+        registry: Arc::clone(&fleet),
+        clock: Clock::default(),
+        max_age: MAX_AGE,
+        policies: Vec::new(),
+    });
+    let group = ReplicaId::new("pool").unwrap();
+    let rss = rss_kib();
+    let mut largest = 0;
+    let mut render = Vec::new();
+    for round in 0..1_000 {
+        let ids: Vec<String> = (0..8).map(|i| format!("pool-{round}-{i}")).collect();
+        fleet.set_group(&group, ids.iter().map(|id| spec(id)).collect());
+        for id in &ids {
+            let routed = Routed {
+                model: ModelId::new("m").unwrap(),
+                policy: PolicyKind::P2c,
+                replica: ReplicaId::new(id).unwrap(),
+            };
+            for _ in 0..10 {
+                metrics.decided(&routed, Duration::from_micros(2));
+                metrics.first_byte(&routed, Duration::from_millis(20));
+                metrics.finished(
+                    &routed,
+                    Outcome::Complete(StatusCode::OK),
+                    Duration::from_millis(80),
+                );
+            }
+            metrics.ejected(&routed.replica);
+            metrics.scraped(&routed.replica, "ok");
+        }
+        let started = Instant::now();
+        let page = metrics.render();
+        render.push(started.elapsed());
+        largest = largest.max(page.len());
+    }
+    let [r50, r99, _] = summary(render);
+    println!(
+        "8000 replicas churned through 1000 rounds: largest page {largest} bytes, render p50 {:.3} ms p99 {:.3} ms, RSS +{} KiB",
+        ms(r50),
+        ms(r99),
+        rss_kib().saturating_sub(rss)
+    );
+    assert!(largest < 64 * 1024, "{largest}");
 }

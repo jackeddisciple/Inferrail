@@ -539,3 +539,84 @@ pub async fn serve_admin(gateway: &Gateway) -> String {
     );
     base
 }
+
+pub fn percentile(sorted: &[Duration], p: f64) -> Duration {
+    if sorted.is_empty() {
+        return Duration::ZERO;
+    }
+    sorted[((sorted.len() - 1) as f64 * p).round() as usize]
+}
+
+pub fn summary(mut latencies: Vec<Duration>) -> [Duration; 3] {
+    latencies.sort();
+    [
+        percentile(&latencies, 0.50),
+        percentile(&latencies, 0.99),
+        percentile(&latencies, 0.999),
+    ]
+}
+
+pub fn rss_kib() -> u64 {
+    std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+#[derive(Debug, Default)]
+pub struct Run {
+    pub latencies: Vec<Duration>,
+    pub service: Vec<Duration>,
+    pub lag: Vec<Duration>,
+    pub errors: u64,
+}
+
+/// Open loop: request `i` is due at `start + i / rate` whatever happened to
+/// earlier ones; latency counts from the due time, so stalls are not hidden.
+pub async fn open_loop(
+    client: &reqwest::Client,
+    url: String,
+    rate: u64,
+    total: u64,
+    body: impl Fn(u64) -> Value,
+) -> Run {
+    let interval = Duration::from_nanos(1_000_000_000 / rate);
+    let started = tokio::time::Instant::now();
+    let mut tasks = Vec::with_capacity(total as usize);
+    let mut lag = Vec::with_capacity(total as usize);
+    for i in 0..total {
+        let due = started + interval * i as u32;
+        tokio::time::sleep_until(due).await;
+        lag.push(tokio::time::Instant::now() - due);
+        let (client, url, body) = (client.clone(), url.clone(), body(i));
+        tasks.push(tokio::spawn(async move {
+            let sent = tokio::time::Instant::now();
+            let ok = match client.post(url).json(&body).send().await {
+                Ok(r) if r.status() == 200 => r.bytes().await.is_ok(),
+                _ => false,
+            };
+            let done = tokio::time::Instant::now();
+            (ok, done - due, done - sent)
+        }));
+    }
+    let mut run = Run {
+        lag,
+        ..Run::default()
+    };
+    for task in tasks {
+        let (ok, latency, service) = task.await.expect("task");
+        if !ok {
+            run.errors += 1;
+        }
+        run.latencies.push(latency);
+        run.service.push(service);
+    }
+    run
+}
+
+pub fn ms(d: Duration) -> f64 {
+    d.as_secs_f64() * 1e3
+}

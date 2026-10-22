@@ -38,6 +38,7 @@ e2e:
 stress:
 	$(CARGO) test --release -p inferrail-sim --test stress -- --ignored --nocapture --test-threads=1
 	$(CARGO) test --release -p inferrail-gateway --test stress -- --ignored --nocapture --test-threads=1
+	$(CARGO) test --release -p inferrail-gateway --test stress_telemetry -- --ignored --nocapture --test-threads=1
 	$(CARGO) build --release -p inferrail-sim -p inferrail-gateway
 	cd bench && INFERRAIL_SIM_BIN=$(CURDIR)/target/release/inferrail-sim \
 		INFERRAIL_GATEWAY_BIN=$(CURDIR)/target/release/inferrail-gateway \
