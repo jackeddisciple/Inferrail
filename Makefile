@@ -2,7 +2,7 @@ CARGO ?= cargo
 UV ?= uv
 NEXTEST := $(shell $(CARGO) nextest --version >/dev/null 2>&1 && echo "nextest run" || echo "test")
 
-.PHONY: check fmt lint audit test test-rust test-python bench e2e stress report stack stack-down
+.PHONY: check fmt lint audit test test-rust test-python bench e2e stress baselines report stack stack-down
 
 check: fmt lint test
 
@@ -43,8 +43,12 @@ stress:
 		INFERRAIL_GATEWAY_BIN=$(CURDIR)/target/release/inferrail-gateway \
 		$(UV) run --frozen pytest -q -s -m stress
 
+baselines:
+	$(CARGO) build --release -p inferrail-sim -p inferrail-gateway
+	cd bench && $(UV) run --frozen inferrail-bench compare --out results/baselines
+
 report:
-	@echo "report: no benchmark results yet"
+	cd bench && $(UV) run --frozen inferrail-bench plot results/baselines/*/*.json.gz --out report/baselines
 
 COMPOSE := docker compose -f deploy/compose/docker-compose.yaml
 

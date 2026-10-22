@@ -12,10 +12,33 @@ from inferrail_bench.workloads import WORKLOADS, generate
 from inferrail_bench.workloads.multi_turn import load_sharegpt
 
 
-def workload_params(name: str, sharegpt: str | None) -> dict:
+def _value(text: str) -> int | float | str | tuple:
+    if "," in text:
+        return tuple(_value(part.strip()) for part in text.split(","))
+    for kind in (int, float):
+        try:
+            return kind(text)
+        except ValueError:
+            pass
+    return text
+
+
+def parse_params(items: Sequence[str]) -> dict:
+    """`key=value` pairs; numbers become numbers and `a,b` a range."""
+    params = {}
+    for item in items:
+        key, sep, value = item.partition("=")
+        if not sep:
+            raise SystemExit(f"--param {item!r} is not key=value")
+        params[key.strip()] = _value(value.strip())
+    return params
+
+
+def workload_params(name: str, sharegpt: str | None, items: Sequence[str] = ()) -> dict:
+    params: dict = parse_params(items)
     if sharegpt and name == "w2":
-        return {"conversations": tuple(tuple(c) for c in load_sharegpt(sharegpt))}
-    return {}
+        params["conversations"] = tuple(tuple(c) for c in load_sharegpt(sharegpt))
+    return params
 
 
 async def measure(
@@ -52,7 +75,7 @@ def describe(summary: dict) -> str:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    params = workload_params(args.workload, args.sharegpt)
+    params = workload_params(args.workload, args.sharegpt, args.param)
     records, summary = asyncio.run(
         measure(
             args.base_url,
@@ -73,6 +96,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         "requests": args.requests,
         "seed": args.seed,
         "warmup_s": args.warmup,
+        "params": parse_params(args.param),
         "target": args.base_url,
     }
     path = results.write(args.out, results.document(run, results.environment(), summary, records))
@@ -83,6 +107,55 @@ def cmd_run(args: argparse.Namespace) -> int:
 def cmd_plot(args: argparse.Namespace) -> int:
     docs = [results.read(p) for p in args.results]
     print(plot.report(docs, args.out))
+    return 0
+
+
+def _rates(text: str, workloads: list[str]) -> dict[str, float]:
+    if "=" not in text:
+        return dict.fromkeys(workloads, float(text))
+    rates = {}
+    for part in text.split(","):
+        name, value = part.split("=", 1)
+        rates[name.strip()] = float(value)
+    missing = set(workloads) - set(rates)
+    if missing:
+        raise SystemExit(f"--rate has no rate for {', '.join(sorted(missing))}")
+    return rates
+
+
+def _compare_params(items: Sequence[str]) -> dict[str, dict]:
+    """`workload.key=value` pairs, grouped by workload."""
+    grouped: dict[str, dict] = {}
+    for item in items:
+        name, dot, rest = item.partition(".")
+        if not dot:
+            raise SystemExit(f"--param {item!r} is not workload.key=value")
+        grouped.setdefault(name, {}).update(parse_params([rest]))
+    return grouped
+
+
+def cmd_compare(args: argparse.Namespace) -> int:
+    from inferrail_bench import compare
+
+    workloads = args.workloads.split(",")
+    plan = compare.Plan(
+        workloads=tuple(workloads),
+        policies=tuple(args.policies.split(",")),
+        reps=args.reps,
+        requests=args.requests,
+        duration=args.duration,
+        rates=_rates(args.rate, workloads) if args.rate else dict(compare.RATES),
+        seed=args.seed,
+        warmup=args.warmup,
+        sims=args.sims,
+        sim_flags=tuple(args.sim_flag) if args.sim_flag else compare.SIM_FLAGS,
+        params=_compare_params(args.param) if args.param else compare.Plan().params,
+        profile="debug" if args.debug else "release",
+    )
+    written = compare.run(plan, args.out)
+    docs = [results.read(p) for p in written]
+    failed = sum(d["summary"].get("errors", 0) for d in docs)
+    print(f"{len(written)} runs written to {args.out}; {failed} failed requests")
     return 0
 
 
@@ -103,8 +176,27 @@ def parser() -> argparse.ArgumentParser:
     run.add_argument("--engine", action="append", default=[], help="engine URL for hit rates")
     run.add_argument("--label", default="", help="policy name to file the result under")
     run.add_argument("--sharegpt", help="ShareGPT JSON to replay as w2 conversations")
+    run.add_argument("--param", action="append", default=[], help="workload parameter, k=v")
     run.add_argument("--out", type=Path, required=True)
     run.set_defaults(handler=cmd_run)
+
+    cmp = sub.add_parser("compare", help="every policy on fresh simulators, same schedules")
+    cmp.add_argument("--workloads", default="w1,w2,w6")
+    cmp.add_argument("--policies", default="round_robin,random,least_request,p2c")
+    cmp.add_argument("--reps", type=int, default=3)
+    cmp.add_argument("--requests", type=int, help="per run; default rate times --duration")
+    cmp.add_argument("--duration", type=float, default=60.0, help="seconds of arrivals per run")
+    cmp.add_argument("--rate", help="one rate, or per workload as w1=12,w6=7")
+    cmp.add_argument("--seed", type=int, default=0)
+    cmp.add_argument("--warmup", type=float, default=10.0)
+    cmp.add_argument("--sims", type=int, default=3)
+    cmp.add_argument("--sim-flag", action="append", help="simulator flag, as --sim-flag=--x=y")
+    cmp.add_argument(
+        "--param", action="append", help="workload parameter, as w1.prompts=32; replaces defaults"
+    )
+    cmp.add_argument("--debug", action="store_true", help="use debug builds")
+    cmp.add_argument("--out", type=Path, required=True)
+    cmp.set_defaults(handler=cmd_compare)
 
     report = sub.add_parser("plot", help="charts and report.md from result files")
     report.add_argument("results", nargs="+", type=Path)

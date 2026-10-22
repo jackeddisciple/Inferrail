@@ -1,11 +1,9 @@
-import os
-import socket
 import subprocess
-import time
-import urllib.request
 from pathlib import Path
 
 import pytest
+
+from inferrail_bench import fleet
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 MODEL = "sim-model"
@@ -24,48 +22,28 @@ SIM_FLAGS = [
 ]
 
 
-def _free_port() -> int:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
-
-
-def _binary(variable: str, name: str) -> Path:
-    configured = os.environ.get(variable)
-    path = Path(configured) if configured else REPO_ROOT / "target" / "debug" / name
-    if not path.exists():
-        pytest.fail(f"{path} not found; run `cargo build -p {name}` or `make e2e`")
-    return path
+def _binary(name: str) -> Path:
+    try:
+        return fleet.binary(name)
+    except FileNotFoundError as err:
+        pytest.fail(f"{err} or `make e2e`")
 
 
 def _start(args: list[str], log_path: Path, health_url: str) -> subprocess.Popen:
-    log = log_path.open("wb")
-    process = subprocess.Popen(args, stdout=log, stderr=subprocess.STDOUT)
-    deadline = time.monotonic() + 15
-    while True:
-        try:
-            with urllib.request.urlopen(health_url, timeout=1) as reply:
-                if reply.status == 200:
-                    return process
-        except OSError:
-            if process.poll() is not None:
-                log.close()
-                pytest.fail(f"{args[0]} exited: {log_path.read_text()[-2000:]}")
-            if time.monotonic() > deadline:
-                process.kill()
-                pytest.fail(f"{args[0]} did not become healthy")
-            time.sleep(0.05)
+    try:
+        return fleet.start(args, log_path, health_url)
+    except RuntimeError as err:
+        pytest.fail(str(err))
 
 
-def _stop(process: subprocess.Popen) -> None:
-    process.terminate()
-    process.wait(timeout=10)
+_stop = fleet.stop
+_free_port = fleet.free_port
 
 
 def _sim(logs: Path, names: list[str]) -> tuple[subprocess.Popen, str]:
     port = _free_port()
     url = f"http://127.0.0.1:{port}"
-    args = [str(_binary("INFERRAIL_SIM_BIN", "inferrail-sim")), "--host", "127.0.0.1"]
+    args = [str(_binary("inferrail-sim")), "--host", "127.0.0.1"]
     args += ["--port", str(port), "--served-model-name", *names, *SIM_FLAGS]
     return _start(args, logs / f"sim-{port}.log", f"{url}/health"), url
 
@@ -100,7 +78,7 @@ def gateway_base_url(tmp_path_factory):
     config = logs / "gateway.yaml"
     config.write_text("\n".join(lines) + "\n")
     url = f"http://127.0.0.1:{port}"
-    binary = _binary("INFERRAIL_GATEWAY_BIN", "inferrail-gateway")
+    binary = _binary("inferrail-gateway")
     gateway = _start([str(binary), "--config", str(config)], logs / "gateway.log", f"{url}/health")
     yield url
     _stop(gateway)

@@ -1,6 +1,7 @@
 """Benchmark results as JSON: what was run, where, the summary, and every
 request in columns so analysis can be redone from the file alone."""
 
+import gzip
 import hashlib
 import json
 import math
@@ -81,14 +82,21 @@ def document(run: dict, env: dict, summary: dict, records: Sequence[Record]) -> 
 
 
 def write(path: str | Path, doc: dict) -> Path:
+    """Writes compact JSON, gzipped when the name ends in `.gz`."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(doc, indent=1, allow_nan=False) + "\n")
+    data = (json.dumps(doc, separators=(",", ":"), allow_nan=False) + "\n").encode()
+    if path.suffix == ".gz":
+        data = gzip.compress(data, mtime=0)
+    path.write_bytes(data)
     return path
 
 
 def read(path: str | Path) -> dict:
-    doc = json.loads(Path(path).read_text())
+    data = Path(path).read_bytes()
+    if Path(path).suffix == ".gz":
+        data = gzip.decompress(data)
+    doc = json.loads(data)
     if doc.get("schema") != SCHEMA:
         raise ValueError(f"{path}: unsupported schema {doc.get('schema')}")
     return doc

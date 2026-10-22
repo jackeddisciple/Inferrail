@@ -85,6 +85,9 @@ def test_documents_round_trip_with_environment(tmp_path):
     assert env["seed"] == 3
     assert env["commit"] is None or len(env["commit"]) == 40
     assert env["cpus"] >= 1
+    packed = results.write(tmp_path / "run.json.gz", doc)
+    assert packed.read_bytes()[:2] == b"\x1f\x8b"
+    assert results.read(packed) == again
     bad = tmp_path / "old.json"
     bad.write_text(json.dumps({"schema": 0}))
     with pytest.raises(ValueError, match="schema"):
@@ -126,6 +129,21 @@ def test_report_has_charts_and_a_row_per_policy(tmp_path):
     assert "0.40" in rows[0]
 
 
+def test_params_parse_numbers_and_group_by_workload():
+    assert cli.parse_params(["prompts=32", "rate=1.5", "name=x", "span=2,8"]) == {
+        "prompts": 32,
+        "rate": 1.5,
+        "name": "x",
+        "span": (2, 8),
+    }
+    assert cli._compare_params(["w1.prompts=4", "w1.user_tokens=7", "w2.sessions=3"]) == {
+        "w1": {"prompts": 4, "user_tokens": 7},
+        "w2": {"sessions": 3},
+    }
+    with pytest.raises(SystemExit):
+        cli.parse_params(["oops"])
+
+
 def test_cli_runs_a_workload_and_plots_it(tmp_path, capsys):
     server = Background(sse(first=0.01, gap=0.002, tokens=4))
     try:
@@ -147,6 +165,8 @@ def test_cli_runs_a_workload_and_plots_it(tmp_path, capsys):
                 "2",
                 "--label",
                 "p2c",
+                "--param",
+                "prompt_tokens=50,60",
                 "--out",
                 str(out),
             ]
@@ -157,6 +177,7 @@ def test_cli_runs_a_workload_and_plots_it(tmp_path, capsys):
     assert "40/40 ok" in capsys.readouterr().out
     doc = results.read(out)
     assert doc["run"]["policy"] == "p2c"
+    assert doc["run"]["params"] == {"prompt_tokens": [50, 60]}
     assert doc["summary"]["ok"] == 40
     assert doc["summary"]["hit_rate"] == pytest.approx(0.8)
     assert cli.main(["plot", str(out), "--out", str(tmp_path / "report")]) == 0

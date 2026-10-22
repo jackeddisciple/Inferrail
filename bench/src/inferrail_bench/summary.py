@@ -40,16 +40,17 @@ def _error_kind(record: Record) -> str:
 
 def summarize(records: Sequence[Record], warmup: float = 0.0, slo: Slo | None = None) -> dict:
     """Statistics over the requests scheduled at least `warmup` seconds after
-    the first one. Latencies count from each request's scheduled time."""
+    the first one. Latencies count from each request's scheduled time; rates
+    are per second of the arrival window, so a run where every request meets
+    the SLO has a goodput equal to its offered rate."""
     slo = slo or Slo()
     if not records:
         return {"requests": 0}
     start = min(r.scheduled for r in records)
     measured = [r for r in records if r.scheduled - start >= warmup]
     ok = [r for r in measured if r.ok]
-    ends = [r.end for r in measured if not math.isnan(r.end)]
-    first = min((r.scheduled for r in measured), default=start)
-    window = max(ends, default=first) - first
+    scheduled = [r.scheduled for r in measured]
+    window = max(scheduled, default=start) - min(scheduled, default=start)
 
     def rate(count: int) -> float:
         return count / window if window > 0 else 0.0
