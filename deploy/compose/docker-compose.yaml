@@ -1,0 +1,60 @@
+# Gateway, three simulated engines, Prometheus, Grafana and Jaeger.
+#   docker compose -f deploy/compose/docker-compose.yaml up --build
+# Gateway :8080, Grafana :3000, Prometheus :9091, Jaeger :16686.
+name: inferrail
+
+x-sim: &sim
+  image: inferrail:local
+  command:
+    - inferrail-sim
+    - --host=0.0.0.0
+    - --port=8000
+    - --served-model-name=inferrail/sim-8b
+    - --enable-prompt-tokens-details
+    - --prefill-token-us=40
+    - --decode-token-ms=10
+  restart: unless-stopped
+
+services:
+  sim-0:
+    <<: *sim
+    build:
+      context: ../..
+      dockerfile: deploy/compose/Dockerfile
+  sim-1: *sim
+  sim-2: *sim
+
+  gateway:
+    image: inferrail:local
+    command: [inferrail-gateway, --config=/etc/inferrail/gateway.yaml]
+    volumes:
+      - ./gateway.yaml:/etc/inferrail/gateway.yaml:ro
+    ports:
+      - "8080:8080"
+    depends_on: [sim-0, sim-1, sim-2, jaeger]
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v3.13.4
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9091:9090"
+
+  grafana:
+    image: grafana/grafana:13.0.11
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/inferrail.json
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../../dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3000:3000"
+    depends_on: [prometheus]
+
+  jaeger:
+    image: jaegertracing/jaeger:2.21.0
+    ports:
+      - "16686:16686"

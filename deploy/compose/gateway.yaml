@@ -1,0 +1,31 @@
+# The gateway inside the compose stack: three simulators, metrics on the
+# admin port for Prometheus and a tenth of requests traced to Jaeger.
+server:
+  listen: 0.0.0.0:8080
+  admin_listen: 0.0.0.0:9090
+
+models:
+  - name: inferrail/sim-8b
+    aliases: [sim]
+
+replicas:
+  - id: sim-0
+    url: http://sim-0:8000
+    models: [inferrail/sim-8b]
+  - id: sim-1
+    url: http://sim-1:8000
+    models: [inferrail/sim-8b]
+  - id: sim-2
+    url: http://sim-2:8000
+    models: [inferrail/sim-8b]
+
+routing:
+  default_policy: least_request
+
+health:
+  interval: 500ms
+  timeout: 250ms
+
+observability:
+  otlp_endpoint: http://jaeger:4318/v1/traces
+  trace_sample_ratio: 0.1

@@ -1,0 +1,16 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: inferrail-gateway
+    static_configs:
+      - targets: ["gateway:9090"]
+  - job_name: engines
+    static_configs:
+      - targets: ["sim-0:8000"]
+        labels: {replica: sim-0}
+      - targets: ["sim-1:8000"]
+        labels: {replica: sim-1}
+      - targets: ["sim-2:8000"]
+        labels: {replica: sim-2}

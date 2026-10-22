@@ -2,7 +2,7 @@ CARGO ?= cargo
 UV ?= uv
 NEXTEST := $(shell $(CARGO) nextest --version >/dev/null 2>&1 && echo "nextest run" || echo "test")
 
-.PHONY: check fmt lint audit test test-rust test-python bench e2e stress report
+.PHONY: check fmt lint audit test test-rust test-python bench e2e stress report stack stack-down
 
 check: fmt lint test
 
@@ -45,3 +45,11 @@ stress:
 
 report:
 	@echo "report: no benchmark results yet"
+
+COMPOSE := docker compose -f deploy/compose/docker-compose.yaml
+
+stack:
+	$(COMPOSE) up --build --detach
+
+stack-down:
+	$(COMPOSE) down

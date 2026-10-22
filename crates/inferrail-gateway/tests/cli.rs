@@ -34,6 +34,10 @@ fn check_accepts_shipped_configs_and_rejects_bad_ones() {
             "2 models, 3 replicas, 1 DNS groups",
         ),
         ("deploy/local.yaml", "1 models, 3 replicas, 0 DNS groups"),
+        (
+            "deploy/compose/gateway.yaml",
+            "1 models, 3 replicas, 0 DNS groups",
+        ),
     ] {
         let out = Command::new(BIN)
             .args(["--check", "--config"])

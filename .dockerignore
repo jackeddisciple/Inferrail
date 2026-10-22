@@ -1,0 +1,11 @@
+target
+.git
+bench/.venv
+bench/.pytest_cache
+bench/.ruff_cache
+bench/results
+bench/report
+bench/traces
+**/__pycache__
+**/.DS_Store
+*.pdf
