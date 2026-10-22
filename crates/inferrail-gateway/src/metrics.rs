@@ -252,13 +252,13 @@ impl Metrics {
         self.decision_log.clone()
     }
 
-    fn track(&self, replica: &ReplicaId, series: Series) {
-        self.series
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .entry(replica.clone())
-            .or_default()
-            .push(series);
+    /// Creates a series that names `replica` and tracks it under the lock
+    /// `prune` holds, so no series can appear after its replica was pruned
+    /// and then be forgotten.
+    fn create(&self, replica: &ReplicaId, series: Series, make: impl FnOnce()) {
+        let mut tracked = self.series.lock().unwrap_or_else(PoisonError::into_inner);
+        make();
+        tracked.entry(replica.clone()).or_default().push(series);
     }
 
     fn count(&self, family: &Family<RouteLabels, Counter>, labels: &RouteLabels, id: &ReplicaId) {
@@ -266,8 +266,9 @@ impl Metrics {
             counter.inc();
             return;
         }
-        self.track(id, Series::Route(labels.clone()));
-        family.get_or_create(labels).inc();
+        self.create(id, Series::Route(labels.clone()), || {
+            family.get_or_create(labels).inc();
+        });
     }
 
     fn observe(&self, family: &Histograms<RouteLabels>, routed: &Routed, value: Duration) {
@@ -276,8 +277,9 @@ impl Metrics {
             histogram.observe(value.as_secs_f64());
             return;
         }
-        self.track(&routed.replica, Series::Route(labels.clone()));
-        family.get_or_create(&labels).observe(value.as_secs_f64());
+        self.create(&routed.replica, Series::Route(labels.clone()), || {
+            family.get_or_create(&labels).observe(value.as_secs_f64());
+        });
     }
 
     pub fn decided(&self, routed: &Routed, took: Duration) {
@@ -311,10 +313,14 @@ impl Metrics {
             counter.inc();
             return;
         }
-        if let Some(replica) = replica {
-            self.track(replica, Series::Requests(labels.clone()));
+        match replica {
+            Some(replica) => self.create(replica, Series::Requests(labels.clone()), || {
+                self.requests.get_or_create(&labels).inc();
+            }),
+            None => {
+                self.requests.get_or_create(&labels).inc();
+            }
         }
-        self.requests.get_or_create(&labels).inc();
     }
 
     /// A proxied response ended: completely, broken by the engine, or
@@ -357,10 +363,13 @@ impl Metrics {
         let labels = ReplicaLabels {
             replica: Text::Replica(replica.clone()),
         };
-        if self.ejections.get(&labels).is_none() {
-            self.track(replica, Series::Ejections(labels.clone()));
+        if let Some(counter) = self.ejections.get(&labels) {
+            counter.inc();
+            return;
         }
-        self.ejections.get_or_create(&labels).inc();
+        self.create(replica, Series::Ejections(labels.clone()), || {
+            self.ejections.get_or_create(&labels).inc();
+        });
     }
 
     pub fn scraped(&self, replica: &ReplicaId, result: &'static str) {
@@ -372,16 +381,17 @@ impl Metrics {
             counter.inc();
             return;
         }
-        self.track(replica, Series::Scrapes(labels.clone()));
-        self.scrapes.get_or_create(&labels).inc();
+        self.create(replica, Series::Scrapes(labels.clone()), || {
+            self.scrapes.get_or_create(&labels).inc();
+        });
     }
 
     /// Drops every series that names a replica no longer in the fleet, so
     /// discovery churn cannot grow the page without bound.
     pub fn prune(&self) {
+        let mut series = self.series.lock().unwrap_or_else(PoisonError::into_inner);
         let fleet = self.fleet.snapshot();
         let live: HashSet<&str> = fleet.replicas().iter().map(|r| r.id().as_str()).collect();
-        let mut series = self.series.lock().unwrap_or_else(PoisonError::into_inner);
         series.retain(|replica, sets| {
             if live.contains(replica.as_str()) {
                 return true;
@@ -778,6 +788,55 @@ mod tests {
         assert!(!page.contains("pool-"), "{page}");
         assert!(page.len() < before + 4096, "{} vs {before}", page.len());
         assert!(m.series.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn recording_while_pruning_never_strands_a_series() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        let fleet = Arc::new(Registry::new(Vec::new()));
+        let m = Arc::new(metrics(&fleet));
+        let group = ReplicaId::new("pool").unwrap();
+        let (stop, generation) = (
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU64::new(0)),
+        );
+        let workers: Vec<_> = (0..4)
+            .map(|w| {
+                let (m, stop, generation) =
+                    (Arc::clone(&m), Arc::clone(&stop), Arc::clone(&generation));
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let g = generation.load(Ordering::Relaxed);
+                        let r = routed(&format!("pool-{g}-{}", w % 2));
+                        m.decided(&r, Duration::from_micros(1));
+                        m.finished(
+                            &r,
+                            Outcome::Complete(StatusCode::OK),
+                            Duration::from_millis(1),
+                        );
+                        m.ejected(&r.replica);
+                        m.scraped(&r.replica, "ok");
+                    }
+                })
+            })
+            .collect();
+        for g in 0..400u64 {
+            fleet.set_group(
+                &group,
+                (0..2)
+                    .map(|i| spec(&format!("pool-{g}-{i}"), Some("pool")))
+                    .collect(),
+            );
+            generation.store(g, Ordering::Relaxed);
+            m.prune();
+        }
+        stop.store(true, Ordering::Relaxed);
+        for w in workers {
+            w.join().unwrap();
+        }
+        fleet.set_group(&group, Vec::new());
+        let page = m.render();
+        assert_eq!(page.matches("pool-").count(), 0, "stranded series");
     }
 
     #[test]
