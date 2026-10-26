@@ -1162,6 +1162,19 @@ dependencies = [
 [[package]]
 name = "inferrail-calibrate"
 version = "0.1.7"
+dependencies = [
+ "anyhow",
+ "clap",
+ "inferrail-core",
+ "inferrail-load",
+ "inferrail-sim",
+ "proptest",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+]
 
 [[package]]
 name = "inferrail-control"

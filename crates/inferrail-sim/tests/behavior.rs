@@ -391,3 +391,50 @@ async fn a_request_finishes_at_its_last_token_not_at_done() {
     drop(frames);
     assert_eq!(sim.metrics().finished("abort"), 0);
 }
+
+#[tokio::test]
+async fn engine_ttft_on_an_idle_engine_is_exactly_the_latency_model() {
+    let latency = LatencyModel {
+        prefill_token_secs: 50e-6,
+        prefill_pair_secs: 2e-9,
+        prefill_fixed_secs: 3e-3,
+        decode_token_secs: 1e-3,
+    };
+    let sim = spawn(config(latency)).await;
+    let mut expected = 0.0;
+    for (i, len) in [64usize, 300, 1_000].into_iter().enumerate() {
+        let prompt: Vec<u32> = (0..len as u32)
+            .map(|t| (t * 7 + i as u32 * 40_000) % 120_000)
+            .collect();
+        let body = serde_json::json!({"model": "llama", "prompt": prompt, "max_tokens": 2});
+        let (status, reply) = sim.post_json("/v1/completions", &body).await;
+        assert_eq!(status, 200, "{reply}");
+        expected += latency.prefill_secs(len as u64, 0);
+    }
+    let text = sim
+        .client
+        .get(sim.url("/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let sum = |family: &str| -> f64 {
+        text.lines()
+            .find(|l| l.starts_with(&format!("{family}_sum{{")))
+            .and_then(|l| l.rsplit_once(' '))
+            .map(|(_, v)| v.parse().unwrap())
+            .unwrap_or_else(|| panic!("missing {family}"))
+    };
+    for family in [
+        "vllm:time_to_first_token_seconds",
+        "vllm:request_prefill_time_seconds",
+    ] {
+        let seen = sum(family);
+        assert!(
+            (seen - expected).abs() < 1e-6,
+            "{family}: {seen} vs {expected}"
+        );
+    }
+}

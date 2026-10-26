@@ -545,10 +545,14 @@ pub fn go_float(value: f64) -> String {
     repr
 }
 
+/// A request's engine side timeline. The first token counts from when the
+/// simulated GPU produced it, as vLLM stamps it in its engine core, not
+/// from when the timer woke the stream that sends it.
 #[derive(Debug, Clone, Copy)]
 struct Admitted {
     arrival: Instant,
     scheduled: Instant,
+    first_token_at: Instant,
     prompt: usize,
     cached: usize,
 }
@@ -577,6 +581,7 @@ impl RequestTracker {
         self.admitted = Some(Admitted {
             arrival: seq.arrival,
             scheduled: seq.scheduled,
+            first_token_at: seq.first_token_at,
             prompt: seq.prompt_tokens,
             cached: seq.cached_tokens,
         });
@@ -589,7 +594,7 @@ impl RequestTracker {
             (Some(last), _) => m.inter_token_latency.observe_duration(now - last),
             (None, Some(admitted)) => m
                 .time_to_first_token
-                .observe_duration(now - admitted.arrival),
+                .observe_duration(admitted.first_token_at - admitted.arrival),
             (None, None) => {}
         }
         self.first.get_or_insert(now);
@@ -610,8 +615,8 @@ impl RequestTracker {
         }
         let Some(a) = self.admitted else { return };
         let now = Instant::now();
-        let first = self.first.unwrap_or(now);
-        let last = self.last.unwrap_or(now);
+        let first = self.first.map_or(now, |_| a.first_token_at);
+        let last = self.last.unwrap_or(now).max(first);
         m.e2e_request_latency.observe_duration(now - a.arrival);
         m.request_queue_time
             .observe_duration(a.scheduled - a.arrival);
