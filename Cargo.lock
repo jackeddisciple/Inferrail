@@ -1260,6 +1260,7 @@ dependencies = [
  "inferrail-core",
  "proptest",
  "serde",
+ "xxhash-rust",
 ]
 
 [[package]]

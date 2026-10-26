@@ -11,6 +11,7 @@ publish.workspace = true
 [dependencies]
 inferrail-core.workspace = true
 serde.workspace = true
+xxhash-rust.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true

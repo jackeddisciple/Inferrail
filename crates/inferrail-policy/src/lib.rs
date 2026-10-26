@@ -7,15 +7,20 @@ use inferrail_core::ids::{BlockHash, ModelId, ReplicaId};
 use serde::Serialize;
 
 mod cost;
+mod hashing;
+mod kv_aware;
 mod least_request;
 mod p2c;
+mod prefix_hash;
 mod random;
 mod rng;
 mod round_robin;
 
 pub use cost::{CostModel, Estimate, Hits, Term};
+pub use kv_aware::KvAware;
 pub use least_request::LeastRequest;
 pub use p2c::P2c;
+pub use prefix_hash::PrefixHash;
 pub use random::Random;
 pub use rng::{SplitMix, mix_seed};
 pub use round_robin::RoundRobin;
@@ -264,11 +269,10 @@ impl Settings {
     }
 }
 
-/// Whether `kind` has its own implementation yet. The cache aware kinds
-/// route by their documented degraded path, power of two choices, until
-/// they land.
+/// Whether `kind` has its own implementation yet. The cost model routes by
+/// its documented degraded path, power of two choices, until it lands.
 pub const fn is_native(kind: PolicyKind) -> bool {
-    !kind.is_cache_aware()
+    !matches!(kind, PolicyKind::CostModel)
 }
 
 pub fn build(kind: PolicyKind, settings: &Settings) -> Box<dyn RoutingPolicy> {
@@ -278,12 +282,12 @@ pub fn build(kind: PolicyKind, settings: &Settings) -> Box<dyn RoutingPolicy> {
         PolicyKind::Random => Box::new(Random::new(seed)),
         PolicyKind::LeastRequest => Box::new(LeastRequest::new(seed)),
         PolicyKind::P2c => Box::new(P2c::new(seed)),
-        PolicyKind::PrefixHash | PolicyKind::KvAware | PolicyKind::CostModel => {
-            Box::new(Degraded {
-                kind,
-                fallback: P2c::new(seed),
-            })
-        }
+        PolicyKind::PrefixHash => Box::new(PrefixHash::new(settings.prefix_blocks, seed)),
+        PolicyKind::KvAware => Box::new(KvAware::new(&settings.kv_aware, seed)),
+        PolicyKind::CostModel => Box::new(Degraded {
+            kind,
+            fallback: P2c::new(seed),
+        }),
     }
 }
 
@@ -307,6 +311,26 @@ impl RoutingPolicy for Degraded {
     }
 }
 
+/// An index below `len` that `keep` accepts, drawn uniformly by `rng`;
+/// `None` when it accepts none.
+pub(crate) fn pick_among(
+    rng: &SplitMix,
+    len: usize,
+    mut keep: impl FnMut(usize) -> bool,
+) -> Option<usize> {
+    let mut chosen = None;
+    let mut seen = 0;
+    for i in 0..len {
+        if keep(i) {
+            seen += 1;
+            if seen == 1 || rng.below(seen) == 0 {
+                chosen = Some(i);
+            }
+        }
+    }
+    chosen
+}
+
 #[cfg(test)]
 mod tests {
     use super::testing::Pool;
@@ -324,11 +348,7 @@ mod tests {
     fn kinds_without_an_implementation_fall_back_to_p2c_choices() {
         let pool = Pool::new(6);
         let candidates = pool.candidates(&[3, 1, 4, 1, 5, 9]);
-        for kind in [
-            PolicyKind::PrefixHash,
-            PolicyKind::KvAware,
-            PolicyKind::CostModel,
-        ] {
+        for kind in [PolicyKind::CostModel] {
             let (degraded, p2c) = (build(kind, &Settings::seeded(77)), P2c::new(77));
             assert!(!is_native(kind));
             for _ in 0..200 {
@@ -365,6 +385,21 @@ mod tests {
         assert_eq!(mix_seed(1, "llama"), mix_seed(1, "llama"));
         assert_ne!(mix_seed(1, "llama"), mix_seed(1, "qwen"));
         assert_ne!(mix_seed(1, "llama"), mix_seed(2, "llama"));
+    }
+
+    #[test]
+    fn pick_among_is_uniform_over_what_it_keeps() {
+        let rng = SplitMix::new(5);
+        let mut counts = [0u64; 6];
+        for _ in 0..30_000 {
+            let i = pick_among(&rng, 6, |i| i % 2 == 0).unwrap();
+            counts[i] += 1;
+        }
+        assert_eq!((counts[1], counts[3], counts[5]), (0, 0, 0));
+        let kept = [counts[0], counts[2], counts[4]];
+        let stat = testing::chi_square(&kept);
+        assert!(stat < 13.82, "chi square {stat} for {kept:?}");
+        assert_eq!(pick_among(&rng, 4, |_| false), None);
     }
 
     fn loads() -> impl Strategy<Value = Vec<u32>> {
@@ -465,5 +500,14 @@ pub(crate) mod testing {
             .iter()
             .map(|&c| (c as f64 - expected).powi(2) / expected)
             .sum()
+    }
+
+    pub(crate) fn chain(seed: u64, len: usize) -> Vec<BlockHash> {
+        (0..len as u64)
+            .map(|i| {
+                let x = (seed << 32 | i).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+                BlockHash::new(u128::from(x) << 64 | u128::from(x.rotate_left(29) ^ i))
+            })
+            .collect()
     }
 }
