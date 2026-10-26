@@ -12,6 +12,7 @@ use inferrail_control::{Clock, Registry};
 use inferrail_core::config::PolicyKind;
 use inferrail_core::ids::{ModelId, ReplicaId};
 use inferrail_index::KvIndex;
+use inferrail_policy::{Choice, Estimate};
 use inferrail_tokenize::CacheStats;
 use prometheus_client::collector::Collector;
 use prometheus_client::encoding::{
@@ -124,6 +125,24 @@ struct ScrapeLabels {
     result: Text,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, EncodeLabelSet)]
+struct ModelPolicyLabels {
+    model: Text,
+    policy: Text,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, EncodeLabelSet)]
+struct GuardLabels {
+    model: Text,
+    guard: Text,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, EncodeLabelSet)]
+struct SteerLabels {
+    model: Text,
+    reason: Text,
+}
+
 type Histograms<S> = Family<S, Histogram, fn() -> Histogram>;
 
 /// A label set that names a replica, kept so it can be removed when the
@@ -176,6 +195,9 @@ pub struct Metrics {
     prompt_tokens: Family<ModelLabels, Counter>,
     predicted_tokens: Family<ModelLabels, Counter>,
     index_resets: Family<ReplicaLabels, Counter>,
+    estimated_ttft: Histograms<ModelPolicyLabels>,
+    guards: Family<GuardLabels, Counter>,
+    steered: Family<SteerLabels, Counter>,
     series: Mutex<HashMap<ReplicaId, Vec<Series>>>,
 }
 
@@ -205,6 +227,9 @@ impl Metrics {
             prompt_tokens: Family::default(),
             predicted_tokens: Family::default(),
             index_resets: Family::default(),
+            estimated_ttft: histograms(|| Histogram::new(TTFT_BUCKETS)),
+            guards: Family::default(),
+            steered: Family::default(),
             series: Mutex::default(),
         };
         let mut registry = MetricRegistry::default();
@@ -306,6 +331,43 @@ impl Metrics {
             "Times a replica's predicted cache was dropped because its engine restarted.",
             this.index_resets.clone(),
         );
+        registry.register(
+            "inferrail_estimated_ttft_seconds",
+            "The cost model's estimate of time to first token on the chosen replica, at every routing decision.",
+            this.estimated_ttft.clone(),
+        );
+        registry.register(
+            "inferrail_routing_guards",
+            "Routing decisions where a load guard set candidates aside, or kv_waived when every candidate was under KV pressure.",
+            this.guards.clone(),
+        );
+        registry.register(
+            "inferrail_routing_steered",
+            "Routing decisions steered beyond the policy's plain rule: by session affinity, to a hot prefix owner, or by a fallback for prompts without a full block.",
+            this.steered.clone(),
+        );
+        for (model, policy) in &fleet.policies {
+            let (guards, steers): (&[&'static str], &[&'static str]) = match policy {
+                PolicyKind::CostModel => (
+                    &["bounded_load", "kv_pressure", "kv_waived"],
+                    &["session", "hot_prefix"],
+                ),
+                PolicyKind::PrefixHash => (&[], &["no_prefix"]),
+                _ => (&[], &[]),
+            };
+            for guard in guards {
+                let _ = this.guards.get_or_create(&GuardLabels {
+                    model: Text::Model(model.clone()),
+                    guard: Text::Fixed(guard),
+                });
+            }
+            for reason in steers {
+                let _ = this.steered.get_or_create(&SteerLabels {
+                    model: Text::Model(model.clone()),
+                    reason: Text::Fixed(reason),
+                });
+            }
+        }
         registry.register_collector(Box::new(fleet));
         Self { registry, ..this }
     }
@@ -379,6 +441,41 @@ impl Metrics {
                     })
                     .inc_by(count);
             }
+        }
+    }
+
+    /// What shaped a decision besides the policy's rule, and the cost
+    /// model's estimate for its replica.
+    pub fn steered(&self, routed: &Routed, choice: &Choice, estimate: Estimate) {
+        let model = Text::Model(routed.model.clone());
+        self.estimated_ttft
+            .get_or_create(&ModelPolicyLabels {
+                model: model.clone(),
+                policy: Text::Fixed(routed.policy.as_str()),
+            })
+            .observe(estimate.ttft_secs);
+        let guarded = choice.guarded;
+        for (guard, applied) in [
+            ("bounded_load", guarded.bounded_load > 0),
+            ("kv_pressure", guarded.kv_pressure > 0),
+            ("kv_waived", guarded.kv_waived),
+        ] {
+            if applied {
+                self.guards
+                    .get_or_create(&GuardLabels {
+                        model: model.clone(),
+                        guard: Text::Fixed(guard),
+                    })
+                    .inc();
+            }
+        }
+        if let Some(steer) = choice.steer {
+            self.steered
+                .get_or_create(&SteerLabels {
+                    model,
+                    reason: Text::Fixed(steer.as_str()),
+                })
+                .inc();
         }
     }
 
@@ -603,12 +700,13 @@ struct Row {
     id: ReplicaId,
     healthy: bool,
     ejected: bool,
+    queued: Duration,
     load: inferrail_load::ReplicaLoad,
 }
 
 type Gauge = (&'static str, &'static str, fn(&Row) -> Option<f64>);
 
-const GAUGES: [Gauge; 11] = [
+const GAUGES: [Gauge; 12] = [
     (
         "inferrail_replica_healthy",
         "1 while the replica passes its health checks.",
@@ -638,6 +736,11 @@ const GAUGES: [Gauge; 11] = [
         "inferrail_replica_prefill_tokens",
         "Estimated prompt tokens still waiting for their first response byte.",
         |r| Some(r.load.prefill_tokens as f64),
+    ),
+    (
+        "inferrail_replica_queued_seconds",
+        "Prefill work the gateway estimates is queued on the replica.",
+        |r| Some(r.queued.as_secs_f64()),
     ),
     (
         "inferrail_replica_engine_running",
@@ -697,6 +800,7 @@ impl Collector for FleetGauges {
                 id: r.id().clone(),
                 healthy: r.health().probe_up(),
                 ejected: r.health().is_ejected(now),
+                queued: r.queued(now),
                 load: r.load(instant, self.max_age),
             })
             .collect();

@@ -5,6 +5,8 @@ use std::time::Duration;
 
 use common::*;
 use futures::StreamExt;
+use inferrail_core::config::PolicyKind;
+use inferrail_core::ids::ModelId;
 use inferrail_load::parse::{name, sample};
 use inferrail_sim::latency::LatencyModel;
 use serde_json::json;
@@ -48,6 +50,18 @@ async fn metric_names_and_labels() {
         &format!("{FAST_HEALTH}routing:\n  default_policy: round_robin\nload:\n  max_age: 5s\n"),
     );
     config.models[0].tokenizer = Some("builtin:sim".to_owned());
+    for (name, policy) in [
+        ("model-b", PolicyKind::CostModel),
+        ("model-c", PolicyKind::PrefixHash),
+    ] {
+        let mut other = config.models[0].clone();
+        other.name = ModelId::new(name).unwrap();
+        other.policy = Some(policy);
+        for replica in &mut config.replicas {
+            replica.models.push(other.name.clone());
+        }
+        config.models.push(other);
+    }
     let gw = TestGateway::start(config).await;
     let admin = serve_admin(&gw.gateway).await;
     gw.stream(&streaming(chat("one", 3))).await;

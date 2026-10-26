@@ -4,7 +4,7 @@ use std::time::Duration;
 use inferrail_control::{Lease, Nanos, Registry, Replica};
 use inferrail_core::ids::{ModelId, ReplicaId};
 use inferrail_index::{KvIndex, Slot};
-use inferrail_policy::{Candidate, CostModel, Hits, RouteContext, RoutingPolicy};
+use inferrail_policy::{Candidate, Choice, CostModel, Estimate, Hits, RouteContext, RoutingPolicy};
 use tokio::time::Instant;
 
 use crate::errors::GatewayError;
@@ -21,6 +21,10 @@ pub(crate) struct Selected {
     pub(crate) cached_tokens: Option<u32>,
     /// Each offered replica's prediction, when asked for and made.
     pub(crate) predictions: Vec<(ReplicaId, u32)>,
+    pub(crate) choice: Choice,
+    /// The cost model's estimate on the chosen replica, from what it is
+    /// predicted to hold. Its prefill is what the replica's queue grew by.
+    pub(crate) estimate: Estimate,
 }
 
 /// What a routing decision knows about the request.
@@ -160,6 +164,8 @@ pub(crate) fn select(
                 offered,
                 cached_tokens: made.then_some(cached[i]),
                 predictions,
+                choice,
+                estimate,
             });
         }
         eligible.remove(i);

@@ -88,10 +88,13 @@ async fn every_decision_is_logged_with_candidates_and_never_the_prompt() {
             "candidates",
             "chosen",
             "decision_ns",
+            "estimated_ttft_ms",
+            "guarded",
             "model",
             "policy",
             "prompt_tokens",
             "request_id",
+            "steer",
             "ts_ms"
         ])
     );

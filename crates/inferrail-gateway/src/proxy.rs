@@ -9,6 +9,7 @@ use hyper::http::request::Parts;
 use hyper::{Method, Request, Response, StatusCode};
 use inferrail_control::{Lease, Nanos, Replica};
 use inferrail_core::ids::{ModelId, ReplicaId};
+use inferrail_policy::Steer;
 use inferrail_tokenize::Endpoint;
 use tokio::time::{Instant, sleep, timeout, timeout_at};
 use tracing::field::Empty;
@@ -245,6 +246,8 @@ async fn attempt(
             inferrail.decision_ns = Empty,
             inferrail.prompt_tokens = Empty,
             inferrail.cached_tokens = Empty,
+            inferrail.estimated_ttft_ms = Empty,
+            inferrail.steer = Empty,
         );
         let now = shared.clock.now();
         let seen_by_policy = sampled.map(|_| {
@@ -298,6 +301,9 @@ async fn attempt(
             replica: lease.replica().id().clone(),
         };
         shared.metrics.decided(&routed, took);
+        shared
+            .metrics
+            .steered(&routed, &selected.choice, selected.estimate);
         if let Some(prediction) = prediction {
             shared.metrics.predicted(&model, prediction);
         }
@@ -318,11 +324,21 @@ async fn attempt(
                 chosen: routed.replica.clone(),
                 decision_ns: u64::try_from(took.as_nanos()).unwrap_or(u64::MAX),
                 prompt_tokens: prediction.map(|p| p.prompt_tokens),
+                estimated_ttft_ms: selected.estimate.ttft_secs * 1e3,
+                steer: selected.choice.steer.map(Steer::as_str),
+                guarded: selected.choice.guarded,
                 candidates: seen,
             });
         }
         if !route_span.is_disabled() {
             describe(&route_span, shared, &lease, candidates, took, prediction);
+            route_span.record(
+                "inferrail.estimated_ttft_ms",
+                selected.estimate.ttft_secs * 1e3,
+            );
+            if let Some(steer) = selected.choice.steer {
+                route_span.record("inferrail.steer", steer.as_str());
+            }
         }
         drop(route_span);
         if attempt > 0 {

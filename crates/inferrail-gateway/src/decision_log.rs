@@ -10,6 +10,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use inferrail_control::{Fleet, Nanos};
 use inferrail_core::ids::{ModelId, ReplicaId};
+use inferrail_policy::Guarded;
 use prometheus_client::metrics::counter::Counter;
 use serde::Serialize;
 use xxhash_rust::xxh3::xxh3_64;
@@ -27,6 +28,8 @@ pub(crate) struct CandidateState {
     pub(crate) pending: u32,
     pub(crate) in_flight_tokens: u64,
     pub(crate) prefill_tokens: u64,
+    /// Prefill the gateway estimates is queued on it.
+    pub(crate) queued_ms: f64,
     pub(crate) engine_running: Option<u32>,
     pub(crate) engine_waiting: Option<u32>,
     pub(crate) engine_kv_usage: Option<f64>,
@@ -45,6 +48,10 @@ pub(crate) struct Decision {
     pub(crate) chosen: ReplicaId,
     pub(crate) decision_ns: u64,
     pub(crate) prompt_tokens: Option<u32>,
+    /// The cost model's estimate of time to first token on the winner.
+    pub(crate) estimated_ttft_ms: f64,
+    pub(crate) steer: Option<&'static str>,
+    pub(crate) guarded: Guarded,
     pub(crate) candidates: Vec<CandidateState>,
 }
 
@@ -72,6 +79,7 @@ pub(crate) fn candidates(
                 pending: load.pending,
                 in_flight_tokens: load.in_flight_tokens,
                 prefill_tokens: load.prefill_tokens,
+                queued_ms: r.queued(now).as_secs_f64() * 1e3,
                 engine_running: load.engine.map(|e| e.running),
                 engine_waiting: load.engine.map(|e| e.waiting),
                 engine_kv_usage: load.engine.map(|e| e.kv_usage),
@@ -207,6 +215,9 @@ mod tests {
             chosen: ReplicaId::new("r0").unwrap(),
             decision_ns: 100,
             prompt_tokens: None,
+            estimated_ttft_ms: 5.0,
+            steer: None,
+            guarded: Guarded::default(),
             candidates: Vec::new(),
         }
     }
