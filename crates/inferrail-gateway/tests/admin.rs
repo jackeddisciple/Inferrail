@@ -43,11 +43,12 @@ async fn metric_names_and_labels() {
         .await,
         Upstream::zero(&[MODEL]).await,
     ];
-    let gw = TestGateway::start(fleet(
+    let mut config = fleet(
         &urls(&[&sims[0], &sims[1]]),
         &format!("{FAST_HEALTH}routing:\n  default_policy: round_robin\nload:\n  max_age: 5s\n"),
-    ))
-    .await;
+    );
+    config.models[0].tokenizer = Some("builtin:sim".to_owned());
+    let gw = TestGateway::start(config).await;
     let admin = serve_admin(&gw.gateway).await;
     gw.stream(&streaming(chat("one", 3))).await;
     let (status, _) = gw.post_json("/v1/chat/completions", &chat("two", 3)).await;

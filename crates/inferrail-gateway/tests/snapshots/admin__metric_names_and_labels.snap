@@ -7,8 +7,12 @@ TYPE inferrail_client_disconnects counter
 TYPE inferrail_decision_log_dropped counter
 TYPE inferrail_decision_log_records counter
 TYPE inferrail_ejections counter
+TYPE inferrail_index_bytes gauge
+TYPE inferrail_index_entries gauge
 TYPE inferrail_load_scrapes counter
 TYPE inferrail_model_policy gauge
+TYPE inferrail_predicted_cached_tokens counter
+TYPE inferrail_prompt_tokens counter
 TYPE inferrail_replica_ejected gauge
 TYPE inferrail_replica_engine_kv_usage gauge
 TYPE inferrail_replica_engine_prefix_cache_hits counter
@@ -18,6 +22,8 @@ TYPE inferrail_replica_engine_waiting gauge
 TYPE inferrail_replica_healthy gauge
 TYPE inferrail_replica_in_flight gauge
 TYPE inferrail_replica_in_flight_tokens gauge
+TYPE inferrail_replica_index_blocks gauge
+TYPE inferrail_replica_index_capacity_blocks gauge
 TYPE inferrail_replica_load_age_seconds gauge
 TYPE inferrail_replica_load_stale gauge
 TYPE inferrail_replica_pending gauge
@@ -27,6 +33,9 @@ TYPE inferrail_request_errors counter
 TYPE inferrail_requests counter
 TYPE inferrail_routing_decision_seconds histogram
 TYPE inferrail_routing_decisions counter
+TYPE inferrail_tokenize_cache_lookups counter
+TYPE inferrail_tokenize_seconds histogram
+TYPE inferrail_tokenized_requests counter
 TYPE inferrail_ttft_seconds histogram
 TYPE inferrail_upstream_retries counter
 inferrail_build_info{version}
@@ -34,8 +43,12 @@ inferrail_client_disconnects_total{model}
 inferrail_decision_log_dropped_total{}
 inferrail_decision_log_records_total{}
 inferrail_ejections_total{replica}
+inferrail_index_bytes{}
+inferrail_index_entries{}
 inferrail_load_scrapes_total{replica,result}
 inferrail_model_policy{model,policy}
+inferrail_predicted_cached_tokens_total{model}
+inferrail_prompt_tokens_total{model}
 inferrail_replica_ejected{replica}
 inferrail_replica_engine_kv_usage{replica}
 inferrail_replica_engine_prefix_cache_hits_total{replica}
@@ -45,6 +58,8 @@ inferrail_replica_engine_waiting{replica}
 inferrail_replica_healthy{replica}
 inferrail_replica_in_flight_tokens{replica}
 inferrail_replica_in_flight{replica}
+inferrail_replica_index_blocks{replica}
+inferrail_replica_index_capacity_blocks{replica}
 inferrail_replica_load_age_seconds{replica}
 inferrail_replica_load_stale{replica}
 inferrail_replica_pending{replica}
@@ -58,6 +73,11 @@ inferrail_routing_decision_seconds_bucket{policy}
 inferrail_routing_decision_seconds_count{policy}
 inferrail_routing_decision_seconds_sum{policy}
 inferrail_routing_decisions_total{model,policy,replica}
+inferrail_tokenize_cache_lookups_total{model,result}
+inferrail_tokenize_seconds_bucket{model}
+inferrail_tokenize_seconds_count{model}
+inferrail_tokenize_seconds_sum{model}
+inferrail_tokenized_requests_total{model,result}
 inferrail_ttft_seconds_bucket{model,policy,replica}
 inferrail_ttft_seconds_count{model,policy,replica}
 inferrail_ttft_seconds_sum{model,policy,replica}

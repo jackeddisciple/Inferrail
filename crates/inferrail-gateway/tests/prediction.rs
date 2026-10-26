@@ -112,6 +112,8 @@ async fn predictions_equal_what_the_engines_cached() {
     for name in [
         "inferrail_prompt_tokens_total",
         "inferrail_predicted_cached_tokens_total",
+        "inferrail_replica_index_blocks",
+        "inferrail_index_entries",
         "inferrail_tokenize_seconds",
     ] {
         assert!(page.contains(name), "{name} missing");
@@ -149,6 +151,80 @@ async fn streams_and_completions_carry_predictions() {
     let ids = json!({"model": MODEL, "prompt": (0..100).collect::<Vec<u32>>(), "max_tokens": 1});
     let response = gw.post("/v1/completions", &ids).await;
     assert_eq!(header(&response, "x-inferrail-prompt-tokens"), Some(100));
+}
+
+#[tokio::test]
+async fn capacity_is_learned_from_the_engine() {
+    let upstream = Upstream::spawn(sim(40)).await;
+    let gw = TestGateway::start(tokenized(fleet(
+        &urls(&[&upstream]),
+        &format!("{FAST_HEALTH}load:\n  scrape_interval: 20ms\n  scrape_timeout: 20ms\n  max_age: 100ms\n"),
+    )))
+    .await;
+    let replica = gw.replica("r0");
+    wait_until(Duration::from_secs(3), || {
+        replica.engine_load().latest().is_some()
+    })
+    .await;
+    for i in 0..60u64 {
+        let seen = send(&gw, &shared_prompt(i % 3, i)).await;
+        assert_eq!(seen.cached.0, Some(seen.cached.1), "#{i}: {seen:?}");
+    }
+    let page = gw.gateway.render_metrics();
+    assert!(
+        page.contains("inferrail_replica_index_capacity_blocks{replica=\"r0\"} 40"),
+        "{page}"
+    );
+}
+
+#[tokio::test]
+async fn an_engine_that_restarts_is_forgotten() {
+    let upstream = Upstream::spawn(sim(1_000)).await;
+    let addr = upstream.addr;
+    let gw = TestGateway::start(tokenized(fleet(
+        &urls(&[&upstream]),
+        &format!("{FAST_HEALTH}load:\n  scrape_interval: 20ms\n  scrape_timeout: 20ms\n  max_age: 100ms\n"),
+    )))
+    .await;
+    let replica = gw.replica("r0");
+    let body = shared_prompt(3, 3);
+    send(&gw, &body).await;
+    assert!(send(&gw, &body).await.cached.0.unwrap() > 0);
+    let before = replica.engine_load().latest().unwrap().at;
+    wait_until(Duration::from_secs(3), || {
+        replica
+            .engine_load()
+            .latest()
+            .is_some_and(|s| s.at > before && s.load.prefix_hits > 0)
+    })
+    .await;
+    upstream.kill();
+    let listener = loop {
+        match tokio::net::TcpListener::bind(addr).await {
+            Ok(listener) => break listener,
+            Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+        }
+    };
+    let _fresh = Upstream::spawn_on(listener, sim(1_000));
+    let waited = wait_until(Duration::from_secs(5), || {
+        gw.gateway
+            .render_metrics()
+            .contains("inferrail_index_resets_total{replica=\"r0\"} 1")
+    })
+    .await;
+    assert!(
+        waited < Duration::from_secs(5),
+        "the restart was never noticed"
+    );
+    wait_until(Duration::from_secs(5), || {
+        replica.is_routable(gw.gateway.clock().now())
+    })
+    .await;
+    let after = send(&gw, &body).await;
+    assert_eq!(after.cached, (Some(0), 0));
+    let again = send(&gw, &body).await;
+    assert_eq!(again.cached.0, Some(again.cached.1));
+    assert!(again.cached.1 > 0);
 }
 
 #[tokio::test]

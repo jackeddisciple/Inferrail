@@ -9,7 +9,8 @@ use hyper_util::rt::{TokioExecutor, TokioTimer};
 use inferrail_control::{Probe, Replica};
 use inferrail_core::config::UpstreamConfig;
 use inferrail_core::openai::ModelList;
-use inferrail_load::{EngineLoad, Scrape, ScrapeError};
+use inferrail_index::KvIndex;
+use inferrail_load::{EngineLoad, Scrape, ScrapeError, Target};
 
 use crate::metrics::Metrics;
 
@@ -82,11 +83,18 @@ impl Probe for HttpProbe {
 
 const MAX_METRICS_PAGE: usize = 4 << 20;
 
-/// `GET /metrics`, read as vLLM or SGLang load.
+/// `GET /metrics`, read as vLLM or SGLang load. An engine whose prefix cache
+/// counters went backwards restarted with an empty cache, so whatever the
+/// index predicted for it is dropped.
 #[derive(Debug, Clone)]
 pub(crate) struct HttpScrape {
     pub(crate) client: Client,
     pub(crate) metrics: Arc<Metrics>,
+    pub(crate) index: Option<Arc<KvIndex>>,
+}
+
+pub(crate) fn restarted(before: &EngineLoad, now: &EngineLoad) -> bool {
+    now.prefix_queries < before.prefix_queries || now.prefix_hits < before.prefix_hits
 }
 
 impl Scrape<Replica> for HttpScrape {
@@ -121,5 +129,45 @@ impl Scrape<Replica> for HttpScrape {
     fn observed(&self, replica: &Replica, result: &Result<EngineLoad, ScrapeError>) {
         let kind = result.as_ref().map_or_else(ScrapeError::kind, |_| "ok");
         self.metrics.scraped(replica.id(), kind);
+        let (Some(index), Ok(load)) = (&self.index, result) else {
+            return;
+        };
+        let restart = replica
+            .cell()
+            .latest()
+            .is_some_and(|before| restarted(&before.load, load));
+        if restart && let Some(slot) = index.find(replica.id()) {
+            index.clear(slot);
+            self.metrics.index_reset(replica.id());
+            tracing::info!(replica = %replica.id(), "engine restarted; forgetting what it had cached");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use inferrail_load::Engine;
+
+    fn load(queries: u64, hits: u64) -> EngineLoad {
+        EngineLoad {
+            engine: Engine::Vllm,
+            running: 0,
+            waiting: 0,
+            kv_usage: 0.0,
+            prefix_queries: queries,
+            prefix_hits: hits,
+            preemptions: 0,
+            kv_capacity_tokens: None,
+        }
+    }
+
+    #[test]
+    fn counters_going_backwards_mean_a_restart() {
+        assert!(!restarted(&load(10, 5), &load(10, 5)));
+        assert!(!restarted(&load(10, 5), &load(20, 9)));
+        assert!(restarted(&load(10, 5), &load(3, 5)));
+        assert!(restarted(&load(10, 5), &load(12, 0)));
+        assert!(!restarted(&load(0, 0), &load(0, 0)));
     }
 }

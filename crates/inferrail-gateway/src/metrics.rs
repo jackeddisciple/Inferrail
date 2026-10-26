@@ -11,6 +11,8 @@ use hyper::StatusCode;
 use inferrail_control::{Clock, Registry};
 use inferrail_core::config::PolicyKind;
 use inferrail_core::ids::{ModelId, ReplicaId};
+use inferrail_index::KvIndex;
+use inferrail_tokenize::ModelTokenizer;
 use prometheus_client::collector::Collector;
 use prometheus_client::encoding::{
     DescriptorEncoder, EncodeLabelSet, EncodeLabelValue, EncodeMetric, LabelValueEncoder,
@@ -132,6 +134,7 @@ enum Series {
     Route(RouteLabels),
     Ejections(ReplicaLabels),
     Scrapes(ScrapeLabels),
+    Resets(ReplicaLabels),
 }
 
 /// Which request this is, for the metrics recorded when its body ends.
@@ -171,6 +174,7 @@ pub struct Metrics {
     tokenize_time: Histograms<ModelLabels>,
     prompt_tokens: Family<ModelLabels, Counter>,
     predicted_tokens: Family<ModelLabels, Counter>,
+    index_resets: Family<ReplicaLabels, Counter>,
     series: Mutex<HashMap<ReplicaId, Vec<Series>>>,
 }
 
@@ -198,6 +202,7 @@ impl Metrics {
             tokenize_time: histograms(|| Histogram::new(TOKENIZE_BUCKETS)),
             prompt_tokens: Family::default(),
             predicted_tokens: Family::default(),
+            index_resets: Family::default(),
             series: Mutex::default(),
         };
         let mut registry = MetricRegistry::default();
@@ -281,6 +286,11 @@ impl Metrics {
             "Prompt tokens the KV index predicted the chosen replica had cached, at every routing decision.",
             this.predicted_tokens.clone(),
         );
+        registry.register(
+            "inferrail_index_resets",
+            "Times a replica's predicted cache was dropped because its engine restarted.",
+            this.index_resets.clone(),
+        );
         registry.register_collector(Box::new(fleet));
         Self { registry, ..this }
     }
@@ -353,6 +363,19 @@ impl Metrics {
         self.predicted_tokens
             .get_or_create(&labels)
             .inc_by(u64::from(prediction.cached_tokens));
+    }
+
+    pub fn index_reset(&self, replica: &ReplicaId) {
+        let labels = ReplicaLabels {
+            replica: Text::Replica(replica.clone()),
+        };
+        if let Some(counter) = self.index_resets.get(&labels) {
+            counter.inc();
+            return;
+        }
+        self.create(replica, Series::Resets(labels.clone()), || {
+            self.index_resets.get_or_create(&labels).inc();
+        });
     }
 
     pub fn retried(&self, model: &ModelId) {
@@ -476,6 +499,9 @@ impl Metrics {
                     Series::Scrapes(labels) => {
                         self.scrapes.remove(&labels);
                     }
+                    Series::Resets(labels) => {
+                        self.index_resets.remove(&labels);
+                    }
                 }
             }
             false
@@ -537,6 +563,8 @@ pub struct FleetGauges {
     pub clock: Clock,
     pub max_age: Duration,
     pub policies: Vec<(ModelId, PolicyKind)>,
+    pub index: Option<Arc<KvIndex>>,
+    pub tokenizers: Vec<(ModelId, Arc<ModelTokenizer>)>,
 }
 
 struct Row {
@@ -658,6 +686,8 @@ impl Collector for FleetGauges {
                 }
             }
         }
+        self.encode_index(&mut encoder, &rows)?;
+        self.encode_tokenizers(&mut encoder)?;
         let mut info = encoder.encode_descriptor(
             "inferrail_model_policy",
             "1 for the routing policy each model uses.",
@@ -679,6 +709,79 @@ impl Collector for FleetGauges {
         )?;
         let labels = [("version", env!("CARGO_PKG_VERSION"))];
         ConstGauge::new(1i64).encode(build.encode_family(&labels)?)?;
+        Ok(())
+    }
+}
+
+impl FleetGauges {
+    fn encode_index(&self, encoder: &mut DescriptorEncoder<'_>, rows: &[Row]) -> fmt::Result {
+        let Some(index) = &self.index else {
+            return Ok(());
+        };
+        let stats = index.stats();
+        let held: HashMap<&str, (usize, usize)> = stats
+            .replicas
+            .iter()
+            .map(|r| (r.replica.as_str(), (r.blocks, r.capacity)))
+            .collect();
+        for (name, help, pick) in [
+            (
+                "inferrail_replica_index_blocks",
+                "KV blocks the index predicts the replica holds.",
+                (|h: (usize, usize)| h.0) as fn((usize, usize)) -> usize,
+            ),
+            (
+                "inferrail_replica_index_capacity_blocks",
+                "KV capacity in blocks the index assumes for the replica.",
+                |h: (usize, usize)| h.1,
+            ),
+        ] {
+            let mut metric = encoder.encode_descriptor(name, help, None, MetricType::Gauge)?;
+            for row in rows {
+                if let Some(&h) = held.get(row.id.as_str()) {
+                    let labels = [("replica", row.id.as_str())];
+                    ConstGauge::new(pick(h) as i64).encode(metric.encode_family(&labels)?)?;
+                }
+            }
+        }
+        for (name, help, value) in [
+            (
+                "inferrail_index_entries",
+                "Distinct KV blocks the index predicts at least one replica holds.",
+                stats.entries,
+            ),
+            (
+                "inferrail_index_bytes",
+                "Memory the KV index holds.",
+                stats.bytes,
+            ),
+        ] {
+            let metric = encoder.encode_descriptor(name, help, None, MetricType::Gauge)?;
+            ConstGauge::new(value as i64).encode(metric)?;
+        }
+        Ok(())
+    }
+
+    fn encode_tokenizers(&self, encoder: &mut DescriptorEncoder<'_>) -> fmt::Result {
+        if self.tokenizers.is_empty() {
+            return Ok(());
+        }
+        let mut metric = encoder.encode_descriptor(
+            "inferrail_tokenize_cache_lookups",
+            "Repeated prompt pieces looked up in a model's tokenization cache, by result.",
+            None,
+            MetricType::Counter,
+        )?;
+        for (model, tokenizer) in &self.tokenizers {
+            let stats = tokenizer.cache_stats();
+            for (result, count) in [("hit", stats.hits), ("miss", stats.misses)] {
+                let labels = [
+                    ("model", Text::Model(model.clone())),
+                    ("result", Text::Fixed(result)),
+                ];
+                ConstCounter::new(count).encode(metric.encode_family(&labels)?)?;
+            }
+        }
         Ok(())
     }
 }
@@ -706,6 +809,8 @@ mod tests {
             clock: Clock::default(),
             max_age: Duration::from_millis(250),
             policies: vec![(ModelId::new("m").unwrap(), PolicyKind::P2c)],
+            index: None,
+            tokenizers: Vec::new(),
         })
     }
 
@@ -953,6 +1058,8 @@ mod tests {
             clock: Clock::default(),
             max_age: Duration::from_millis(250),
             policies: vec![(quoted.clone(), PolicyKind::P2c)],
+            index: None,
+            tokenizers: Vec::new(),
         });
         let routed = Routed {
             model: quoted.clone(),

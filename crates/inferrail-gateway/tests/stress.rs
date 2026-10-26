@@ -744,6 +744,8 @@ fn discovery_churn_keeps_the_metrics_page_bounded() {
         clock: Clock::default(),
         max_age: MAX_AGE,
         policies: Vec::new(),
+        index: None,
+        tokenizers: Vec::new(),
     });
     let group = ReplicaId::new("pool").unwrap();
     let rss = rss_kib();

@@ -184,6 +184,16 @@ impl Gateway {
                 .iter()
                 .map(|m| (m.name.clone(), config.policy_for(m)))
                 .collect(),
+            index: index.clone(),
+            tokenizers: config
+                .models
+                .iter()
+                .filter_map(|m| {
+                    tokenizers
+                        .get(&m.name)
+                        .map(|t| (m.name.clone(), Arc::clone(t)))
+                })
+                .collect(),
         }));
         let log = &config.observability.decision_log;
         let decisions = match &log.path {
@@ -296,6 +306,13 @@ impl Gateway {
             shared.clock,
         ));
         background.spawn(Arc::clone(&shared.metrics).run_pruner(PRUNE_EVERY));
+        if let Some(index) = &shared.index {
+            background.spawn(forget_departed(
+                Arc::clone(&shared.registry),
+                Arc::clone(index),
+                PRUNE_EVERY,
+            ));
+        }
         if shared.config.load.enabled {
             let registry = Arc::clone(&shared.registry);
             background.spawn(run_collector(
@@ -303,6 +320,7 @@ impl Gateway {
                 upstream::HttpScrape {
                     client: shared.client.clone(),
                     metrics: Arc::clone(&shared.metrics),
+                    index: shared.index.clone(),
                 },
                 CollectorConfig {
                     interval: shared.config.load.scrape_interval,
@@ -311,5 +329,65 @@ impl Gateway {
             ));
         }
         server::serve(shared, listener, shutdown).await
+    }
+}
+
+/// Drops index state of replicas that left the fleet, every `period`.
+async fn forget_departed(
+    registry: Arc<Registry>,
+    index: Arc<KvIndex>,
+    period: std::time::Duration,
+) {
+    let mut ticker = tokio::time::interval(period);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticker.tick().await;
+        prune_index(&registry, &index);
+    }
+}
+
+fn prune_index(registry: &Registry, index: &KvIndex) {
+    let fleet = registry.snapshot();
+    let live: std::collections::HashSet<&str> =
+        fleet.replicas().iter().map(|r| r.id().as_str()).collect();
+    for id in index.replicas() {
+        if !live.contains(id.as_str()) {
+            index.forget(&id);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use inferrail_control::{Limits, Origin};
+    use inferrail_core::ids::{BlockHash, ReplicaId};
+
+    fn member(group: &ReplicaId, id: &str) -> ReplicaSpec {
+        ReplicaSpec {
+            id: ReplicaId::new(id).unwrap(),
+            url: format!("http://{id}.pool:8000").parse().unwrap(),
+            models: vec![ModelId::new("m").unwrap()],
+            origin: Origin::Dns(group.clone()),
+            limits: Limits::default(),
+            kv_capacity_blocks: None,
+        }
+    }
+
+    #[test]
+    fn replicas_that_left_the_fleet_are_forgotten() {
+        let registry = Registry::new(Vec::new());
+        let group = ReplicaId::new("pool").unwrap();
+        registry.set_group(&group, vec![member(&group, "a"), member(&group, "b")]);
+        let index = KvIndex::new();
+        for id in ["a", "b", "never-seen"] {
+            let slot = index.slot(&ReplicaId::new(id).unwrap());
+            index.record(slot, &[BlockHash::new(1), BlockHash::new(2)], 10);
+        }
+        registry.set_group(&group, vec![member(&group, "a")]);
+        prune_index(&registry, &index);
+        assert_eq!(index.replicas(), [ReplicaId::new("a").unwrap()]);
+        assert_eq!(index.stats().entries, 2);
+        index.verify().unwrap();
     }
 }

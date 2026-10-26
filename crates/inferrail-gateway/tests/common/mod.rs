@@ -75,6 +75,12 @@ pub fn decode(token_ms: f64) -> LatencyModel {
 impl Upstream {
     pub async fn spawn(config: SimConfig) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        Self::spawn_on(listener, config)
+    }
+
+    /// A fresh simulator on `listener`, as when an engine restarts on the
+    /// same address with an empty cache.
+    pub fn spawn_on(listener: TcpListener, config: SimConfig) -> Self {
         let upstream = Self {
             addr: listener.local_addr().expect("addr"),
             sim: Sim::new(config).expect("sim config"),
