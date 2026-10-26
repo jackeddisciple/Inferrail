@@ -129,7 +129,9 @@ const NAMED_PARAMS: [&str; 14] = [
 
 const CONTINUE_TAG: &str = "CONTINUE_FINAL_MESSAGE_TAG ";
 
-const KNOWN_PART_FIELDS: [&str; 19] = [
+/// The fields of vLLM's content part types, which wrapping a text part
+/// drops; any other field is kept.
+const KNOWN_PART_FIELDS: [&str; 18] = [
     "text",
     "type",
     "image_url",
@@ -147,7 +149,6 @@ const KNOWN_PART_FIELDS: [&str; 19] = [
     "thinking",
     "closed",
     "name",
-    "detail",
     "prompt_cache_breakpoint",
 ];
 
@@ -966,14 +967,14 @@ mod tests {
         assert_eq!(template.format(), ContentFormat::OpenAi);
         let out = chat(
             r#"{"messages": [
-            {"role": "user", "content": ["plain", {"type": "text", "text": "t", "cache": 1}]}
+            {"role": "user", "content": ["plain", {"type": "text", "text": "t", "cache": 1, "detail": "high", "uuid": null}]}
         ]}"#,
         )
         .render(&template, None, &[])
         .unwrap();
         assert_eq!(
             out,
-            r#"{"type": "text", "text": "plain"}{"type": "text", "text": "t", "cache": 1}"#
+            r#"{"type": "text", "text": "plain"}{"type": "text", "text": "t", "cache": 1, "detail": "high"}"#
         );
     }
 
