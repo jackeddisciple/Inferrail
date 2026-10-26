@@ -360,9 +360,11 @@ impl Metrics {
         self.prompt_tokens
             .get_or_create(&labels)
             .inc_by(u64::from(prediction.prompt_tokens));
-        self.predicted_tokens
-            .get_or_create(&labels)
-            .inc_by(u64::from(prediction.cached_tokens));
+        if let Some(cached) = prediction.cached_tokens {
+            self.predicted_tokens
+                .get_or_create(&labels)
+                .inc_by(u64::from(cached));
+        }
     }
 
     pub fn index_reset(&self, replica: &ReplicaId) {

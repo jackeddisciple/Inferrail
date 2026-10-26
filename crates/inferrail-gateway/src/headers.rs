@@ -15,7 +15,8 @@ const HOP_BY_HOP: [HeaderName; 7] = [
 pub const REPLICA: HeaderName = HeaderName::from_static("x-inferrail-replica");
 /// The prompt's length in tokens, when the gateway tokenized it.
 pub const PROMPT_TOKENS: HeaderName = HeaderName::from_static("x-inferrail-prompt-tokens");
-/// Prompt tokens the KV index predicted the chosen replica had cached.
+/// Prompt tokens the KV index predicted the chosen replica had cached; absent
+/// when the index made no prediction.
 pub const CACHED_TOKENS: HeaderName = HeaderName::from_static("x-inferrail-cached-tokens");
 
 pub fn strip_hop_by_hop(headers: &mut HeaderMap) {

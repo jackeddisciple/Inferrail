@@ -103,6 +103,7 @@ async fn every_decision_is_logged_with_candidates_and_never_the_prompt() {
         assert_eq!(line["attempt"], 0);
         let candidates = line["candidates"].as_array().unwrap();
         assert_eq!(candidates.len(), 3);
+        assert!(candidates.iter().all(|c| c["cached_tokens"].is_null()));
         let chosen = line["chosen"].as_str().unwrap();
         let winner = candidates.iter().find(|c| c["replica"] == chosen).unwrap();
         assert_eq!(winner["eligible"], true);

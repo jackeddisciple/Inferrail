@@ -47,9 +47,9 @@ with dozens of replicas and thousands of blocks per prompt.
   prefix cache counters go backwards restarted, and its predictions are
   dropped.
 * Policies receive each candidate's predicted cached tokens and the prompt
-  length in `RouteContext`. Responses carry `x-inferrail-prompt-tokens` and
-  `x-inferrail-cached-tokens`, so a benchmark can compare the prediction
-  with the engine's own count request by request.
+  length in `RouteContext`. Responses carry `x-inferrail-prompt-tokens` and,
+  when the index predicted, `x-inferrail-cached-tokens`, so a benchmark can
+  compare the prediction with the engine's own count request by request.
 
 ## Consequences
 

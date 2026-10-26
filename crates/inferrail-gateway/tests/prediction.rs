@@ -283,6 +283,60 @@ async fn prompts_the_engine_never_computed_are_not_predicted() {
 }
 
 #[tokio::test]
+async fn without_the_index_only_the_prompt_is_reported() {
+    let upstream = Upstream::spawn(sim(1_000)).await;
+    let path = std::env::temp_dir().join(format!(
+        "inferrail-unpredicted-{}.jsonl",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let gw = TestGateway::start(tokenized(fleet(
+        &urls(&[&upstream]),
+        &format!(
+            "{FAST_HEALTH}index:\n  enabled: false\nobservability:\n  decision_log:\n    path: {}\n    sample_rate: 1.0\n",
+            path.display()
+        ),
+    )))
+    .await;
+    for _ in 0..2 {
+        let response = gw.post("/v1/chat/completions", &shared_prompt(2, 2)).await;
+        assert!(header(&response, "x-inferrail-prompt-tokens").unwrap() > 400);
+        assert!(
+            response
+                .headers()
+                .get("x-inferrail-cached-tokens")
+                .is_none()
+        );
+        response.bytes().await.unwrap();
+    }
+    let page = gw.gateway.render_metrics();
+    assert!(page.contains("inferrail_prompt_tokens_total{"), "{page}");
+    assert!(
+        !page.contains("inferrail_predicted_cached_tokens_total{"),
+        "{page}"
+    );
+    let mut lines = Vec::new();
+    wait_until(Duration::from_secs(3), || {
+        lines = std::fs::read_to_string(&path)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .collect();
+        lines.len() >= 2
+    })
+    .await;
+    let _ = std::fs::remove_file(&path);
+    for line in &lines {
+        assert!(line["prompt_tokens"].as_u64().unwrap() > 400);
+        let candidates = line["candidates"].as_array().unwrap();
+        assert!(
+            candidates.iter().all(|c| c["cached_tokens"].is_null()),
+            "{line}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn a_tokenizer_that_cannot_load_degrades_to_plain_routing() {
     let upstream = Upstream::spawn(sim(1_000)).await;
     let mut config = fleet(&urls(&[&upstream]), FAST_HEALTH);

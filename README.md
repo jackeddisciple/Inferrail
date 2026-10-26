@@ -94,8 +94,9 @@ curl -si localhost:8080/v1/chat/completions \
 
 The response headers name the replica that served it (`x-inferrail-replica`),
 the request ID the engine used (`x-request-id`), the prompt's length in
-tokens (`x-inferrail-prompt-tokens`) and how many of them the gateway
-predicted that replica had cached (`x-inferrail-cached-tokens`); with
+tokens (`x-inferrail-prompt-tokens`) and, when the KV index made a
+prediction, how many of them it predicted that replica had cached
+(`x-inferrail-cached-tokens`); with
 `--enable-prompt-tokens-details` the simulator reports the real count in
 `usage.prompt_tokens_details.cached_tokens`. The official SDK works
 by changing nothing but the base URL:

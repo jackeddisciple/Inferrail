@@ -14,9 +14,10 @@ pub(crate) struct Selected {
     pub(crate) lease: Lease,
     /// How many replicas were offered to the policy.
     pub(crate) offered: usize,
-    /// Prompt tokens predicted to be cached on the chosen replica.
-    pub(crate) cached_tokens: u32,
-    /// Each offered replica's prediction, when asked for.
+    /// Prompt tokens predicted to be cached on the chosen replica, when
+    /// the KV index made a prediction.
+    pub(crate) cached_tokens: Option<u32>,
+    /// Each offered replica's prediction, when asked for and made.
     pub(crate) predictions: Vec<(ReplicaId, u32)>,
 }
 
@@ -52,8 +53,10 @@ pub(crate) fn select(
         eligible.retain(|r| !tried.contains(r.id()));
     }
     let offered = eligible.len();
-    let mut cached = predict(&eligible, request);
-    let predictions = if request.explain {
+    let predicted = predict(&eligible, request);
+    let made = predicted.is_some();
+    let mut cached = predicted.unwrap_or_else(|| vec![0; eligible.len()]);
+    let predictions = if request.explain && made {
         eligible
             .iter()
             .map(|r| r.id().clone())
@@ -87,7 +90,7 @@ pub(crate) fn select(
             return Ok(Selected {
                 lease,
                 offered,
-                cached_tokens: cached[i],
+                cached_tokens: made.then_some(cached[i]),
                 predictions,
             });
         }
@@ -101,18 +104,23 @@ pub(crate) fn select(
     })
 }
 
-fn predict(eligible: &[&Arc<Replica>], request: Request<'_>) -> Vec<u32> {
-    match (request.prompt, request.index) {
-        (Some(prompt), Some(index)) if prompt.cacheable > 0 && !eligible.is_empty() => {
-            let slots: Vec<Slot> = eligible.iter().map(|r| index.slot(r.id())).collect();
-            index
-                .longest_prefix(&prompt.hashes[..prompt.cacheable], &slots)
-                .into_iter()
-                .map(|blocks| prompt.cached_tokens(blocks))
-                .collect()
-        }
-        _ => vec![0; eligible.len()],
+/// Each eligible replica's predicted cached tokens, or `None` when the
+/// prompt was not tokenized or the index is off, so nothing was predicted.
+fn predict(eligible: &[&Arc<Replica>], request: Request<'_>) -> Option<Vec<u32>> {
+    let (Some(prompt), Some(index)) = (request.prompt, request.index) else {
+        return None;
+    };
+    if prompt.cacheable == 0 || eligible.is_empty() {
+        return Some(vec![0; eligible.len()]);
     }
+    let slots: Vec<Slot> = eligible.iter().map(|r| index.slot(r.id())).collect();
+    Some(
+        index
+            .longest_prefix(&prompt.hashes[..prompt.cacheable], &slots)
+            .into_iter()
+            .map(|blocks| prompt.cached_tokens(blocks))
+            .collect(),
+    )
 }
 
 #[cfg(test)]
@@ -312,7 +320,10 @@ mod tests {
         for _ in 0..6 {
             let selected = select(&registry, policy.as_ref(), request, 1, &[]).unwrap();
             let winner = selected.lease.replica().id().as_str().to_owned();
-            assert_eq!(selected.cached_tokens, if winner == "r1" { 48 } else { 0 });
+            assert_eq!(
+                selected.cached_tokens,
+                Some(if winner == "r1" { 48 } else { 0 })
+            );
             assert_eq!(selected.lease.tokens(), 64);
             let mut predictions = selected.predictions.clone();
             predictions.sort();
@@ -331,6 +342,20 @@ mod tests {
                 .predictions
                 .is_empty()
         );
+        for unpredicted in [
+            Request {
+                index: None,
+                ..request
+            },
+            Request {
+                prompt: None,
+                ..request
+            },
+        ] {
+            let selected = select(&registry, policy.as_ref(), unpredicted, 1, &[]).unwrap();
+            assert_eq!(selected.cached_tokens, None);
+            assert!(selected.predictions.is_empty());
+        }
     }
 
     #[test]

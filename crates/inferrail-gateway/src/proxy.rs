@@ -370,11 +370,12 @@ async fn attempt(
     })
 }
 
-/// What the KV index predicted for the chosen replica.
+/// The tokenized prompt's length, and what the KV index predicted the
+/// chosen replica has cached when it made a prediction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Prediction {
     pub(crate) prompt_tokens: u32,
-    pub(crate) cached_tokens: u32,
+    pub(crate) cached_tokens: Option<u32>,
 }
 
 /// Tokenizes and hashes the prompt, counting the outcome; `None` routes the
@@ -416,7 +417,9 @@ fn describe(
     let load = replica.load(Instant::now(), shared.config.load.max_age);
     if let Some(prediction) = prediction {
         span.record("inferrail.prompt_tokens", prediction.prompt_tokens);
-        span.record("inferrail.cached_tokens", prediction.cached_tokens);
+        if let Some(cached) = prediction.cached_tokens {
+            span.record("inferrail.cached_tokens", cached);
+        }
     }
     span.record("inferrail.candidates", candidates);
     span.record("inferrail.replica", replica.id().as_str());
@@ -660,8 +663,10 @@ async fn forward(
     if let Some(prediction) = prediction {
         head.headers
             .insert(PROMPT_TOKENS, HeaderValue::from(prediction.prompt_tokens));
-        head.headers
-            .insert(CACHED_TOKENS, HeaderValue::from(prediction.cached_tokens));
+        if let Some(cached) = prediction.cached_tokens {
+            head.headers
+                .insert(CACHED_TOKENS, HeaderValue::from(cached));
+        }
     }
     if is_retryable(status) {
         drop(lease);
