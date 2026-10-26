@@ -62,14 +62,30 @@ fn goldens(family: &str) -> Vec<Golden> {
 fn check(family: &str) {
     let dir = model_dir(family);
     let goldens = goldens(family);
-    let tokenizer = ModelTokenizer::load(&TokenizerOptions {
-        source: dir.to_string_lossy().into_owned(),
-        clock: Clock::Fixed(jiff::civil::date(2026, 1, 15).at(9, 30, 0, 0)),
-        ..TokenizerOptions::default()
-    })
-    .expect("tokenizer loads");
-    assert_eq!(tokenizer.parity(), Parity::Verified);
-    compare(family, &tokenizer, &goldens, "cold");
+    for cache_tokens in [0, 1 << 20] {
+        let tokenizer = ModelTokenizer::load(&TokenizerOptions {
+            source: dir.to_string_lossy().into_owned(),
+            clock: Clock::Fixed(jiff::civil::date(2026, 1, 15).at(9, 30, 0, 0)),
+            cache_tokens,
+            ..TokenizerOptions::default()
+        })
+        .expect("tokenizer loads");
+        assert_eq!(tokenizer.parity(), Parity::Verified);
+        for pass in ["cold", "warm"] {
+            compare(
+                family,
+                &tokenizer,
+                &goldens,
+                &format!("{pass}, cache of {cache_tokens}"),
+            );
+        }
+        if cache_tokens > 0 {
+            assert!(
+                tokenizer.cache_stats().hits > 0,
+                "{family}: the cache was never used"
+            );
+        }
+    }
     std::fs::remove_dir_all(&dir).expect("scratch removed");
 }
 

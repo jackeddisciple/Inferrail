@@ -10,12 +10,14 @@ mod error;
 mod hf;
 mod model;
 mod python;
+mod segments;
 pub mod sim;
 mod source;
 mod template;
 
 pub use error::TokenizeError;
 pub use hf::Parity;
-pub use model::{Encoded, Endpoint, ModelTokenizer, TokenizerOptions};
+pub use model::{DEFAULT_CACHE_TOKENS, Encoded, Endpoint, ModelTokenizer, TokenizerOptions};
+pub use segments::CacheStats;
 pub use source::{SIM, Source, resolve};
 pub use template::{Clock, ContentFormat};

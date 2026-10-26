@@ -1282,6 +1282,8 @@ dependencies = [
 name = "inferrail-tokenize"
 version = "0.1.5"
 dependencies = [
+ "criterion",
+ "daachorse",
  "flate2",
  "inferrail-core",
  "jiff",

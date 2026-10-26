@@ -5,6 +5,7 @@ use minijinja::Value;
 
 use crate::chat::{self, Chat};
 use crate::hf::{self, HfFiles, Parity};
+use crate::segments::{CacheStats, Segmenter};
 use crate::source::{self, Source};
 use crate::template::{Clock, ContentFormat};
 use crate::{TokenizeError, sim};
@@ -23,9 +24,12 @@ pub struct Encoded {
     pub cache_salt: Option<String>,
 }
 
+/// Token ids of repeated prompt pieces kept for reuse, per model.
+pub const DEFAULT_CACHE_TOKENS: usize = 1 << 22;
+
 /// How a model's tokenizer is found and configured, mirroring the vLLM
 /// server flags that change what a request tokenizes to.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct TokenizerOptions {
     /// A model directory, a cached Hugging Face repository id
     /// (`org/name` or `org/name@revision`), or `builtin:sim`.
@@ -37,6 +41,21 @@ pub struct TokenizerOptions {
     /// `--default-chat-template-kwargs`.
     pub template_kwargs: Vec<(String, serde_json::Value)>,
     pub clock: Clock,
+    /// How many token ids of repeated prompt pieces to keep; zero disables.
+    pub cache_tokens: usize,
+}
+
+impl Default for TokenizerOptions {
+    fn default() -> Self {
+        Self {
+            source: String::new(),
+            chat_template: None,
+            content_format: None,
+            template_kwargs: Vec::new(),
+            clock: Clock::default(),
+            cache_tokens: DEFAULT_CACHE_TOKENS,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -53,6 +72,7 @@ enum Backend {
 #[derive(Debug)]
 struct HfModel {
     files: HfFiles,
+    segments: Segmenter,
     format: Option<ContentFormat>,
     defaults: Vec<(String, Value)>,
 }
@@ -75,6 +95,7 @@ impl ModelTokenizer {
                     })
                     .collect::<Result<_, _>>()?;
                 Backend::Hf(Box::new(HfModel {
+                    segments: Segmenter::new(&files.tokenizer, options.cache_tokens),
                     files,
                     format: options.content_format,
                     defaults,
@@ -95,6 +116,14 @@ impl ModelTokenizer {
         match &self.backend {
             Backend::Hf(model) => model.files.parity,
             Backend::Sim => Parity::Verified,
+        }
+    }
+
+    /// How often repeated prompt pieces were served from memory.
+    pub fn cache_stats(&self) -> CacheStats {
+        match &self.backend {
+            Backend::Hf(model) => model.segments.stats(),
+            Backend::Sim => CacheStats::default(),
         }
     }
 
@@ -134,11 +163,7 @@ impl HfModel {
     }
 
     fn tokens(&self, text: &str, special: bool) -> Result<Vec<u32>, TokenizeError> {
-        self.files
-            .tokenizer
-            .encode_fast(text, special)
-            .map(|e| e.get_ids().to_vec())
-            .map_err(|e| TokenizeError::Tokenizer(e.to_string()))
+        self.segments.encode(&self.files.tokenizer, text, special)
     }
 
     fn encode_chat(&self, body: &[u8]) -> Result<Encoded, TokenizeError> {
