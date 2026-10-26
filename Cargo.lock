@@ -1271,6 +1271,7 @@ version = "0.1.7"
 dependencies = [
  "criterion",
  "inferrail-core",
+ "inferrail-index",
  "proptest",
  "serde",
  "xxhash-rust",
