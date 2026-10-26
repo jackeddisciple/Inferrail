@@ -21,9 +21,11 @@ struct Golden {
 }
 
 fn fixtures(family: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/fixtures/tokenizers")
-        .join(family)
+    let root = std::env::var_os("INFERRAIL_GOLDENS").map_or_else(
+        || Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tokenizers"),
+        PathBuf::from,
+    );
+    root.join(family)
 }
 
 fn gunzip(path: &Path) -> Vec<u8> {

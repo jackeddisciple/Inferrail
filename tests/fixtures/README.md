@@ -28,7 +28,9 @@
   from `make_goldens.py`, which runs vLLM's request handling, ported, through
   transformers 5.17.0 and pydantic; `make goldens` rebuilds everything. The
   families are Qwen3 8B, Granite 3.3 8B Instruct and Hermes 2 Pro Mistral 7B,
-  all Apache 2.0.
+  all Apache 2.0. `INFERRAIL_GOLDEN_OUT`, `INFERRAIL_GOLDEN_COUNT` and
+  `INFERRAIL_GOLDEN_SEED` write a larger set elsewhere for stress runs, which
+  the parity test reads from `INFERRAIL_GOLDENS`.
 
 When a real engine run is available, replace the derived vLLM files with
 live recordings from the pinned version and keep the tests unchanged.

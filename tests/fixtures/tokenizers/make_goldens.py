@@ -13,7 +13,9 @@
 
     uv run make_goldens.py
 
-Each family directory gets the tokenizer files of one pinned Hugging Face
+INFERRAIL_GOLDEN_OUT, INFERRAIL_GOLDEN_COUNT and INFERRAIL_GOLDEN_SEED write
+a larger or different set elsewhere, for stress runs of the parity test
+(point INFERRAIL_GOLDENS at the same directory). Each family directory gets the tokenizer files of one pinned Hugging Face
 revision (tokenizer.json gzipped) and goldens.jsonl.gz: request bodies with
 the token ids vLLM v0.31.0 would compute for them. The request handling is
 ported from that version's vllm/entrypoints/chat_utils.py,
@@ -27,6 +29,7 @@ import gzip
 import hashlib
 import inspect
 import json
+import os
 import random
 import shutil
 import sys
@@ -53,9 +56,11 @@ from transformers import AutoTokenizer
 from typing_extensions import Required, TypedDict
 
 HERE = Path(__file__).resolve().parent
+OUT = Path(os.environ.get("INFERRAIL_GOLDEN_OUT") or HERE)
+SEED = os.environ.get("INFERRAIL_GOLDEN_SEED", "")
 FIXED_NOW = datetime.datetime(2026, 1, 15, 9, 30, 0)
-CHAT_PER_FAMILY = 200
-COMPLETIONS_PER_FAMILY = 40
+CHAT_PER_FAMILY = int(os.environ.get("INFERRAIL_GOLDEN_COUNT") or 200)
+COMPLETIONS_PER_FAMILY = max(1, CHAT_PER_FAMILY // 5)
 
 FAMILIES = [
     {
@@ -773,12 +778,12 @@ def fetch(family: dict, out: Path, scratch: Path) -> dict:
 
 
 def build(family: dict) -> None:
-    out = HERE / family["name"]
+    out = OUT / family["name"]
     with tempfile.TemporaryDirectory() as tmp:
         scratch = Path(tmp)
         fetch(family, out, scratch)
         tokenizer = AutoTokenizer.from_pretrained(str(scratch))
-        rng = random.Random(f"inferrail goldens {family['name']}")
+        rng = random.Random(f"inferrail goldens {family['name']}{SEED}")
         lines, rejected = [], 0
         for i in range(CHAT_PER_FAMILY):
             body = chat_body(rng, family["name"], family["repo"], i)
