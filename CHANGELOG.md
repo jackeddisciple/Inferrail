@@ -3,6 +3,74 @@
 Notable changes to Inferrail. Versions follow
 [Semantic Versioning](https://semver.org).
 
+## [0.1.7] Bug Fixes and Improvements (26 October 2026)
+
+Fixes from an adversarial pass over tokenization at the edge and the KV
+index. Edge case requests and single template expressions ran through both
+transformers 5.17 and the gateway's tokenizer on eleven model families, the
+eight beyond the golden fixtures included, and the gateway was driven with
+requests engines refuse and replicas that fail.
+
+### Fixed
+
+* An attempt the engine refused, answered with an error, or failed before
+  answering left its blocks in the KV index, so later requests sharing the
+  prefix were predicted as cached on a replica that never computed it. The
+  blocks a record added are now taken back; an attempt that runs out of
+  time keeps them, since the engine was most likely computing it. With
+  retried 503s and refused requests mixed in, 545 of 545 predictions are
+  now exact where 543 were, and 16 concurrent clients saw no prediction
+  above the engine's count where 10 of 871 were.
+* Tool call arguments and every request field a template sees were parsed
+  by serde, so a negative zero became a float, integers wider than 64 bits
+  lost digits, and `1e400`, `NaN` or `Infinity` in arguments emptied them.
+  Prompts with any of these tokenized differently from vLLM's. They are now
+  read with the rules of Python's `json.loads`; integers wider than 128
+  bits get no prediction.
+* `repr` printed private use, unassigned and most format characters, such
+  as the tag characters of flag emoji, as they were, where Python escapes
+  them. Templates that print tools or arguments as Python values, SmolLM3's
+  among them, now render what transformers renders, from CPython 3.12's
+  Unicode tables.
+* A template keyword read before it is assigned, as in
+  `set enable_thinking = enable_thinking | default(true)`, never reached the
+  template: minijinja counts a `set` target as assigned before reading its
+  value, so the request's or the configured value was dropped and the
+  default rendered. Keywords now follow a port of Jinja2's own analysis,
+  which agrees with Jinja2 on all eleven chat templates tried, where four
+  differed before.
+* `title()` started words only after spaces and hyphens, so `1st` and
+  `a_b` came out unlike Python's `1St` and `A_B`; `title()` and
+  `capitalize()` upper cased ligatures and digraphs where Python title
+  cases them, `ß` to `SS` instead of `Ss`; and a final sigma was never
+  lower cased to `ς`. The methods and the `title` and `capitalize` filters
+  now follow CPython 3.12 and Jinja2.
+* Wrapping a text part for a template that takes OpenAI style content
+  dropped its `detail` field, which vLLM keeps with the other extra fields.
+* The decision log gave every candidate a predicted 0 cached tokens for
+  prompts that were never tokenized, and with `index.enabled: false` the
+  `x-inferrail-cached-tokens` header, the route span and
+  `inferrail_predicted_cached_tokens` still reported a prediction of 0.
+  They now report nothing when nothing was predicted.
+* Models configured alike share one tokenizer, and each reported that
+  tokenizer's totals in `inferrail_tokenize_cache_lookups`, so a sum over
+  models counted every lookup once per model. Each request now adds its own
+  hits and misses to its own model.
+
+### Changed
+
+* A chat body is read once, by the reader with Python's JSON rules, and
+  strings are scanned eight bytes at a time, so preparing a request costs
+  what it did in 0.1.6: a warm 8,000 token chat still takes 0.1 ms. A body
+  that repeats a top level field now keeps the last value, as Python does,
+  where it was refused before.
+
+### Added
+
+* A regression test for every fix, records taken back in the KV index's
+  reference model, and expectations produced by Jinja2 and CPython for the
+  variable analysis, the JSON reader, `repr`, `title` and `capitalize`.
+
 ## [0.1.6] Tokens, Block Hashes and the Approximate KV Index (26 October 2026)
 
 The gateway now sees prompts as the engines see them: it tokenizes every
