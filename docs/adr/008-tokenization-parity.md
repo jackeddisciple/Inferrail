@@ -32,7 +32,8 @@ leading spaces tokenize.
   * requests are prepared as vLLM prepares them, including the content
     format detection vLLM runs on the template's syntax tree, developer
     role handling, `continue_final_message`, `reasoning_effort` and the
-    filtering of template keywords;
+    filtering of template keywords, which keeps the ones the template reads
+    as Jinja2's own analysis finds them;
   * what a template sees of the request, tool call arguments included, is
     read with the rules of Python's `json.loads`: integers keep every
     digit, `-0` is the integer zero, floats out of range are infinities,

@@ -17,6 +17,7 @@ mod segments;
 pub mod sim;
 mod source;
 mod template;
+mod variables;
 
 pub use error::TokenizeError;
 pub use hf::Parity;

@@ -58,7 +58,10 @@ impl ChatTemplate {
             .lstrip_blocks(true)
             .build()
             .map_err(|e| TokenizeError::Template(e.to_string()))?;
-        let format = detect_content_format(&source, syntax.clone());
+        let (format, variables) = match minijinja::machinery::parse(&source, NAME, syntax.clone()) {
+            Ok(root) => (content_format(&root), crate::variables::undeclared(&root)),
+            Err(_) => (ContentFormat::String, HashSet::new()),
+        };
         let mut env = Environment::new();
         env.set_syntax(syntax);
         env.set_undefined_behavior(UndefinedBehavior::Chainable);
@@ -102,10 +105,6 @@ impl ChatTemplate {
         let mentions_content = source.contains("content");
         env.add_template_owned(NAME, source)
             .map_err(|e| TokenizeError::Template(e.to_string()))?;
-        let variables = env
-            .get_template(NAME)
-            .map_err(|e| TokenizeError::Template(e.to_string()))?
-            .undeclared_variables(false);
         Ok(Self {
             env,
             variables,
@@ -271,12 +270,9 @@ fn tojson(value: Value, args: Rest<Value>, kwargs: Kwargs) -> Result<Value, Erro
 /// (or a variable assigned from it), over a macro parameter that receives
 /// such content, or over a bare `content` outside macros. Anything the walk
 /// cannot follow means plain strings, as vLLM falls back to.
-pub(crate) fn detect_content_format(source: &str, syntax: SyntaxConfig) -> ContentFormat {
-    let Ok(root) = minijinja::machinery::parse(source, NAME, syntax) else {
-        return ContentFormat::String;
-    };
+fn content_format(root: &Stmt<'_>) -> ContentFormat {
     let mut walk = Walk::default();
-    walk.stmt(&root, None);
+    walk.stmt(root, None);
     walk.verdict().unwrap_or(ContentFormat::String)
 }
 
@@ -724,6 +720,12 @@ mod tests {
         .unwrap();
         assert!(template.uses("enable_thinking") && template.uses("messages"));
         assert!(!template.uses("x") && !template.uses("m"));
+        let reread = ChatTemplate::compile(
+            "{% set enable_thinking = enable_thinking | default(true) %}{{ enable_thinking }}",
+            &Clock::default(),
+        )
+        .unwrap();
+        assert!(reread.uses("enable_thinking"), "read before it is assigned");
     }
 
     #[test]
@@ -770,11 +772,9 @@ mod tests {
                 ContentFormat::String,
             ),
         ] {
-            assert_eq!(
-                detect_content_format(source, SyntaxConfig::default()),
-                want,
-                "{source}"
-            );
+            let format = minijinja::machinery::parse(source, NAME, SyntaxConfig::default())
+                .map_or(ContentFormat::String, |root| content_format(&root));
+            assert_eq!(format, want, "{source}");
         }
         assert_eq!(
             format_of("{% for m in messages %}{% for c in m.content %}{% endfor %}{% endfor %}"),
