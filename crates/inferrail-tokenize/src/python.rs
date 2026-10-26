@@ -6,6 +6,8 @@ use std::fmt::Write as _;
 use minijinja::value::{Value, ValueKind};
 use minijinja::{Error, ErrorKind};
 
+use crate::printable::is_printable;
+
 /// `str(value)`; Jinja2's `Undefined` prints as nothing.
 pub(crate) fn str_of(value: &Value, out: &mut String) {
     match value.kind() {
@@ -143,23 +145,6 @@ pub(crate) fn float_repr(f: f64, out: &mut String) {
     }
 }
 
-fn printable(c: char) -> bool {
-    !(c.is_control()
-        || matches!(
-            c,
-            '\u{a0}'
-                | '\u{ad}'
-                | '\u{1680}'
-                | '\u{2000}'..='\u{200f}'
-                | '\u{2028}'..='\u{202f}'
-                | '\u{205f}'..='\u{2064}'
-                | '\u{2066}'..='\u{206f}'
-                | '\u{3000}'
-                | '\u{feff}'
-                | '\u{fff9}'..='\u{fffb}'
-        ))
-}
-
 fn string_repr(s: &str, out: &mut String) {
     let quote = if s.contains('\'') && !s.contains('"') {
         '"'
@@ -177,7 +162,7 @@ fn string_repr(s: &str, out: &mut String) {
                 out.push('\\');
                 out.push(c);
             }
-            c if printable(c) => out.push(c),
+            c if is_printable(c) => out.push(c),
             c if (c as u32) < 0x100 => {
                 let _ = write!(out, "\\x{:02x}", c as u32);
             }
@@ -401,6 +386,12 @@ mod tests {
         assert_eq!(repr(Value::from("it's")), "\"it's\"");
         assert_eq!(repr(Value::from("say \"hi\" it's")), "'say \"hi\" it\\'s'");
         assert_eq!(repr(Value::from("a\nb\u{1}\u{a0}é")), "'a\\nb\\x01\\xa0é'");
+        assert_eq!(
+            repr(Value::from(
+                "\u{e000}\u{600}\u{378}\u{e0041}😀\u{feff}\u{3000} é日\u{ad}\u{2028}\u{10fff}\u{7f}\u{85}"
+            )),
+            "'\\ue000\\u0600\\u0378\\U000e0041😀\\ufeff\\u3000 é日\\xad\\u2028\\U00010fff\\x7f\\x85'"
+        );
         let list = Value::from(vec![Value::from(1), Value::from("x"), Value::from(())]);
         assert_eq!(repr(list), "[1, 'x', None]");
         let map: Value = serde_json::from_str::<Value>(r#"{"b": 1, "a": [true, 2.0]}"#).unwrap();

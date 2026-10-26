@@ -11,6 +11,7 @@ pub mod hash;
 mod hf;
 mod json;
 mod model;
+mod printable;
 mod python;
 mod segments;
 pub mod sim;
