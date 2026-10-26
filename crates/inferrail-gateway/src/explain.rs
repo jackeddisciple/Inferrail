@@ -1,0 +1,155 @@
+//! `/admin/explain`: what the model's policy would do with a request now,
+//! and why, without routing it or changing any state.
+
+use std::sync::Arc;
+
+use axum::body::Bytes;
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::response::{IntoResponse, Response};
+use inferrail_core::ids::{ModelId, ReplicaId};
+use inferrail_policy::{Estimate, Exclusion, Guarded, HotPrefix, Steer, Term};
+use inferrail_tokenize::Endpoint;
+use serde::Serialize;
+use tokio::time::Instant;
+
+use crate::Shared;
+use crate::errors::GatewayError;
+use crate::proxy::{Resolved, estimate_tokens, resolve_model, session_key};
+use crate::route;
+
+#[derive(Debug, Serialize)]
+struct Report {
+    model: ModelId,
+    policy: &'static str,
+    rule: &'static str,
+    prompt_tokens: u32,
+    tokenized: bool,
+    /// Why the KV index made no prediction, when it made none.
+    unpredicted: Option<&'static str>,
+    blocks: usize,
+    session: bool,
+    /// The replica the policy would pick, unless chance decides.
+    winner: Option<ReplicaId>,
+    decided_by: Option<Term>,
+    steer: Option<Steer>,
+    guarded: Guarded,
+    hot_prefix: Option<HotPrefix>,
+    replicas: Vec<Row>,
+}
+
+#[derive(Debug, Serialize)]
+struct Row {
+    replica: ReplicaId,
+    offered: bool,
+    /// Why it was not offered: unhealthy, ejected or full.
+    unavailable: Option<&'static str>,
+    in_flight: u32,
+    queued_secs: f64,
+    running: u32,
+    kv_usage: Option<f64>,
+    cached_tokens: Option<u32>,
+    excluded: Option<Exclusion>,
+    owner: bool,
+    score: Option<f64>,
+    estimate: Option<Estimate>,
+}
+
+pub(crate) async fn handle(
+    shared: Arc<Shared>,
+    endpoint: Endpoint,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let (status, body) = match report(&shared, endpoint, &headers, body).await {
+        Ok(report) => (
+            StatusCode::OK,
+            serde_json::to_vec_pretty(&report).unwrap_or_default(),
+        ),
+        Err(err) => (err.status(), err.to_json()),
+    };
+    (
+        status,
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        )],
+        body,
+    )
+        .into_response()
+}
+
+async fn report(
+    shared: &Shared,
+    endpoint: Endpoint,
+    headers: &HeaderMap,
+    body: Bytes,
+) -> Result<Report, GatewayError> {
+    let Resolved { model, body, user } = resolve_model(shared, body)?;
+    let policy = shared.policy(&model)?;
+    let (prepared, _) = shared.prompts.prepare(&model, endpoint, &body).await;
+    let (prompt, skipped) = match prepared {
+        Ok(prompt) => (Some(prompt), None),
+        Err(skip) => (None, Some(skip.label())),
+    };
+    let unpredicted =
+        skipped.or((prompt.is_some() && shared.index.is_none()).then_some("index_off"));
+    let tokens = prompt
+        .as_ref()
+        .map_or_else(|| estimate_tokens(body.len()), |p| p.tokens);
+    let request = route::Request {
+        model: &model,
+        tokens,
+        prompt: prompt.as_ref(),
+        index: shared.index.as_deref(),
+        session: session_key(headers, user.as_deref()),
+        cost: shared.cost(&model),
+        max_age: shared.config.load.max_age,
+        explain: true,
+    };
+    let now = shared.clock.now();
+    let fleet = shared.registry.load();
+    let (considered, candidates, predicted, explanation) =
+        route::explain(fleet.serving(&model), policy, request, now);
+    let instant = Instant::now();
+    let replicas = considered
+        .iter()
+        .map(|seen| {
+            let scored = seen.offered.map(|i| explanation.candidates[i]);
+            let cached = seen.offered.and_then(|i| predicted.as_ref().map(|p| p[i]));
+            let view = seen.offered.map_or_else(
+                || route::candidate(seen.replica, 0, now, instant, request.max_age),
+                |i| candidates[i],
+            );
+            Row {
+                replica: seen.replica.id().clone(),
+                offered: seen.offered.is_some(),
+                unavailable: seen.unavailable,
+                in_flight: view.in_flight,
+                queued_secs: view.queued_secs,
+                running: view.running,
+                kv_usage: view.kv_usage,
+                cached_tokens: cached,
+                excluded: scored.and_then(|s| s.excluded),
+                owner: scored.is_some_and(|s| s.owner),
+                score: scored.and_then(|s| s.score),
+                estimate: scored.and_then(|s| s.estimate),
+            }
+        })
+        .collect();
+    Ok(Report {
+        policy: policy.kind().as_str(),
+        rule: explanation.rule,
+        prompt_tokens: tokens,
+        tokenized: prompt.is_some(),
+        unpredicted,
+        blocks: prompt.as_ref().map_or(0, |p| p.hashes.len()),
+        session: request.session.is_some(),
+        winner: explanation.winner.map(|i| candidates[i].id.clone()),
+        decided_by: explanation.decided_by,
+        steer: explanation.steer,
+        guarded: explanation.guarded,
+        hot_prefix: explanation.hot_prefix,
+        replicas,
+        model,
+    })
+}

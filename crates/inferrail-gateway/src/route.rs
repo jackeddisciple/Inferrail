@@ -4,7 +4,9 @@ use std::time::Duration;
 use inferrail_control::{Lease, Nanos, Registry, Replica};
 use inferrail_core::ids::{ModelId, ReplicaId};
 use inferrail_index::{KvIndex, Slot};
-use inferrail_policy::{Candidate, Choice, CostModel, Estimate, Hits, RouteContext, RoutingPolicy};
+use inferrail_policy::{
+    Candidate, Choice, CostModel, Estimate, Explanation, Hits, RouteContext, RoutingPolicy,
+};
 use tokio::time::Instant;
 
 use crate::errors::GatewayError;
@@ -63,7 +65,7 @@ impl Request<'_> {
 
 /// A replica as policies see it: the gateway's own counts, its queued
 /// prefill, and the engine's report while that is fresh.
-fn candidate(
+pub(crate) fn candidate(
     replica: &Replica,
     cached_tokens: u32,
     now: Nanos,
@@ -176,6 +178,60 @@ pub(crate) fn select(
     } else {
         GatewayError::unavailable(format!("no healthy replica serves `{model}`"))
     })
+}
+
+/// One replica serving the model, as an explanation shows it.
+#[derive(Debug)]
+pub(crate) struct Considered<'a> {
+    pub(crate) replica: &'a Arc<Replica>,
+    /// Why it was not offered to the policy.
+    pub(crate) unavailable: Option<&'static str>,
+    /// Its place among the candidates when it was offered.
+    pub(crate) offered: Option<usize>,
+}
+
+/// What `select` would offer and what the policy thinks of it, without
+/// taking a lease or changing any state.
+pub(crate) fn explain<'f>(
+    pool: &'f [Arc<Replica>],
+    policy: &dyn RoutingPolicy,
+    request: Request<'_>,
+    now: Nanos,
+) -> (
+    Vec<Considered<'f>>,
+    Vec<Candidate<'f>>,
+    Option<Vec<u32>>,
+    Explanation,
+) {
+    let eligible = eligible(pool, now, &[]);
+    let predicted = predict(&eligible, request);
+    let instant = Instant::now();
+    let candidates: Vec<Candidate<'f>> = eligible
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let cached = predicted.as_ref().map_or(0, |p| p[i]);
+            candidate(r, cached, now, instant, request.max_age)
+        })
+        .collect();
+    let explanation = policy.explain(&request.context(now, &candidates));
+    let considered = pool
+        .iter()
+        .map(|replica| Considered {
+            replica,
+            unavailable: if !replica.health().probe_up() {
+                Some("unhealthy")
+            } else if !replica.is_routable(now) {
+                Some("ejected")
+            } else if !replica.has_room() {
+                Some("full")
+            } else {
+                None
+            },
+            offered: eligible.iter().position(|r| Arc::ptr_eq(r, replica)),
+        })
+        .collect();
+    (considered, candidates, predicted, explanation)
 }
 
 /// Each eligible replica's predicted cached tokens, or `None` when the

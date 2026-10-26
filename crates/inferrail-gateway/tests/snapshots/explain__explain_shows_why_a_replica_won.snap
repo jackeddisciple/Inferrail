@@ -1,0 +1,82 @@
+---
+source: crates/inferrail-gateway/tests/explain.rs
+expression: "report.replace(&warm, \"WARM\")"
+---
+{
+  "model": "model-a",
+  "policy": "cost_model",
+  "rule": "the lowest estimated time to first token within the load guards",
+  "prompt_tokens": 625,
+  "tokenized": true,
+  "unpredicted": null,
+  "blocks": 39,
+  "session": false,
+  "winner": "WARM",
+  "decided_by": "prefill",
+  "steer": null,
+  "guarded": {
+    "bounded_load": 0,
+    "kv_pressure": 0,
+    "kv_waived": false
+  },
+  "hot_prefix": null,
+  "replicas": [
+    {
+      "replica": "WARM",
+      "offered": true,
+      "unavailable": null,
+      "in_flight": 0,
+      "queued_secs": 0.0,
+      "running": 0,
+      "kv_usage": null,
+      "cached_tokens": 592,
+      "excluded": null,
+      "owner": false,
+      "score": null,
+      "estimate": {
+        "queue_secs": 0.0,
+        "prefill_secs": 0.00836626565,
+        "tier_secs": 0.0,
+        "ttft_secs": 0.00836626565
+      }
+    },
+    {
+      "replica": "r1",
+      "offered": true,
+      "unavailable": null,
+      "in_flight": 0,
+      "queued_secs": 0.0,
+      "running": 0,
+      "kv_usage": null,
+      "cached_tokens": 0,
+      "excluded": null,
+      "owner": false,
+      "score": null,
+      "estimate": {
+        "queue_secs": 0.0,
+        "prefill_secs": 0.06814453125,
+        "tier_secs": 0.0,
+        "ttft_secs": 0.06814453125
+      }
+    },
+    {
+      "replica": "r2",
+      "offered": true,
+      "unavailable": null,
+      "in_flight": 0,
+      "queued_secs": 0.0,
+      "running": 0,
+      "kv_usage": null,
+      "cached_tokens": 0,
+      "excluded": null,
+      "owner": false,
+      "score": null,
+      "estimate": {
+        "queue_secs": 0.0,
+        "prefill_secs": 0.06814453125,
+        "tier_secs": 0.0,
+        "ttft_secs": 0.06814453125
+      }
+    }
+  ]
+}

@@ -22,6 +22,7 @@ mod admin;
 mod body;
 mod decision_log;
 pub mod errors;
+mod explain;
 pub mod headers;
 pub mod inspect;
 pub mod metrics;
@@ -246,8 +247,8 @@ impl Gateway {
         &self.shared.registry
     }
 
-    /// Serves `GET /metrics` and `GET /health` on the admin listener until
-    /// `shutdown` resolves.
+    /// Serves `GET /metrics`, `GET /health` and `POST /admin/explain/v1/...`
+    /// on the admin listener until `shutdown` resolves.
     pub async fn serve_admin(
         self,
         listener: TcpListener,

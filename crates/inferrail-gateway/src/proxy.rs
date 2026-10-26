@@ -459,7 +459,7 @@ fn describe(
 
 /// Prompt tokens a body of `len` bytes holds, at about four bytes a token,
 /// for models whose prompts are not tokenized at the edge.
-fn estimate_tokens(len: usize) -> u32 {
+pub(crate) fn estimate_tokens(len: usize) -> u32 {
     u32::try_from(len.div_ceil(4)).unwrap_or(u32::MAX)
 }
 
@@ -518,15 +518,15 @@ async fn read_body(
 
 /// A request's model, its body as the engine should see it, and its
 /// `user` field.
-struct Resolved {
-    model: ModelId,
-    body: Bytes,
-    user: Option<String>,
+pub(crate) struct Resolved {
+    pub(crate) model: ModelId,
+    pub(crate) body: Bytes,
+    pub(crate) user: Option<String>,
 }
 
 /// Names a conversation for session affinity: `x-session-id` when sent,
 /// otherwise the request's `user` field.
-fn session_key(headers: &HeaderMap, user: Option<&str>) -> Option<u64> {
+pub(crate) fn session_key(headers: &HeaderMap, user: Option<&str>) -> Option<u64> {
     if let Some(id) = headers
         .get(SESSION_ID)
         .map(HeaderValue::as_bytes)
@@ -540,7 +540,7 @@ fn session_key(headers: &HeaderMap, user: Option<&str>) -> Option<u64> {
 
 /// Resolves the requested name to a served model. The body is only
 /// rewritten when the engine would otherwise see a different name.
-fn resolve_model(shared: &Shared, body: Bytes) -> Result<Resolved, GatewayError> {
+pub(crate) fn resolve_model(shared: &Shared, body: Bytes) -> Result<Resolved, GatewayError> {
     let (model, rewritten, user) = {
         let inspected = inspect(&body).map_err(|err| match err {
             InspectError::ModelNotString => GatewayError::bad_param(err.to_string(), "model"),
