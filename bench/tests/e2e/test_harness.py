@@ -65,6 +65,12 @@ def test_compare_runs_every_policy_on_the_same_schedule(tmp_path):
         assert schedules[0] == schedules[1]
     w1 = [d for d in docs if d["run"]["workload"] == "w1"]
     assert all(d["summary"]["hit_rate"] > 0.3 for d in w1)
+    for doc in docs:
+        predicted = doc["summary"]["prediction"]
+        assert predicted["requests"] == 30
+        assert predicted["prompt_agreement"] == 1.0
+        assert predicted["cached_agreement"] >= 0.9, predicted
+        assert len(doc["requests"]["predicted_cached_tokens"]) == 30
     assert cli.main(["plot", *map(str, files), "--out", str(tmp_path / "report")]) == 0
     text = (tmp_path / "report" / "report.md").read_text()
     assert "| round_robin |" in text

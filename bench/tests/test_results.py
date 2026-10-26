@@ -52,6 +52,23 @@ def test_summary_counts_slo_goodput_hit_rate_and_errors():
     assert s["lag_s"]["max"] == pytest.approx(0.001)
 
 
+def test_prediction_accuracy_compares_headers_with_usage():
+    records = [record(i, ttft=0.1, prompt=100, cached=c) for i, c in enumerate([0, 32, 64, 64])]
+    for r, guess in zip(records, [0, 32, 48, 80], strict=True):
+        r.predicted_prompt_tokens, r.predicted_cached_tokens = 100, guess
+    records[3].predicted_prompt_tokens = 99
+    records.append(record(4, ttft=0.1, status=503))
+    records.append(record(5, ttft=0.1))
+    p = summarize(records)["prediction"]
+    assert p["requests"] == 4
+    assert p["cached_agreement"] == pytest.approx(0.5)
+    assert (p["over_predicted"], p["under_predicted"]) == (0.25, 0.25)
+    assert p["mean_abs_error_tokens"] == pytest.approx(8.0)
+    assert p["prompt_agreement"] == pytest.approx(0.75)
+    assert p["predicted_hit_rate"] == pytest.approx(160 / 400)
+    assert summarize([record(0, ttft=0.1)])["prediction"] is None
+
+
 def test_warmup_leaves_out_the_first_seconds():
     records = [record(i, ttft=5.0 if i < 10 else 0.1) for i in range(40)]
     assert summarize(records)["ttft_s"]["max"] == pytest.approx(5.0)
@@ -207,6 +224,8 @@ def test_report_has_charts_and_a_row_per_policy(tmp_path):
     assert len(rows) == 2
     assert text.index("| round_robin") < text.index("| least_request")
     assert "0.40" in rows[0]
+    assert "prediction agreement" in text
+    assert rows[0].count("n/a") >= 1
 
 
 def test_params_parse_numbers_and_group_by_workload():

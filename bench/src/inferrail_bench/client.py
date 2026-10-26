@@ -11,6 +11,8 @@ from dataclasses import dataclass, field
 import httpx2
 
 REPLICA_HEADER = "x-inferrail-replica"
+PROMPT_HEADER = "x-inferrail-prompt-tokens"
+CACHED_HEADER = "x-inferrail-cached-tokens"
 
 
 @dataclass
@@ -27,6 +29,8 @@ class Record:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     cached_tokens: int = 0
+    predicted_prompt_tokens: int | None = None
+    predicted_cached_tokens: int | None = None
 
     @property
     def ok(self) -> bool:
@@ -61,6 +65,11 @@ class Record:
         return [b - a for a, b in zip(self.token_times, self.token_times[1:], strict=False)]
 
 
+def _count(value: str | None) -> int | None:
+    """A token count header from the gateway; absent when it made no prediction."""
+    return int(value) if value is not None and value.isdigit() else None
+
+
 def _apply(record: Record, chunk: dict, now: float) -> None:
     for choice in chunk.get("choices") or []:
         delta = choice.get("delta") or {}
@@ -86,6 +95,8 @@ async def stream_chat(
         async with client.stream("POST", path, json=body) as response:
             record.status = response.status_code
             record.replica = response.headers.get(REPLICA_HEADER)
+            record.predicted_prompt_tokens = _count(response.headers.get(PROMPT_HEADER))
+            record.predicted_cached_tokens = _count(response.headers.get(CACHED_HEADER))
             if response.status_code != 200:
                 payload = await response.aread()
                 record.error = payload.decode(errors="replace")[:500]

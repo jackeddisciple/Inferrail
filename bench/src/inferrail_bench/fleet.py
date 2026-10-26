@@ -69,15 +69,26 @@ def sim(logs: Path, names: list[str], flags: list[str], profile: str = "debug"):
     return start(args, logs / f"sim-{port}.log", f"{url}/health"), url
 
 
-def gateway_config(port: int, admin: int, model: str, sims: list[str], policy: str) -> str:
+def gateway_config(
+    port: int,
+    admin: int,
+    model: str,
+    sims: list[str],
+    policy: str,
+    tokenizer: str | None = "builtin:sim",
+) -> str:
+    """The gateway tokenizes with the simulator's own tokenizer by default,
+    so every response carries the KV index's prediction."""
     lines = [
         "server:",
         f"  listen: 127.0.0.1:{port}",
         f"  admin_listen: 127.0.0.1:{admin}",
         "models:",
         f"  - name: {model}",
-        "replicas:",
     ]
+    if tokenizer:
+        lines.append(f"    tokenizer: {tokenizer}")
+    lines.append("replicas:")
     for i, url in enumerate(sims):
         lines += [f"  - id: r{i}", f"    url: {url}", f"    models: [{model}]"]
     lines += ["routing:", f"  default_policy: {policy}", "  seed: 7"]

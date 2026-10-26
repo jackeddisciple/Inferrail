@@ -38,6 +38,30 @@ def _error_kind(record: Record) -> str:
     return (record.error or "unknown").split(":")[0]
 
 
+def prediction(records: Sequence[Record]) -> dict | None:
+    """How well the gateway's KV index predicted what the engine served
+    from cache, over successful requests that carry a prediction: exact
+    agreement, the share over and under the engine's count, and the mean
+    error in tokens. Prompt agreement checks the edge tokenizer itself."""
+    rows = [r for r in records if r.ok and r.predicted_cached_tokens is not None]
+    if not rows:
+        return None
+    n = len(rows)
+    diffs = [r.predicted_cached_tokens - r.cached_tokens for r in rows]
+    prompt = sum(r.prompt_tokens for r in rows)
+    return {
+        "requests": n,
+        "prompt_agreement": sum(r.predicted_prompt_tokens == r.prompt_tokens for r in rows) / n,
+        "cached_agreement": sum(d == 0 for d in diffs) / n,
+        "over_predicted": sum(d > 0 for d in diffs) / n,
+        "under_predicted": sum(d < 0 for d in diffs) / n,
+        "mean_abs_error_tokens": sum(abs(d) for d in diffs) / n,
+        "predicted_hit_rate": sum(r.predicted_cached_tokens for r in rows) / prompt
+        if prompt
+        else 0.0,
+    }
+
+
 def summarize(records: Sequence[Record], warmup: float = 0.0, slo: Slo | None = None) -> dict:
     """Statistics over the requests scheduled at least `warmup` seconds after
     the first one. Latencies count from each request's scheduled time; rates
@@ -77,5 +101,6 @@ def summarize(records: Sequence[Record], warmup: float = 0.0, slo: Slo | None = 
         "prompt_tokens": prompt,
         "cached_tokens": cached,
         "hit_rate": cached / prompt if prompt else 0.0,
+        "prediction": prediction(ok),
         "replicas": dict(sorted(Counter(r.replica or "" for r in ok).items())),
     }

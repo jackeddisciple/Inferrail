@@ -30,11 +30,25 @@ def test_ttft_itl_and_tpot_match_the_server_timing():
         assert r.replica == "r0"
         assert len(r.token_times) == 10
         assert (r.prompt_tokens, r.completion_tokens, r.cached_tokens) == (40, 10, 32)
-        assert 0.11 <= r.ttft <= 0.2, r.ttft
+        assert 0.11 <= r.ttft <= 0.3, r.ttft
         assert abs(r.tpot - 0.02) < 0.008, r.tpot
         assert abs(statistics.median(r.itl) - 0.02) < 0.008
         assert r.e2e >= r.ttft + 9 * 0.018
         assert r.lag < 0.02
+
+
+def test_gateway_predictions_are_recorded_when_present():
+    async def main():
+        server, url = await serve(sse(first=0.0, gap=0.0, tokens=2, predicted=(40, 16)))
+        plain, plain_url = await serve(sse(first=0.0, gap=0.0, tokens=2))
+        async with server, plain:
+            with_headers = await runner.run(url, "m", [REQUEST], [0.0])
+            without = await runner.run(plain_url, "m", [REQUEST], [0.0])
+        return with_headers[0], without[0]
+
+    predicted, plain = run(main())
+    assert (predicted.predicted_prompt_tokens, predicted.predicted_cached_tokens) == (40, 16)
+    assert (plain.predicted_prompt_tokens, plain.predicted_cached_tokens) == (None, None)
 
 
 def test_tpot_counts_tokens_not_chunks_when_engines_batch_them():

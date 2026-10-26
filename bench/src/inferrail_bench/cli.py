@@ -78,13 +78,16 @@ async def measure(
 
 def describe(summary: dict) -> str:
     ttft = summary.get("ttft_s") or {}
-    return (
+    text = (
         f"{summary.get('ok', 0)}/{summary.get('requests', 0)} ok, "
         f"TTFT p50 {ttft.get('p50', float('nan')) * 1e3:.0f} ms "
         f"p99 {ttft.get('p99', float('nan')) * 1e3:.0f} ms, "
         f"hit rate {summary.get('hit_rate', 0):.2f}, "
         f"goodput {summary.get('goodput_rps', 0):.2f} req/s"
     )
+    if predicted := summary.get("prediction"):
+        text += f", predictions exact {predicted['cached_agreement']:.2f}"
+    return text
 
 
 def cmd_run(args: argparse.Namespace) -> int:

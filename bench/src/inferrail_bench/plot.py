@@ -116,6 +116,7 @@ COLUMNS = [
     ("goodput req/s", "goodput_rps", 1, ".2f"),
     ("hit rate", "hit_rate", 1, ".2f"),
     ("engine hit rate", "engine.hit_rate", 1, ".2f"),
+    ("prediction agreement", "prediction.cached_agreement", 1, ".2f"),
     ("errors", "errors", 1, ".0f"),
     ("send lag p99 ms", "lag_s.p99", 1e3, ".1f"),
 ]

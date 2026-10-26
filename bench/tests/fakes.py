@@ -53,14 +53,29 @@ def _event(payload: dict | str) -> bytes:
     return _chunk(f"data: {text}\n\n".encode())
 
 
-def sse(first: float, gap: float, tokens: int, replica: str = "r0", per_chunk: int = 1) -> Handler:
+def sse(
+    first: float,
+    gap: float,
+    tokens: int,
+    replica: str = "r0",
+    per_chunk: int = 1,
+    predicted: tuple[int, int] | None = None,
+) -> Handler:
     """Streams `tokens` content chunks of `per_chunk` tokens each, the first
-    after `first` seconds and the rest `gap` apart, then usage and [DONE]."""
+    after `first` seconds and the rest `gap` apart, then usage and [DONE].
+    `predicted` adds the gateway's prompt and cached token headers."""
+
+    headers = ""
+    if predicted is not None:
+        headers = (
+            f"x-inferrail-prompt-tokens: {predicted[0]}\r\n"
+            f"x-inferrail-cached-tokens: {predicted[1]}\r\n"
+        )
 
     async def handler(writer: asyncio.StreamWriter) -> None:
         writer.write(
             b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n"
-            + f"x-inferrail-replica: {replica}\r\n".encode()
+            + f"x-inferrail-replica: {replica}\r\n{headers}".encode()
             + b"transfer-encoding: chunked\r\n\r\n"
         )
         await writer.drain()

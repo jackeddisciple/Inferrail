@@ -67,6 +67,8 @@ def columns(records: Sequence[Record]) -> dict:
         "prompt_tokens": [r.prompt_tokens for r in records],
         "cached_tokens": [r.cached_tokens for r in records],
         "completion_tokens": [r.completion_tokens for r in records],
+        "predicted_prompt_tokens": [r.predicted_prompt_tokens for r in records],
+        "predicted_cached_tokens": [r.predicted_cached_tokens for r in records],
         "error": [r.error for r in records],
     }
 
