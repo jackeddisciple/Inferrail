@@ -5,9 +5,17 @@
 //! chat requests exactly as vLLM v0.31.0 does with transformers 5.17 and
 //! tokenizing the result with the same pipeline.
 
+mod chat;
 mod error;
+mod hf;
+mod model;
+mod python;
 pub mod sim;
 mod source;
+mod template;
 
 pub use error::TokenizeError;
+pub use hf::Parity;
+pub use model::{Encoded, Endpoint, ModelTokenizer, TokenizerOptions};
 pub use source::{SIM, Source, resolve};
+pub use template::{Clock, ContentFormat};

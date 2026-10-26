@@ -29,6 +29,9 @@ humantime-serde = "1.1.1"
 hyper = { version = "1.12.0", features = ["client", "http1", "http2", "server"] }
 hyper-util = { version = "0.1.21", features = ["client-legacy", "http1", "http2", "server-auto", "server-graceful", "service", "tokio"] }
 insta = "1.49.0"
+jiff = "0.2.38"
+minijinja = { version = "3.0.3", default-features = false, features = ["adjacent_loop_items", "builtins", "fuel", "loop_controls", "macros", "multi_template", "preserve_order", "serde", "stacker", "unstable_machinery"] }
+minijinja-contrib = { version = "3.0.3", features = ["pycompat"] }
 opentelemetry = { version = "0.33.1", default-features = false, features = ["trace"] }
 opentelemetry-otlp = { version = "0.33.1", default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace"] }
 opentelemetry_sdk = { version = "0.33.1", default-features = false, features = ["trace"] }
@@ -39,6 +42,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["float_roundtrip", "raw_value"] }
 serde-saphyr = "2.0.0"
 thiserror = "2.0.21"
+tokenizers = { version = "0.23.2", default-features = false, features = ["onig"] }
 tokio = { version = "1.54.1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tower = { version = "0.5.3", default-features = false, features = ["util"] }
 tracing = "0.1.44"

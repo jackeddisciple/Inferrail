@@ -1,0 +1,3 @@
+[advisories]
+# paste is unmaintained, not vulnerable: a compile time macro that tokenizers uses.
+ignore = ["RUSTSEC-2024-0436"]

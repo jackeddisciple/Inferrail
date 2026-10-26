@@ -10,8 +10,13 @@ publish.workspace = true
 
 [dependencies]
 inferrail-core.workspace = true
+jiff.workspace = true
+minijinja.workspace = true
+minijinja-contrib.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+tokenizers.workspace = true
 xxhash-rust.workspace = true
 
 [dev-dependencies]
