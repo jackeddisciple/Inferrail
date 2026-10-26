@@ -1233,6 +1233,7 @@ dependencies = [
 name = "inferrail-index"
 version = "0.1.5"
 dependencies = [
+ "criterion",
  "inferrail-core",
  "proptest",
 ]
