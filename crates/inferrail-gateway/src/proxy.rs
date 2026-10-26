@@ -13,11 +13,12 @@ use inferrail_tokenize::Endpoint;
 use tokio::time::{Instant, sleep, timeout, timeout_at};
 use tracing::field::Empty;
 use tracing::{Instrument, Span};
+use xxhash_rust::xxh3::xxh3_64_with_seed;
 
 use crate::body::{Recording, ResponseBody, UpstreamBody};
 use crate::decision_log::{self, Decision};
 use crate::errors::GatewayError;
-use crate::headers::{self, CACHED_TOKENS, PROMPT_TOKENS, REPLICA};
+use crate::headers::{self, CACHED_TOKENS, PROMPT_TOKENS, REPLICA, SESSION_ID};
 use crate::inspect::{InspectError, inspect};
 use crate::metrics::Routed;
 use crate::prompts::{self, Prompt, Skip};
@@ -197,7 +198,8 @@ async fn attempt(
     let body = timeout_at(deadline, read_body(&parts.headers, body, limit))
         .await
         .map_err(|_| GatewayError::slow_body())??;
-    let (model, body) = resolve_model(shared, body)?;
+    let Resolved { model, body, user } = resolve_model(shared, body)?;
+    let session = session_key(&parts.headers, user.as_deref());
     Span::current().record("gen_ai.request.model", model.as_str());
     seen.model = Some(model.clone());
     if shared.config.logging.log_prompts {
@@ -259,7 +261,7 @@ async fn attempt(
             tokens,
             prompt: prompt.as_ref(),
             index: shared.index.as_deref(),
-            session: None,
+            session,
             cost: shared.cost(&model),
             max_age: shared.config.load.max_age,
             explain: sampled.is_some(),
@@ -498,14 +500,37 @@ async fn read_body(
     Ok(first.unwrap_or_else(|| Bytes::from(joined)))
 }
 
+/// A request's model, its body as the engine should see it, and its
+/// `user` field.
+struct Resolved {
+    model: ModelId,
+    body: Bytes,
+    user: Option<String>,
+}
+
+/// Names a conversation for session affinity: `x-session-id` when sent,
+/// otherwise the request's `user` field.
+fn session_key(headers: &HeaderMap, user: Option<&str>) -> Option<u64> {
+    if let Some(id) = headers
+        .get(SESSION_ID)
+        .map(HeaderValue::as_bytes)
+        .filter(|id| !id.is_empty())
+    {
+        return Some(xxh3_64_with_seed(id, 1));
+    }
+    user.filter(|u| !u.is_empty())
+        .map(|u| xxh3_64_with_seed(u.as_bytes(), 2))
+}
+
 /// Resolves the requested name to a served model. The body is only
 /// rewritten when the engine would otherwise see a different name.
-fn resolve_model(shared: &Shared, body: Bytes) -> Result<(ModelId, Bytes), GatewayError> {
-    let (model, rewritten) = {
+fn resolve_model(shared: &Shared, body: Bytes) -> Result<Resolved, GatewayError> {
+    let (model, rewritten, user) = {
         let inspected = inspect(&body).map_err(|err| match err {
             InspectError::ModelNotString => GatewayError::bad_param(err.to_string(), "model"),
             _ => GatewayError::bad_request(err.to_string()),
         })?;
+        let user = inspected.user.as_deref().map(str::to_owned);
         match inspected.model.as_deref() {
             Some(name) => {
                 let model = shared
@@ -515,7 +540,7 @@ fn resolve_model(shared: &Shared, body: Bytes) -> Result<(ModelId, Bytes), Gatew
                     .clone();
                 let rewrite =
                     (model.as_str() != name).then(|| inspected.with_model(&body, model.as_str()));
-                (model, rewrite)
+                (model, rewrite, user)
             }
             None => {
                 let [only] = shared.config.models.as_slice() else {
@@ -525,11 +550,15 @@ fn resolve_model(shared: &Shared, body: Bytes) -> Result<(ModelId, Bytes), Gatew
                     ));
                 };
                 let rewrite = inspected.with_model(&body, only.name.as_str());
-                (only.name.clone(), Some(rewrite))
+                (only.name.clone(), Some(rewrite), user)
             }
         }
     };
-    Ok((model, rewritten.map_or(body, Bytes::from)))
+    Ok(Resolved {
+        model,
+        body: rewritten.map_or(body, Bytes::from),
+        user,
+    })
 }
 
 fn upstream_request(

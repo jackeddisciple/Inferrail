@@ -3,6 +3,7 @@
 use std::borrow::Cow;
 use std::ops::Range;
 
+use serde::de::{IgnoredAny, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use serde_json::value::RawValue;
 
@@ -16,22 +17,67 @@ pub enum InspectError {
     ModelNotString,
 }
 
-#[derive(Deserialize)]
+/// The fields routing reads. A repeated `model` is refused, as before; a
+/// repeated `user` keeps its last value, as Python's JSON reader does.
+#[derive(Default)]
 struct Peek<'a> {
-    #[serde(default, borrow, deserialize_with = "present")]
     model: Option<&'a RawValue>,
+    user: Option<&'a RawValue>,
 }
 
-fn present<'de, D: Deserializer<'de>>(d: D) -> Result<Option<&'de RawValue>, D::Error> {
-    <&RawValue>::deserialize(d).map(Some)
+impl<'de> Deserialize<'de> for Peek<'de> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_map(PeekVisitor)
+    }
+}
+
+struct PeekVisitor;
+
+impl<'de> Visitor<'de> for PeekVisitor {
+    type Value = Peek<'de>;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a JSON object")
+    }
+
+    fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<Peek<'de>, M::Error> {
+        let mut peek = Peek::default();
+        while let Some(key) = map.next_key::<Cow<'de, str>>()? {
+            match key.as_ref() {
+                "model" if peek.model.is_some() => {
+                    return Err(serde::de::Error::duplicate_field("model"));
+                }
+                "model" => peek.model = Some(map.next_value()?),
+                "user" => peek.user = Some(map.next_value()?),
+                _ => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+        Ok(peek)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Inspected<'a> {
     /// The requested model; `None` when the field is absent or null.
     pub model: Option<Cow<'a, str>>,
+    /// The `user` field when it is a string, which names a conversation for
+    /// session affinity.
+    pub user: Option<Cow<'a, str>>,
     span: Option<Range<usize>>,
     open: usize,
+}
+
+fn string(raw: &RawValue) -> Option<Cow<'_, str>> {
+    let text = raw.get();
+    if !text.starts_with('"') {
+        return None;
+    }
+    match serde_json::from_str::<&str>(text) {
+        Ok(value) => Some(Cow::Borrowed(value)),
+        Err(_) => serde_json::from_str::<String>(text).ok().map(Cow::Owned),
+    }
 }
 
 const BOM: &[u8] = b"\xef\xbb\xbf";
@@ -49,9 +95,11 @@ pub fn inspect(body: &[u8]) -> Result<Inspected<'_>, InspectError> {
         .ok_or(InspectError::NotAnObject)?;
     let peek: Peek<'_> =
         serde_json::from_slice(json).map_err(|e| InspectError::InvalidJson(e.to_string()))?;
+    let user = peek.user.and_then(string);
     let Some(raw) = peek.model else {
         return Ok(Inspected {
             model: None,
+            user,
             span: None,
             open,
         });
@@ -73,6 +121,7 @@ pub fn inspect(body: &[u8]) -> Result<Inspected<'_>, InspectError> {
     };
     Ok(Inspected {
         model,
+        user,
         span: body.get(span.clone()).map(|_| span),
         open,
     })
@@ -151,6 +200,33 @@ mod tests {
         for bad in ["\u{feff}\u{feff}{}", "\u{feff}[]", " \u{feff}{}"] {
             assert!(inspect(bad.as_bytes()).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn a_string_user_is_read_and_a_repeated_one_keeps_the_last() {
+        let user = |body: &str| {
+            inspect(body.as_bytes())
+                .map(|i| i.user.map(Cow::into_owned))
+                .unwrap()
+        };
+        assert_eq!(
+            user(r#"{"model":"m","user":"alice"}"#).as_deref(),
+            Some("alice")
+        );
+        assert_eq!(user(r#"{"user":"a\u0062c"}"#).as_deref(), Some("abc"));
+        assert_eq!(user(r#"{"user":"a","user":"b"}"#).as_deref(), Some("b"));
+        for body in [
+            r#"{"user":7}"#,
+            r#"{"user":null}"#,
+            r#"{"user":["a"]}"#,
+            "{}",
+        ] {
+            assert_eq!(user(body), None, "{body}");
+        }
+        assert!(matches!(
+            inspect(br#"{"user":"a"}"#).unwrap().user,
+            Some(Cow::Borrowed("a"))
+        ));
     }
 
     #[test]

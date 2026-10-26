@@ -18,6 +18,8 @@ pub const PROMPT_TOKENS: HeaderName = HeaderName::from_static("x-inferrail-promp
 /// Prompt tokens the KV index predicted the chosen replica had cached; absent
 /// when the index made no prediction.
 pub const CACHED_TOKENS: HeaderName = HeaderName::from_static("x-inferrail-cached-tokens");
+/// Names the conversation a request belongs to, for session affinity.
+pub const SESSION_ID: HeaderName = HeaderName::from_static("x-session-id");
 
 pub fn strip_hop_by_hop(headers: &mut HeaderMap) {
     let listed: Vec<HeaderName> = headers

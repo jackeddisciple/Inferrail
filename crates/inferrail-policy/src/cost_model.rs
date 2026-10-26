@@ -4,7 +4,8 @@ use inferrail_core::config::PolicyKind;
 
 use crate::cost::{CostModel, Estimate, Hits};
 use crate::guards::{load_cap, under_pressure, within_load};
-use crate::hashing::{prefix_key, weight};
+use crate::hashing::{prefix_key, tag, weight};
+use crate::sessions::Sessions;
 use crate::sketch::Sketch;
 use crate::{
     Choice, Exclusion, Explanation, Guarded, HotPrefix, RouteContext, RoutingPolicy, Scored,
@@ -23,8 +24,9 @@ struct Hot {
 /// Inferrail's policy: the replica with the lowest estimated time to first
 /// token, `W + P + X`, among those the load guards allow. Bounded load
 /// skips replicas past their share of requests in flight, KV pressure keeps
-/// long prompts off replicas whose cache is nearly full, and a hot root
-/// prefix is spread over just enough owners.
+/// long prompts off replicas whose cache is nearly full, a hot root prefix
+/// is spread over just enough owners, and with session affinity a
+/// conversation stays on its last replica while that one is allowed.
 #[derive(Debug)]
 pub struct CostModelPolicy {
     cost: CostModel,
@@ -32,6 +34,7 @@ pub struct CostModelPolicy {
     kappa: f64,
     short_prompt_tokens: u32,
     hot: Option<Hot>,
+    sessions: Option<Sessions>,
     rng: SplitMix,
 }
 
@@ -66,6 +69,7 @@ impl CostModelPolicy {
                 utilization: hot.utilization,
                 sketch: Sketch::new(hot.window),
             }),
+            sessions: settings.session_affinity.then(Sessions::new),
             rng: SplitMix::new(settings.seed),
         }
     }
@@ -158,6 +162,12 @@ impl CostModelPolicy {
         }
     }
 
+    /// The conversation's last replica, unless a load guard rules it out.
+    fn sticky(&self, ctx: &RouteContext<'_>, plan: &Plan) -> Option<usize> {
+        let replica = self.sessions.as_ref()?.get(ctx.session?)?;
+        (0..ctx.candidates.len()).find(|&i| tag(ctx.candidates[i].id) == replica && plan.allowed(i))
+    }
+
     /// Whether candidate `i` is among the cheapest allowed: lowest estimate,
     /// then fewest requests in flight.
     fn cheapest(ctx: &RouteContext<'_>, plan: &Plan) -> impl Fn(usize) -> bool {
@@ -198,9 +208,17 @@ impl RoutingPolicy for CostModelPolicy {
             return None;
         }
         let plan = self.plan(ctx, true);
-        let best = Self::cheapest(ctx, &plan);
-        let index = pick_among(&self.rng, ctx.candidates.len(), best)?;
-        let steer = plan.owner[index].then_some(Steer::HotPrefix);
+        let (index, steer) = match self.sticky(ctx, &plan) {
+            Some(i) => (i, Some(Steer::Session)),
+            None => {
+                let best = Self::cheapest(ctx, &plan);
+                let i = pick_among(&self.rng, ctx.candidates.len(), best)?;
+                (i, plan.owner[i].then_some(Steer::HotPrefix))
+            }
+        };
+        if let (Some(sessions), Some(session)) = (&self.sessions, ctx.session) {
+            sessions.set(session, tag(ctx.candidates[index].id));
+        }
         Some(Choice {
             index,
             steer,
@@ -223,17 +241,23 @@ impl RoutingPolicy for CostModelPolicy {
                 owner: plan.owner[i],
             })
             .collect();
-        let best = Self::cheapest(ctx, &plan);
-        let tied: Vec<usize> = (0..n).filter(|&i| best(i)).collect();
-        let winner = (tied.len() == 1).then(|| tied[0]);
-        let decided_by = winner.and_then(|w| {
-            let runner_up = (0..n)
-                .filter(|&i| i != w && plan.allowed(i))
-                .min_by(|&a, &b| plan.ttft(a).total_cmp(&plan.ttft(b)))?;
-            (plan.ttft(runner_up) > plan.ttft(w))
-                .then(|| plan.estimates[w].ahead_of(&plan.estimates[runner_up]))
-        });
-        let steer = winner.filter(|&w| plan.owner[w]).map(|_| Steer::HotPrefix);
+        let (winner, steer, decided_by) = match self.sticky(ctx, &plan) {
+            Some(i) => (Some(i), Some(Steer::Session), None),
+            None => {
+                let best = Self::cheapest(ctx, &plan);
+                let tied: Vec<usize> = (0..n).filter(|&i| best(i)).collect();
+                let winner = (tied.len() == 1).then(|| tied[0]);
+                let decided_by = winner.and_then(|w| {
+                    let runner_up = (0..n)
+                        .filter(|&i| i != w && plan.allowed(i))
+                        .min_by(|&a, &b| plan.ttft(a).total_cmp(&plan.ttft(b)))?;
+                    (plan.ttft(runner_up) > plan.ttft(w))
+                        .then(|| plan.estimates[w].ahead_of(&plan.estimates[runner_up]))
+                });
+                let steer = winner.filter(|&w| plan.owner[w]).map(|_| Steer::HotPrefix);
+                (winner, steer, decided_by)
+            }
+        };
         Explanation {
             rule: RULE,
             winner,
@@ -358,6 +382,54 @@ mod tests {
         assert!(crate::testing::chi_square(&counts) < 16.27, "{counts:?}");
         let explained = policy.explain(&context(&pool, &candidates, 500, &[]));
         assert_eq!((explained.winner, explained.decided_by), (None, None));
+    }
+
+    #[test]
+    fn sessions_stick_until_their_replica_is_overloaded() {
+        let pool = Pool::new(3);
+        let policy = CostModelPolicy::new(&Settings {
+            session_affinity: true,
+            ..settings()
+        });
+        let session = |candidates: &[Candidate<'_>], key: u64| {
+            policy
+                .choose(&RouteContext {
+                    session: Some(key),
+                    prompt_tokens: 300,
+                    ..RouteContext::new(&pool.model, candidates)
+                })
+                .unwrap()
+        };
+        let calm = fleet(
+            &pool.ids,
+            &[(1, 0, 0.0, None), (1, 0, 0.3, None), (1, 0, 0.0, None)],
+        );
+        let first = session(&calm, 77);
+        assert_eq!(first.steer, None);
+        let mut cheaper = calm.clone();
+        cheaper[first.index].queued_secs = 0.2;
+        let again = session(&cheaper, 77);
+        assert_eq!(
+            (again.index, again.steer),
+            (first.index, Some(Steer::Session))
+        );
+        let mut hot = calm.clone();
+        hot[first.index].in_flight = 9;
+        let moved = session(&hot, 77);
+        assert_ne!(moved.index, first.index);
+        assert_eq!(moved.steer, None);
+        let back = session(&calm, 77);
+        assert_eq!(
+            (back.index, back.steer),
+            (moved.index, Some(Steer::Session))
+        );
+        let explained = policy.explain(&RouteContext {
+            session: Some(77),
+            prompt_tokens: 300,
+            ..RouteContext::new(&pool.model, &calm)
+        });
+        assert_eq!(explained.steer, Some(Steer::Session));
+        assert_eq!(explained.winner, Some(moved.index));
     }
 
     fn hot_settings(window: Duration) -> Settings {
@@ -527,6 +599,7 @@ mod tests {
             let policy = CostModelPolicy::new(&Settings {
                 epsilon,
                 seed,
+                session_affinity: true,
                 ..hot_settings(Duration::from_millis(100))
             });
             let prefixes: Vec<Vec<BlockHash>> = (0..4).map(|p| chain(p, 8)).collect();
@@ -595,6 +668,7 @@ mod tests {
             };
             let make = || CostModelPolicy::new(&Settings {
                 seed,
+                session_affinity: true,
                 ..Settings::seeded(seed)
             });
             let (plain, explained) = (make(), make());

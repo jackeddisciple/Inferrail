@@ -2,7 +2,7 @@
 //! to the same replicas on every gateway and across restarts.
 
 use inferrail_core::ids::{BlockHash, ReplicaId};
-use xxhash_rust::xxh3::xxh3_64_with_seed;
+use xxhash_rust::xxh3::{xxh3_64, xxh3_64_with_seed};
 
 /// The key of a prompt's first `blocks` blocks: the hash of the last of
 /// them, which names the whole prefix since hashes chain. A prompt with
@@ -17,6 +17,11 @@ pub(crate) fn prefix_key(hashes: &[BlockHash], blocks: u32) -> Option<u64> {
 /// it, and removing a replica only moves the keys it owned.
 pub(crate) fn weight(key: u64, replica: &ReplicaId) -> u64 {
     xxh3_64_with_seed(replica.as_str().as_bytes(), key)
+}
+
+/// A replica's tag for compact tables; never zero, so zero can mean empty.
+pub(crate) fn tag(replica: &ReplicaId) -> u32 {
+    (xxh3_64(replica.as_str().as_bytes()) as u32) | 1
 }
 
 #[cfg(test)]
@@ -41,7 +46,7 @@ mod tests {
     }
 
     #[test]
-    fn weights_spread_keys_evenly() {
+    fn weights_spread_keys_evenly_and_tags_are_never_zero() {
         let ids: Vec<ReplicaId> = (0..5)
             .map(|i| ReplicaId::new(format!("gpu-{i}")).unwrap())
             .collect();
@@ -52,5 +57,6 @@ mod tests {
         }
         let stat = crate::testing::chi_square(&owned);
         assert!(stat < 18.47, "chi square {stat} for {owned:?}");
+        assert!(ids.iter().all(|id| tag(id) != 0));
     }
 }
