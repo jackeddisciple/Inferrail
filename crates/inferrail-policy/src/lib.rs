@@ -23,11 +23,15 @@ pub use round_robin::RoundRobin;
 pub struct Candidate<'a> {
     pub id: &'a ReplicaId,
     pub in_flight: u32,
+    /// Prompt tokens the KV index predicts this replica serves from cache.
+    pub cached_tokens: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct RouteContext<'a> {
     pub model: &'a ModelId,
+    /// The prompt's length in tokens, when it was tokenized at the edge.
+    pub prompt_tokens: Option<u32>,
     pub candidates: &'a [Candidate<'a>],
 }
 
@@ -131,7 +135,7 @@ mod tests {
             let pool = Pool::new(loads.len());
             let candidates = pool.candidates(&loads);
             let policy = build(kind, seed);
-            let ctx = RouteContext { model: &pool.model, candidates: &candidates };
+            let ctx = RouteContext { model: &pool.model, prompt_tokens: None, candidates: &candidates };
             for _ in 0..8 {
                 match policy.choose(&ctx) {
                     None => prop_assert!(loads.is_empty()),
@@ -190,7 +194,11 @@ pub(crate) mod testing {
             self.ids
                 .iter()
                 .zip(loads.iter().copied().chain(std::iter::repeat(0)))
-                .map(|(id, in_flight)| Candidate { id, in_flight })
+                .map(|(id, in_flight)| Candidate {
+                    id,
+                    in_flight,
+                    cached_tokens: 0,
+                })
                 .collect()
         }
 
@@ -202,6 +210,7 @@ pub(crate) mod testing {
             policy
                 .choose(&RouteContext {
                     model: &self.model,
+                    prompt_tokens: None,
                     candidates,
                 })
                 .expect("a candidate")

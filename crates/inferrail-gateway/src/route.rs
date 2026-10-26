@@ -33,9 +33,11 @@ pub(crate) fn select(
         candidates.extend(eligible.iter().map(|r| Candidate {
             id: r.id(),
             in_flight: r.in_flight(),
+            cached_tokens: 0,
         }));
         let ctx = RouteContext {
             model,
+            prompt_tokens: None,
             candidates: &candidates,
         };
         let Some(i) = policy.choose(&ctx).filter(|&i| i < eligible.len()) else {

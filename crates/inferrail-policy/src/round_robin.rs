@@ -87,6 +87,7 @@ mod tests {
         let pool = Pool::new(0);
         let ctx = RouteContext {
             model: &pool.model,
+            prompt_tokens: None,
             candidates: &[],
         };
         assert_eq!(RoundRobin::default().choose(&ctx), None);

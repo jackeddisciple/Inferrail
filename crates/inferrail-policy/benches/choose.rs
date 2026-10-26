@@ -18,10 +18,12 @@ fn choose(c: &mut Criterion) {
             .map(|id| Candidate {
                 id,
                 in_flight: rng.below(64) as u32,
+                cached_tokens: 0,
             })
             .collect();
         let ctx = RouteContext {
             model: &model,
+            prompt_tokens: None,
             candidates: &candidates,
         };
         for kind in [

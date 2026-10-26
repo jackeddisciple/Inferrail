@@ -63,6 +63,7 @@ mod tests {
         assert_eq!(pool.pick(&policy, &pool.candidates(&[])), 0);
         let ctx = RouteContext {
             model: &pool.model,
+            prompt_tokens: None,
             candidates: &[],
         };
         assert_eq!(policy.choose(&ctx), None);
