@@ -5,6 +5,7 @@
 //! chat requests exactly as vLLM v0.31.0 does with transformers 5.17 and
 //! tokenizing the result with the same pipeline.
 
+mod case;
 mod chat;
 mod error;
 pub mod hash;

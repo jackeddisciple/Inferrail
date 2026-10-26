@@ -10,8 +10,8 @@ use minijinja::syntax::SyntaxConfig;
 use minijinja::value::{Kwargs, Rest, Value, ValueKind};
 use minijinja::{AutoEscape, Environment, Error, ErrorKind, UndefinedBehavior};
 
-use crate::TokenizeError;
 use crate::python::{self, JsonStyle};
+use crate::{TokenizeError, case};
 
 const NAME: &str = "chat";
 const FUEL: u64 = 50_000_000;
@@ -66,7 +66,15 @@ impl ChatTemplate {
         env.set_syntax(syntax);
         env.set_undefined_behavior(UndefinedBehavior::Chainable);
         env.set_auto_escape_callback(|_| AutoEscape::None);
-        env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
+        env.set_unknown_method_callback(|state, value, method, args| {
+            match (value.as_str(), method, args) {
+                (Some(text), "title", []) => Ok(Value::from(case::title(text))),
+                (Some(text), "capitalize", []) => Ok(Value::from(case::capitalize(text))),
+                _ => {
+                    minijinja_contrib::pycompat::unknown_method_callback(state, value, method, args)
+                }
+            }
+        });
         env.set_fuel(Some(FUEL));
         env.set_formatter(|out, _state, value| {
             if let Some(text) = value.as_str() {
@@ -80,11 +88,11 @@ impl ChatTemplate {
         env.add_filter("items", items);
         env.add_filter("length", length);
         env.add_filter("count", length);
-        env.add_filter("string", |value: Value| {
-            let mut text = String::new();
-            python::str_of(&value, &mut text);
-            text
+        env.add_filter("title", |value: Value| case::title_filter(&text_of(&value)));
+        env.add_filter("capitalize", |value: Value| {
+            case::capitalize(&text_of(&value))
         });
+        env.add_filter("string", |value: Value| text_of(&value));
         env.add_function(
             "raise_exception",
             |message: Value| -> Result<Value, Error> {
@@ -181,6 +189,12 @@ fn trim_markers(inner: &str) -> (&str, &str, &str) {
         inner[open.len()..inner.len() - close.len()].trim(),
         close,
     )
+}
+
+fn text_of(value: &Value) -> String {
+    let mut text = String::new();
+    python::str_of(value, &mut text);
+    text
 }
 
 /// Jinja2's `items`, which yields nothing for an undefined value.
