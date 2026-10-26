@@ -105,10 +105,46 @@ shared_id!(
     |c| !c.is_whitespace() && !c.is_control()
 );
 
+/// Names a full block of prompt tokens together with every token before
+/// it. The router computes these from token ids and never takes them from
+/// an engine, so they mean the same thing for every engine and version.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct BlockHash(u128);
+
+impl BlockHash {
+    pub const fn new(raw: u128) -> Self {
+        Self(raw)
+    }
+
+    pub const fn get(self) -> u128 {
+        self.0
+    }
+}
+
+impl fmt::Display for BlockHash {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:032x}", self.0)
+    }
+}
+
+impl fmt::Debug for BlockHash {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "BlockHash({self})")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    #[test]
+    fn block_hashes_print_as_fixed_width_hex() {
+        let hash = BlockHash::new(0xab);
+        assert_eq!(hash.to_string(), format!("{}ab", "0".repeat(30)));
+        assert_eq!(format!("{hash:?}"), format!("BlockHash({hash})"));
+        assert_eq!(BlockHash::new(u128::MAX).get(), u128::MAX);
+    }
 
     #[test]
     fn accepts_typical_names() {

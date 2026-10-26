@@ -7,6 +7,7 @@
 
 mod chat;
 mod error;
+pub mod hash;
 mod hf;
 mod model;
 mod python;

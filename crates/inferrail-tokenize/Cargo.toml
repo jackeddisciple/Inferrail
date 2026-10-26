@@ -31,3 +31,7 @@ workspace = true
 [[bench]]
 name = "tokenize"
 harness = false
+
+[[bench]]
+name = "hash"
+harness = false
