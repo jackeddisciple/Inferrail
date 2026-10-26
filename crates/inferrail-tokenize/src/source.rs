@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use crate::TokenizeError;
 
-pub const SIM: &str = "builtin:sim";
+pub const SIM: &str = inferrail_core::config::SIM_TOKENIZER;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Source {

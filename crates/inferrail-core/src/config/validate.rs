@@ -4,10 +4,13 @@ use std::time::Duration;
 
 use url::Url;
 
-use super::Config;
+use super::{Config, ContentFormat, ModelConfig, SIM_TOKENIZER};
 use crate::ids::ModelId;
 
 pub const MAX_BLOCK_SIZE: u32 = 4096;
+pub const MAX_TOKENIZER_WORKERS: usize = 256;
+pub const MAX_TOKENIZER_QUEUE: usize = 1 << 20;
+pub const MAX_CAPACITY_BLOCKS: u64 = 1 << 32;
 pub const MAX_RETRY_ATTEMPTS: u32 = 10;
 pub const MIN_SCRAPE_INTERVAL: Duration = Duration::from_millis(10);
 const LOG_LEVELS: [&str; 5] = ["trace", "debug", "info", "warn", "error"];
@@ -123,6 +126,59 @@ fn check_models(path: &str, models: &[ModelId], known: &HashSet<&str>, c: &mut C
     }
 }
 
+fn check_tokenization(path: &str, model: &ModelConfig, c: &mut Collector) {
+    let overrides = [
+        ("chat_template", model.chat_template.is_some()),
+        (
+            "chat_template_kwargs",
+            !model.chat_template_kwargs.is_empty(),
+        ),
+        (
+            "chat_template_content_format",
+            model.chat_template_content_format != ContentFormat::Auto,
+        ),
+    ];
+    match model.tokenizer.as_deref() {
+        None => {
+            for (field, set) in overrides {
+                if set {
+                    c.push(format!("{path}.{field}"), "needs a tokenizer");
+                }
+            }
+        }
+        Some(spec) if spec.trim().is_empty() || spec.trim() != spec => c.push(
+            format!("{path}.tokenizer"),
+            "must be a model directory, a Hugging Face repository id or builtin:sim",
+        ),
+        Some(SIM_TOKENIZER) => {
+            for (field, set) in overrides {
+                if set {
+                    c.push(
+                        format!("{path}.{field}"),
+                        "does not apply to the simulator's own tokenizer",
+                    );
+                }
+            }
+        }
+        Some(_) => {}
+    }
+    if model
+        .chat_template
+        .as_ref()
+        .is_some_and(|p| p.as_os_str().is_empty())
+    {
+        c.push(format!("{path}.chat_template"), "must not be empty");
+    }
+    for key in model.chat_template_kwargs.keys() {
+        if matches!(key.as_str(), "chat_template" | "tokenize") {
+            c.push(
+                format!("{path}.chat_template_kwargs.{key}"),
+                "is not allowed; vLLM refuses it too",
+            );
+        }
+    }
+}
+
 fn check_limits(
     path: &str,
     kv_capacity_blocks: Option<u64>,
@@ -155,6 +211,15 @@ impl Config {
         self.check_retry(&mut c);
         self.check_load(&mut c);
         self.check_observability(&mut c);
+        self.check_tokenizer(&mut c);
+        if self.index.default_capacity_blocks == 0
+            || self.index.default_capacity_blocks > MAX_CAPACITY_BLOCKS
+        {
+            c.push(
+                "index.default_capacity_blocks",
+                format!("must be between 1 and {MAX_CAPACITY_BLOCKS}"),
+            );
+        }
         if !LOG_LEVELS.contains(&self.logging.level.as_str()) {
             c.push(
                 "logging.level",
@@ -220,6 +285,30 @@ impl Config {
             if !self.is_served(&model.name) {
                 c.push(format!("{path}.name"), format!("no replica serves {own:?}"));
             }
+            check_tokenization(&path, model, c);
+        }
+    }
+
+    fn check_tokenizer(&self, c: &mut Collector) {
+        let tokenizer = &self.tokenizer;
+        if tokenizer.workers > MAX_TOKENIZER_WORKERS {
+            c.push(
+                "tokenizer.workers",
+                format!("must be at most {MAX_TOKENIZER_WORKERS}"),
+            );
+        }
+        if tokenizer.queue == 0 || tokenizer.queue > MAX_TOKENIZER_QUEUE {
+            c.push(
+                "tokenizer.queue",
+                format!("must be between 1 and {MAX_TOKENIZER_QUEUE}"),
+            );
+        }
+        c.positive("tokenizer.max_wait", tokenizer.max_wait);
+        if tokenizer.max_wait > self.server.request_timeout {
+            c.push(
+                "tokenizer.max_wait",
+                "must not exceed server.request_timeout",
+            );
         }
     }
 
@@ -394,8 +483,10 @@ impl Config {
 mod tests {
     use std::time::Duration;
 
-    use super::super::{Config, ConfigError, DnsGroupConfig, ReplicaConfig};
-    use super::MAX_BLOCK_SIZE;
+    use super::super::{
+        Config, ConfigError, ContentFormat, DnsGroupConfig, ReplicaConfig, SIM_TOKENIZER,
+    };
+    use super::{MAX_BLOCK_SIZE, MAX_CAPACITY_BLOCKS, MAX_TOKENIZER_QUEUE, MAX_TOKENIZER_WORKERS};
     use crate::ids::{ModelId, ReplicaId};
     use proptest::prelude::*;
 
@@ -856,6 +947,76 @@ discovery:
             Some("http://collector:4318/v1/traces".parse().unwrap());
         config.observability.trace_sample_ratio = 0.0;
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn tokenizer_settings_are_checked() {
+        let mut config = base();
+        config.models[0].chat_template = Some("/t.jinja".into());
+        config.models[0]
+            .chat_template_kwargs
+            .insert("x".into(), serde_json::json!(1));
+        let found = issues(&config);
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert!(found.iter().all(|i| i.ends_with("needs a tokenizer")));
+        config.models[0].tokenizer = Some("/models/llama".into());
+        assert!(config.validate().is_ok());
+        config.models[0].tokenizer = Some(SIM_TOKENIZER.into());
+        assert_eq!(issues(&config).len(), 2);
+        config.models[0].chat_template = None;
+        config.models[0].chat_template_kwargs.clear();
+        config.models[0].chat_template_content_format = ContentFormat::String;
+        assert!(only_issue(&config).contains("simulator"));
+        config.models[0].chat_template_content_format = ContentFormat::Auto;
+        for bad in ["", " padded", "/x "] {
+            config.models[0].tokenizer = Some(bad.into());
+            assert!(
+                only_issue(&config).starts_with("models[0].tokenizer"),
+                "{bad:?}"
+            );
+        }
+        config.models[0].tokenizer = Some("org/model".into());
+        for key in ["tokenize", "chat_template"] {
+            config.models[0].chat_template_kwargs.clear();
+            config.models[0]
+                .chat_template_kwargs
+                .insert(key.into(), serde_json::json!(true));
+            assert!(only_issue(&config).contains(&format!("chat_template_kwargs.{key}")));
+        }
+        config.models[0].chat_template_kwargs.clear();
+        config.models[0].chat_template = Some("".into());
+        assert!(only_issue(&config).contains("must not be empty"));
+    }
+
+    #[test]
+    fn tokenizer_pool_and_index_limits() {
+        let mut config = base();
+        config.tokenizer.workers = MAX_TOKENIZER_WORKERS + 1;
+        config.tokenizer.queue = 0;
+        config.tokenizer.max_wait = Duration::ZERO;
+        config.index.default_capacity_blocks = 0;
+        let found = issues(&config);
+        for path in [
+            "tokenizer.workers",
+            "tokenizer.queue",
+            "tokenizer.max_wait",
+            "index.default_capacity_blocks",
+        ] {
+            assert!(
+                found.iter().any(|i| i.starts_with(path)),
+                "{path}: {found:?}"
+            );
+        }
+        config.tokenizer.workers = MAX_TOKENIZER_WORKERS;
+        config.tokenizer.queue = MAX_TOKENIZER_QUEUE;
+        config.tokenizer.max_wait = Duration::from_secs(1);
+        config.index.default_capacity_blocks = MAX_CAPACITY_BLOCKS;
+        assert!(config.validate().is_ok());
+        config.tokenizer.max_wait = Duration::from_secs(3600);
+        assert!(only_issue(&config).starts_with("tokenizer.max_wait"));
+        config.tokenizer.max_wait = Duration::from_secs(1);
+        config.index.default_capacity_blocks = MAX_CAPACITY_BLOCKS + 1;
+        assert!(only_issue(&config).starts_with("index.default_capacity_blocks"));
     }
 
     #[test]

@@ -9,6 +9,11 @@ server:
   header_read_timeout: 30s
   shutdown_timeout: 30s
 
+# A model's tokenizer is a model directory, a repository id already in the
+# local Hugging Face cache (org/name or org/name@revision), or builtin:sim for
+# inferrail-sim. Models without one are routed without cache predictions.
+# chat_template, chat_template_content_format and chat_template_kwargs mirror
+# the vLLM flags of the same names and must match how the engines run.
 models:
   - name: meta-llama/Llama-3.1-8B-Instruct
     aliases: [llama-8b]
@@ -16,6 +21,9 @@ models:
     tokenizer: meta-llama/Llama-3.1-8B-Instruct
   - name: Qwen/Qwen3-8B
     policy: least_request
+    tokenizer: Qwen/Qwen3-8B
+    chat_template_kwargs:
+      enable_thinking: false
 
 replicas:
   - id: gpu-0
@@ -76,6 +84,23 @@ load:
   scrape_interval: 100ms
   scrape_timeout: 100ms
   max_age: 250ms
+
+# Prompts are tokenized at the edge. Short ones are tokenized on the request's
+# own thread, long ones on the worker pool; a request that finds the queue
+# full, or waits longer than max_wait, is routed without a cache prediction.
+# Repeated prompt pieces (system prompts, earlier turns) are kept per model.
+tokenizer:
+  workers: 0
+  queue: 1024
+  max_wait: 50ms
+  cache_tokens: 4194304
+
+# Every routed prompt is recorded as cached on the replica it went to, in a
+# shadow LRU sized to that replica's KV capacity: kv_capacity_blocks when
+# set, otherwise what its engine reports, otherwise default_capacity_blocks.
+index:
+  enabled: true
+  default_capacity_blocks: 16384
 
 # Prometheus metrics are always served on server.admin_listen at /metrics.
 observability:

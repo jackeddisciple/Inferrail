@@ -6,6 +6,7 @@ server:
 models:
   - name: inferrail/sim-8b
     aliases: [sim]
+    tokenizer: builtin:sim
 
 replicas:
   - id: sim-0

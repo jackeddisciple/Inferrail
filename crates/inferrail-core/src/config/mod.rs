@@ -1,5 +1,6 @@
 //! Gateway configuration: YAML schema, defaults and loading.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -13,12 +14,16 @@ use crate::ids::{ModelId, ReplicaId};
 mod validate;
 
 pub use validate::{
-    ConfigIssue, ConfigIssues, MAX_BLOCK_SIZE, MAX_RETRY_ATTEMPTS, MIN_SCRAPE_INTERVAL,
+    ConfigIssue, ConfigIssues, MAX_BLOCK_SIZE, MAX_CAPACITY_BLOCKS, MAX_RETRY_ATTEMPTS,
+    MAX_TOKENIZER_QUEUE, MAX_TOKENIZER_WORKERS, MIN_SCRAPE_INTERVAL,
 };
 
 pub const DEFAULT_BLOCK_SIZE: u32 = 16;
 pub const DEFAULT_EPSILON: f64 = 0.25;
 pub const DEFAULT_KAPPA: f64 = 0.92;
+pub const DEFAULT_CAPACITY_BLOCKS: u64 = 16_384;
+/// The tokenizer of `inferrail-sim`, which needs no model files.
+pub const SIM_TOKENIZER: &str = "builtin:sim";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -59,6 +64,10 @@ pub struct Config {
     pub load: LoadConfig,
     #[serde(default)]
     pub observability: ObservabilityConfig,
+    #[serde(default)]
+    pub tokenizer: TokenizerConfig,
+    #[serde(default)]
+    pub index: IndexConfig,
 }
 
 impl Config {
@@ -171,8 +180,35 @@ pub struct ModelConfig {
     pub policy: Option<PolicyKind>,
     #[serde(default = "default_block_size")]
     pub block_size: u32,
+    /// A model directory, a repository id already in the local Hugging Face
+    /// cache (`org/name` or `org/name@revision`), or `builtin:sim`. Without
+    /// one the model is routed without cache predictions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tokenizer: Option<String>,
+    /// A template file used instead of the model's, as vLLM's `--chat-template`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_template: Option<PathBuf>,
+    /// As vLLM's `--chat-template-content-format`.
+    #[serde(default, skip_serializing_if = "ContentFormat::is_auto")]
+    pub chat_template_content_format: ContentFormat,
+    /// As vLLM's `--default-chat-template-kwargs`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub chat_template_kwargs: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContentFormat {
+    #[default]
+    Auto,
+    String,
+    Openai,
+}
+
+impl ContentFormat {
+    pub fn is_auto(&self) -> bool {
+        *self == Self::Auto
+    }
 }
 
 fn default_block_size() -> u32 {
@@ -398,6 +434,55 @@ impl Default for ObservabilityConfig {
     }
 }
 
+/// Edge tokenization: where long prompts are tokenized and how much of the
+/// work is kept for reuse.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct TokenizerConfig {
+    /// Threads that tokenize long prompts off the request path; zero uses
+    /// half the cores.
+    pub workers: usize,
+    /// Prompts waiting for a worker. A request that finds the queue full is
+    /// routed without a cache prediction rather than made to wait.
+    pub queue: usize,
+    /// The longest a request waits for its prompt to be tokenized before it
+    /// is routed without a cache prediction.
+    #[serde(with = "humantime_serde")]
+    pub max_wait: Duration,
+    /// Token ids of repeated prompt pieces kept per model; zero disables.
+    pub cache_tokens: usize,
+}
+
+impl Default for TokenizerConfig {
+    fn default() -> Self {
+        Self {
+            workers: 0,
+            queue: 1024,
+            max_wait: Duration::from_millis(50),
+            cache_tokens: 1 << 22,
+        }
+    }
+}
+
+/// The KV index in approximate mode, built from the gateway's own routing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct IndexConfig {
+    pub enabled: bool,
+    /// KV capacity assumed for a replica without `kv_capacity_blocks` until
+    /// its engine reports one.
+    pub default_capacity_blocks: u64,
+}
+
+impl Default for IndexConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            default_capacity_blocks: DEFAULT_CAPACITY_BLOCKS,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct DecisionLogConfig {
@@ -451,6 +536,51 @@ replicas:
             config.observability.decision_log,
             DecisionLogConfig::default()
         );
+        assert_eq!(config.models[0].tokenizer, None);
+        assert!(config.models[0].chat_template_content_format.is_auto());
+        assert_eq!(config.tokenizer.workers, 0);
+        assert_eq!(config.tokenizer.queue, 1024);
+        assert_eq!(config.tokenizer.max_wait, Duration::from_millis(50));
+        assert_eq!(config.tokenizer.cache_tokens, 1 << 22);
+        assert!(config.index.enabled);
+        assert_eq!(config.index.default_capacity_blocks, 16_384);
+    }
+
+    #[test]
+    fn tokenizer_and_index_settings_parse() {
+        let text = MINIMAL.replace(
+            "  - name: meta-llama/Llama-3.1-8B-Instruct\n",
+            "  - name: meta-llama/Llama-3.1-8B-Instruct\n    tokenizer: /models/llama\n    chat_template: /etc/t.jinja\n    chat_template_content_format: openai\n    chat_template_kwargs: {enable_thinking: false, depth: 2, tags: [a]}\n",
+        );
+        let config = Config::from_yaml_str(&format!(
+            "{text}tokenizer:\n  workers: 4\n  queue: 16\n  max_wait: 5ms\n  cache_tokens: 0\nindex:\n  enabled: false\n  default_capacity_blocks: 512\n"
+        ))
+        .unwrap();
+        let model = &config.models[0];
+        assert_eq!(model.tokenizer.as_deref(), Some("/models/llama"));
+        assert_eq!(
+            model.chat_template.as_deref(),
+            Some(Path::new("/etc/t.jinja"))
+        );
+        assert_eq!(model.chat_template_content_format, ContentFormat::Openai);
+        assert_eq!(
+            model.chat_template_kwargs["enable_thinking"],
+            serde_json::json!(false)
+        );
+        assert_eq!(model.chat_template_kwargs["tags"], serde_json::json!(["a"]));
+        assert_eq!(
+            config.tokenizer,
+            TokenizerConfig {
+                workers: 4,
+                queue: 16,
+                max_wait: Duration::from_millis(5),
+                cache_tokens: 0
+            }
+        );
+        assert!(!config.index.enabled);
+        assert_eq!(config.index.default_capacity_blocks, 512);
+        let again = Config::from_yaml_str(&config.to_yaml_string().unwrap()).unwrap();
+        assert_eq!(again, config);
     }
 
     #[test]
@@ -528,6 +658,8 @@ replicas:
             "load:\n  interval: 1s\n",
             "observability:\n  jaeger: true\n",
             "observability:\n  decision_log:\n    rate: 1\n",
+            "tokenizer:\n  threads: 2\n",
+            "index:\n  mode: exact\n",
             "discovery:\n  dns:\n    - name: p\n      url: http://p:1\n      models: [meta-llama/Llama-3.1-8B-Instruct]\n      ttl: 5s\n",
         ] {
             let err = Config::from_yaml_str(&format!("{MINIMAL}{extra}")).unwrap_err();

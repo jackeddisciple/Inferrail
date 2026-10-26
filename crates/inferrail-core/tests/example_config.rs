@@ -27,6 +27,11 @@ fn shipped_example_config_is_valid() {
     assert_eq!(config.replicas_serving(&qwen.name).count(), 1);
     assert!(config.is_served(&qwen.name));
     assert_eq!(config.discovery.dns[0].max_concurrency, Some(128));
+    assert_eq!(qwen.tokenizer.as_deref(), Some("Qwen/Qwen3-8B"));
+    assert_eq!(
+        qwen.chat_template_kwargs["enable_thinking"],
+        serde_json::json!(false)
+    );
 }
 
 #[test]
@@ -40,4 +45,6 @@ fn example_documents_the_defaults() {
     assert_eq!(config.upstream, Default::default());
     assert_eq!(config.load, Default::default());
     assert_eq!(config.observability, Default::default());
+    assert_eq!(config.tokenizer, Default::default());
+    assert_eq!(config.index, Default::default());
 }
