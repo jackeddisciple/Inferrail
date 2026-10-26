@@ -1232,6 +1232,10 @@ dependencies = [
 [[package]]
 name = "inferrail-index"
 version = "0.1.5"
+dependencies = [
+ "inferrail-core",
+ "proptest",
+]
 
 [[package]]
 name = "inferrail-load"
