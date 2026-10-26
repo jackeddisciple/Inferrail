@@ -3,6 +3,123 @@
 Notable changes to Inferrail. Versions follow
 [Semantic Versioning](https://semver.org).
 
+## [0.1.6] Tokens, Block Hashes and the Approximate KV Index (26 October 2026)
+
+The gateway now sees prompts as the engines see them: it tokenizes every
+request with token ids identical to vLLM's, hashes the tokens into chained
+blocks, and predicts for every replica how much of the prompt it already
+holds. The policies that act on those predictions come next.
+
+### Added
+
+#### `inferrail-tokenize`
+
+* Hugging Face tokenizers loaded the way transformers 5.17 loads them,
+  including the pipelines `LlamaTokenizer`, `Qwen2Tokenizer` and
+  `GPT2Tokenizer` rebuild instead of using `tokenizer.json` as written, the
+  added tokens of `tokenizer_config.json` and the special tokens templates
+  see. Other classes load as written and are logged as unverified.
+* Chat templates on minijinja set up as transformers sets up Jinja2:
+  `trim_blocks` and `lstrip_blocks`, loop controls, Python string and dict
+  methods, `tojson` as `json.dumps`, `raise_exception`, `strftime_now`,
+  Python formatting of printed values, named templates such as `tool_use`,
+  `chat_template.jinja` files and a template override.
+* Chat requests prepared as vLLM v0.31.0 prepares them: messages rebuilt
+  from the fields vLLM reads, text parts joined or wrapped by the content
+  format vLLM detects from the template's syntax tree, tool call arguments
+  parsed into objects, tools dumped from vLLM's schema, developer messages,
+  `continue_final_message`, `reasoning_effort`, `documents`, and template
+  keywords merged and filtered as vLLM does. Completions take text or token
+  ids, and every request's `cache_salt` is kept.
+* A cache of repeated prompt pieces per model, exact because tokenizers
+  handle the text between added tokens on its own, and disabled for
+  pipelines where that does not hold.
+* Chained XXH3 128 bit block hashes over full blocks, salted by model, LoRA
+  adapter and `cache_salt`, at about 5.5 ns per block.
+* Tokenizers found in a model directory, the local Hugging Face cache or
+  `builtin:sim`, the simulator's tokenizer, which moved here from
+  `inferrail-sim`.
+
+#### `inferrail-index`
+
+* The KV index in approximate mode: a 64 way sharded map from block hash to
+  replicas, a shadow LRU per replica sized to its KV capacity, and longest
+  prefix lookup at about 4.8 ns per block, flat in the number of replicas up
+  to 64. Forgotten replicas' slots are reused under a new generation, so a
+  stale handle never writes into them.
+
+#### `inferrail-gateway`
+
+* Prompts tokenized and hashed at the edge, short bodies on the request's
+  task and long ones on a bounded worker pool. A request that finds the pool
+  full or waits longer than `tokenizer.max_wait` is routed without a
+  prediction instead of waiting.
+* Every routing candidate offered with the prompt tokens the index predicts
+  it has cached, and every routed prompt recorded on the chosen replica,
+  with capacity from `kv_capacity_blocks`, the engine's metrics or
+  `index.default_capacity_blocks`.
+* `x-inferrail-prompt-tokens` and `x-inferrail-cached-tokens` on proxied
+  responses, prompt and cached tokens on route spans and in the decision
+  log, and the metrics `inferrail_tokenized_requests`,
+  `inferrail_tokenize_seconds`, `inferrail_prompt_tokens`,
+  `inferrail_predicted_cached_tokens`, `inferrail_tokenize_cache_lookups`,
+  `inferrail_index_entries`, `inferrail_index_bytes`,
+  `inferrail_index_resets` and the per replica index blocks and capacity.
+* Replicas that leave the fleet are forgotten by the index, and an engine
+  whose prefix cache counters go backwards is treated as restarted with an
+  empty cache.
+* Tokenizers that cannot be loaded leave their model routing without
+  predictions; startup logs it and the config check prints it.
+
+#### `inferrail-policy`
+
+* `Candidate::cached_tokens` and `RouteContext::prompt_tokens`, ignored by
+  the baselines.
+
+#### Configuration
+
+* `models[].chat_template`, `chat_template_content_format` and
+  `chat_template_kwargs`, mirroring the vLLM flags of the same names, and
+  validated against the tokenizer they need.
+* `tokenizer` section: `workers`, `queue`, `max_wait` and `cache_tokens`.
+* `index` section: `enabled` and `default_capacity_blocks`.
+* The local and compose configs tokenize with `builtin:sim`.
+
+#### Benchmark harness (`bench/`)
+
+* Predicted prompt and cached tokens recorded per request and compared with
+  the engines' usage: exact, over and under predictions, mean error and the
+  predicted hit rate, in every summary and report. Harness gateways
+  tokenize with `builtin:sim`.
+
+#### Dashboard
+
+* A row for prompts and the index: predicted next to engine hit rate,
+  tokenization outcomes and time, and the index's blocks per replica.
+
+#### Tests
+
+* Golden fixtures for Qwen3, Granite 3.3 and Hermes 2 Pro: tokenizer files at
+  pinned revisions and 720 requests whose ids come from vLLM's request
+  handling, ported, through transformers 5.17 and pydantic, rebuilt with
+  `make goldens`. Every request vLLM accepts matches, cold and warm, with
+  and without the cache.
+* Property tests for block hash chaining, the index against a naive
+  reference model, the shadow LRU, replica sets and tokenizers fed
+  arbitrary bodies; known answer hashes checked against an independent
+  implementation; and gateway tests that predictions equal what simulators
+  cached.
+* A1, A2 and A3 benchmarks, and stress tests for tokenization, the index and
+  the gateway with predictions, run by `make stress`.
+* ADR 008 (tokenization parity) and ADR 009 (block hashes and the
+  approximate index).
+
+### Changed
+
+* Lease prompt tokens are counted for tokenized models instead of estimated
+  from the body size.
+* `Gateway::check` returns the warnings of tokenizers that cannot be loaded.
+
 ## [0.1.5] Bug Fixes and Improvements (22 October 2026)
 
 Fixes from an adversarial pass over the load collector, observability and

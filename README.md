@@ -12,16 +12,16 @@ most of its prompt in cache, without letting any replica overload.
 The goal is lower tail latency and fewer GPUs for the same traffic, proven
 with benchmarks anyone can rerun.
 
-> **Status: v0.1.5, load signals, observability and the benchmark
-> harness, hardened.** The gateway proxies chat and completions to a fleet of
-> engines, streams responses untouched, retries before the first byte,
-> ejects failing replicas, discovers replicas through DNS and routes with
-> four baseline policies. It now reads every engine's load ten times a
-> second, exports Prometheus metrics, OpenTelemetry traces and a decision
-> log, and ships with a dashboard and a harness that compares policies on
-> the simulator. The KV index and the cost model come next, so the cache
-> aware policies still route by their documented fallback, power of two
-> choices. See [Roadmap](#roadmap).
+> **Status: v0.1.6, tokens, hashes and the approximate KV index.** The
+> gateway proxies chat and completions to a fleet of engines, streams
+> responses untouched, retries before the first byte, ejects failing
+> replicas, discovers replicas through DNS, reads every engine's load ten
+> times a second and exports metrics, traces and a decision log. It now
+> tokenizes prompts at the edge with token ids identical to vLLM's, hashes
+> them into chained blocks, and predicts for every replica how much of each
+> prompt it already holds. The policies that act on those predictions come
+> next, so the cache aware policies still route by their documented
+> fallback, power of two choices. See [Roadmap](#roadmap).
 
 ## Why this exists
 
@@ -48,18 +48,20 @@ the cache away. Inferrail treats routing as a cost estimate instead: for each
 replica, how long until this request's first token, given what is cached
 there and what is queued there?
 
-## What is in v0.1.5
+## What is in v0.1.6
 
 | Piece | What it does |
 | --- | --- |
-| `inferrail-gateway` | OpenAI compatible proxy on hyper: chat and completions, streaming pass through, model list, request IDs, retries before the first byte, health checks, outlier ejection, breakers, DNS discovery, graceful shutdown, Prometheus metrics on an admin port, OpenTelemetry traces and a sampled decision log |
+| `inferrail-gateway` | OpenAI compatible proxy on hyper: chat and completions, streaming pass through, model list, request IDs, retries before the first byte, health checks, outlier ejection, breakers, DNS discovery, graceful shutdown, edge tokenization on a bounded worker pool, cache predictions per replica, Prometheus metrics on an admin port, OpenTelemetry traces and a sampled decision log |
+| `inferrail-tokenize` | Chat templates and Hugging Face tokenizers with token ids identical to vLLM v0.31.0 on three model families, a cache of repeated prompt pieces, the simulator's tokenizer, and chained XXH3 128 bit block hashes salted by model, adapter and `cache_salt` |
+| `inferrail-index` | The KV index in approximate mode: a sharded map from block hash to replicas and a shadow LRU per replica sized to its KV capacity, with longest prefix lookup in microseconds |
 | `inferrail-load` | Reads vLLM and SGLang `/metrics` pages, scrapes every replica ten times a second and publishes load snapshots that are never used once stale |
-| `inferrail-policy` | The `RoutingPolicy` trait and the round robin, random, least request and power of two choices baselines, chosen per model |
+| `inferrail-policy` | The `RoutingPolicy` trait, whose candidates now carry predicted cached tokens, and the round robin, random, least request and power of two choices baselines, chosen per model |
 | `inferrail-control` | Lock free replica registry with request and prompt token counters, health state with exponential ejection backoff, the active health checker and DNS discovery |
 | `inferrail-core` | Lossless OpenAI wire types, an incremental SSE decoder and validated YAML configuration |
 | `inferrail-sim` | A CPU mock of vLLM v0.31.0 with the same HTTP API, streaming bytes and Prometheus metrics, a calibrated latency model and a real prefix cache |
-| Other crates | `tokenize`, `index`, `events` and `calibrate` compile as stubs with the boundaries the router will use |
-| `bench/` | The benchmark harness (`inferrail-bench`): open loop workloads W1, W2 and W6, TTFT, TPOT and ITL measurement, JSON results, charts and policy comparisons on simulators, plus the OpenAI SDK suites |
+| Other crates | `events` and `calibrate` compile as stubs with the boundaries the router will use |
+| `bench/` | The benchmark harness (`inferrail-bench`): open loop workloads W1, W2 and W6, TTFT, TPOT and ITL measurement, prediction accuracy against the engines' own counts, JSON results, charts and policy comparisons on simulators, plus the OpenAI SDK suites |
 | `deploy/compose`, `dashboards/` | Gateway, simulators, Prometheus, Grafana and Jaeger in one `make stack`, with the first dashboard |
 | CI | fmt, clippy with warnings denied, nextest, doc tests, ruff, pytest, `cargo audit`, `cargo machete`, and the official OpenAI SDK and the harness against the simulator and the gateway on every push |
 
@@ -90,8 +92,12 @@ curl -si localhost:8080/v1/chat/completions \
        "max_tokens": 16}'
 ```
 
-The response headers name the replica that served it (`x-inferrail-replica`)
-and the request ID the engine used (`x-request-id`). The official SDK works
+The response headers name the replica that served it (`x-inferrail-replica`),
+the request ID the engine used (`x-request-id`), the prompt's length in
+tokens (`x-inferrail-prompt-tokens`) and how many of them the gateway
+predicted that replica had cached (`x-inferrail-cached-tokens`); with
+`--enable-prompt-tokens-details` the simulator reports the real count in
+`usage.prompt_tokens_details.cached_tokens`. The official SDK works
 by changing nothing but the base URL:
 
 ```python
@@ -210,9 +216,9 @@ from the load balancer first.
 
 The gateway knows two things about each replica's load. Its own counters
 are always current: requests in flight, requests still waiting for a
-response head, and estimated prompt tokens in flight and still waiting for
-their first byte (four bytes of request body per token until requests are
-tokenized at the edge). The engine's own view comes from its Prometheus
+response head, and prompt tokens in flight and still waiting for their first
+byte (counted for models with a tokenizer, estimated at four bytes of
+request body per token for the rest). The engine's own view comes from its Prometheus
 page: running and waiting requests, KV cache usage, prefix cache counters,
 preemptions and KV capacity.
 
@@ -234,6 +240,54 @@ second the oldest report any reader saw was 102 ms; with 64 replicas
 scraped at once it was 112 ms. See
 [ADR 005](docs/adr/005-load-collector.md).
 
+## Prompts and the KV index
+
+To route on cache state the gateway has to know a prompt's tokens exactly
+as the engine will see them, cut them into the blocks the engine caches,
+and remember where each block went.
+
+**Tokenization.** Each model names a tokenizer: a model directory, a
+repository already in the local Hugging Face cache (`org/name` or
+`org/name@revision`), or `builtin:sim` for the simulator. Nothing is
+downloaded. Chat requests are prepared the way vLLM v0.31.0 prepares them,
+rendered with the model's chat template on minijinja set up as transformers
+sets up Jinja2, and tokenized with the pipeline transformers 5.17 builds,
+which for `LlamaTokenizer` differs from `tokenizer.json`. `chat_template`,
+`chat_template_content_format` and `chat_template_kwargs` mirror the vLLM
+flags of the same names. Golden fixtures for Qwen3, Granite 3.3 and Hermes 2
+Pro, generated by running vLLM's request handling through transformers,
+match token for token. See [ADR 008](docs/adr/008-tokenization-parity.md).
+
+**Speed.** Repeated prompt pieces, such as shared system prompts and
+earlier turns, are tokenized once per model and kept up to
+`tokenizer.cache_tokens`. An 8,000 token chat takes 4.5 ms cold and 0.1 ms
+when its system prompt was seen before. Bodies over 1 KiB go to a pool of
+`tokenizer.workers` threads; a request that finds the queue full, or waits
+longer than `tokenizer.max_wait`, is routed without a prediction instead of
+waiting.
+
+**Block hashes.** Full blocks of `block_size` tokens are hashed with
+XXH3 128 in a chain, so a block's hash names its whole prefix; a trailing
+partial block is never hashed. The chain is salted by the model, the LoRA
+adapter and vLLM's per request `cache_salt`. Engine hash values are never
+used. Hashing costs about 5.5 ns per block.
+
+**The index.** Every routed prompt is recorded on the replica it went to, in
+a shadow LRU as large as that replica's KV cache: `kv_capacity_blocks` when
+set, else what its engine reports, else `index.default_capacity_blocks`. A
+shared map from block hash to replicas answers, for every candidate, how many
+leading blocks of a prompt it holds: 2.4 µs for 512 blocks over 64
+replicas. Predictions stop one block short of a fully cached prompt, as
+engines always compute the last token. Replicas that leave the fleet are
+forgotten, and an engine whose prefix cache counters go backwards is
+treated as restarted with an empty cache. See
+[ADR 009](docs/adr/009-approximate-kv-index.md).
+
+**Degrading.** A model without a tokenizer, or whose tokenizer fails to load,
+routes as before; startup and `--check` say so. A request the tokenizer
+cannot follow (images, a template in the request, a batch of prompts) is
+routed without a prediction and counted by reason.
+
 ## Observability
 
 **Metrics.** `GET /metrics` on `server.admin_listen` (127.0.0.1:9090 by
@@ -248,8 +302,13 @@ default) serves OpenMetrics, apart from the client port:
 | `inferrail_routing_decision_seconds` | policy | time to choose and take a lease |
 | `inferrail_upstream_retries_total`, `inferrail_client_disconnects_total` | model | retries before the first byte, abandoned responses |
 | `inferrail_request_errors_total` | model, reason | errors the gateway answered itself |
+| `inferrail_tokenized_requests_total` | model, result | prompts tokenized, or why a request got no prediction: `invalid`, `unsupported`, `template`, `busy`, `slow`, `unavailable` |
+| `inferrail_tokenize_seconds` | model | time to tokenize and hash a prompt, waiting for a worker included |
+| `inferrail_prompt_tokens_total`, `inferrail_predicted_cached_tokens_total` | model | prompt tokens and the cached tokens predicted on the chosen replica, per decision |
+| `inferrail_tokenize_cache_lookups_total` | model, result | repeated prompt pieces served from the tokenization cache |
+| `inferrail_index_entries`, `inferrail_index_bytes`, `inferrail_index_resets_total` | replica for resets | blocks the index holds, its memory, engines found restarted |
 | `inferrail_ejections_total`, `inferrail_load_scrapes_total` | replica (and result) | passive ejections, engine scrapes |
-| `inferrail_replica_*` | replica | health, ejection, in flight requests and prompt tokens, the engine's running, waiting, KV usage and prefix cache counters, and the age of its report |
+| `inferrail_replica_*` | replica | health, ejection, in flight requests and prompt tokens, the engine's running, waiting, KV usage and prefix cache counters, the age of its report, and the blocks and capacity the index assumes |
 
 Replica gauges are read from the fleet when Prometheus scrapes, series of
 replicas that leave are removed, and recording one streamed request costs
@@ -257,7 +316,8 @@ about 160 ns.
 
 **Traces.** With `observability.otlp_endpoint` set, every request becomes a
 server span, and every attempt a `route` span (policy, candidates offered,
-winner, its in flight count and engine load, decision time) and an
+winner, its in flight count and engine load, decision time, prompt tokens
+and the winner's predicted cached tokens) and an
 `upstream` client span, exported over OTLP HTTP and sampled by
 `trace_sample_ratio`. A bare collector address such as
 `http://collector:4318` gets the standard `/v1/traces` path. A client's
@@ -267,8 +327,8 @@ when it recovers. Without an endpoint the spans are never created.
 
 **Decision log.** With `observability.decision_log.sample_rate` above zero,
 sampled requests write one JSON line per routing decision to
-`decision_log.path`: the policy, the attempt, the winner and every
-candidate's state and load. Requests are sampled by id, so all attempts of
+`decision_log.path`: the policy, the attempt, the prompt's tokens, the
+winner and every candidate's state, load and predicted cached tokens. Requests are sampled by id, so all attempts of
 a request are kept together. A writer thread drains a bounded queue; if
 the disk falls behind, records are dropped and counted, never waited for.
 Prompts are never logged. See [ADR 006](docs/adr/006-observability.md).
@@ -280,14 +340,16 @@ The provisioned dashboard ([`dashboards/inferrail.json`](dashboards/inferrail.js
 shows TTFT per replica and per policy from both the gateway and the
 engines, in flight requests, engine queues and KV usage per replica, each
 policy's traffic share, prefix cache hit rates, decision time, retries,
-ejections and errors.
+ejections and errors, and the predicted hit rate next to the engines' own,
+tokenization outcomes and time, and the blocks the index holds per replica.
 
 ## Routing policies
 
 Every policy implements one `RoutingPolicy` trait and is chosen per model in
 the config, so baselines and the main policy run in the same binary on the
 same candidates. The gateway only ever offers a policy replicas that serve
-the model, are healthy and have room. See
+the model, are healthy and have room, each with the prompt tokens the KV
+index predicts it has cached, and tells it the prompt's length. See
 [ADR 004](docs/adr/004-routing-policies.md).
 
 | Policy | Rule | Status |
@@ -343,7 +405,8 @@ cached prompt still recomputes its last block.
 **Tokenizer.** A deterministic stand in whose token boundaries depend only on
 the text to their left, so shared text means shared tokens. Generated text
 retokenizes to the same ids, so multi turn reuse works as it does on a real
-engine.
+engine. It lives in `inferrail-tokenize`, so a gateway configured with
+`tokenizer: builtin:sim` tokenizes exactly as its simulators do.
 
 **Metrics.** Every default vLLM family the simulator can model: running and
 waiting requests, KV usage, prefix cache queries and hits, token counters,
@@ -395,6 +458,11 @@ benchmark plan requires (see [ADR 007](docs/adr/007-benchmark-harness.md)):
   engines' own counters (read from vLLM or SGLang over the same requests,
   after the warmup), errors, send lag and requests per replica. Time per
   output token counts tokens from usage, not stream chunks.
+* **Prediction accuracy.** When the gateway tokenized a request, its
+  predicted prompt and cached tokens are compared with the engine's usage:
+  the share of exact predictions, of over and under predictions, the mean
+  error in tokens and the predicted hit rate. Harness gateways tokenize
+  with `builtin:sim`.
 * **Fair comparisons.** `compare` gives every policy the same requests and
   arrival times and a cold gateway and simulators per run, discards a
   warmup, and repeats with new seeds.
@@ -448,12 +516,16 @@ models:
   - name: meta-llama/Llama-3.1-8B-Instruct
     aliases: [llama-8b]
     policy: least_request
+    tokenizer: /models/Llama-3.1-8B-Instruct
+    chat_template_kwargs:
+      enable_thinking: false
 replicas:
   - id: gpu-0
     url: http://10.0.0.10:8000
     models: [meta-llama/Llama-3.1-8B-Instruct]
     max_concurrency: 256
     max_pending: 32
+    kv_capacity_blocks: 18000
 discovery:
   dns:
     - name: llama-pool
@@ -474,6 +546,11 @@ retry:
 load:
   scrape_interval: 100ms
   max_age: 250ms
+tokenizer:
+  workers: 4
+  max_wait: 50ms
+index:
+  default_capacity_blocks: 16384
 observability:
   otlp_endpoint: http://localhost:4318/v1/traces
   trace_sample_ratio: 0.1
@@ -493,8 +570,18 @@ test and the Python tests. `make audit` checks dependencies against the
 RustSec advisory database and for unused crates. Beyond unit tests the suite
 includes:
 
+* **Golden parity**: token ids for 648 requests across Qwen3, Granite 3.3
+  and Hermes 2 Pro equal what vLLM v0.31.0 computes with transformers
+  5.17, with tools, multi turn conversations, reasoning, documents, content
+  parts, special tokens in text and continued messages, cold and warm, with
+  and without the tokenization cache.
 * **Property tests** for SSE decoding under any chunking, tokenizer prefix
-  stability, block hash chaining, the prefix cache LRU, latency
+  stability, block hash chaining (a changed token changes its block and
+  every later one, never an earlier one; a prefix hashes the same alone or
+  inside a longer prompt), the KV index against a naive reference model
+  after any sequence of records, clears and departures (a reported prefix
+  of depth d means blocks 0 to d minus 1 are held and block d is not),
+  arbitrary request bodies never panicking the tokenizers, the prefix cache LRU, latency
   monotonicity, config round trips, uniform policy choices under fixed seeds,
   least request always picking a minimum, power of two choices never picking
   a unique maximum, fleet membership, replica health and lease token
@@ -521,11 +608,15 @@ includes:
   export from the binary, and the decision log.
 * **Consistency tests**: every dashboard query names a metric the gateway or
   vLLM exports, and the compose stack and its configs are valid.
+* **Prediction tests**: predicted cached tokens equal what three simulators
+  really cached on every one of 300 requests under eviction pressure,
+  through streams and completions, with capacity learned from engine
+  metrics, after an engine restart, and when a tokenizer cannot load.
 * **Harness tests**: workload shapes and determinism, Poisson statistics,
   TTFT, TPOT and ITL against servers with known timing, coordinated
   omission against a server that falls behind, a blocked client loop
-  showing up as lag, results, reports and a full comparison on real
-  binaries.
+  showing up as lag, prediction accuracy, results, reports and a full
+  comparison on real binaries.
 * **SDK tests** (`make e2e`): the official OpenAI Python SDK, sync and async,
   against the simulator binary and through the gateway binary in front of
   three simulators.
@@ -555,6 +646,16 @@ includes:
 | 20 replicas serving 50 MB or endless metrics pages for 5 s | the healthy replica's report never older than 104 ms; each scrape capped at 4 MiB and 100 ms |
 | 8,000 replicas churned through discovery | the metrics page never exceeds 40 KB and renders in 0.05 ms |
 | The harness driving zero latency simulators at 300 req/s | every request sent within 2.2 ms of its schedule at p99 |
+| Open loop at 2,000 and 5,000 req/s with tokenization and the index on, 200 word system prompts | the gateway adds 0.3 to 0.5 ms at p99 |
+| The same with 2,000 word system prompts at 1,000 and 2,000 req/s | the gateway adds 0.3 to 0.5 ms at p99 |
+| 3,000 requests at 400 req/s over 3 simulators | every prompt and cached token prediction exact |
+| 400 concurrent 20,000 word prompts through one tokenizer worker | all served; those that could not wait were routed without a prediction |
+| 40,000 distinct prompts soaked through the index | it stays within the replicas' KV capacity, RSS grew 43 MB |
+| 12 threads recording, 6 looking up and 2 forgetting for 5 s | the shared map equals the shadow caches exactly afterwards; lookup p99 31 µs |
+| A million blocks over 64 replicas | 148 bytes per block, 512 block lookups at 7 µs p99 |
+| 16 threads sharing one tokenizer and its cache | 20 to 33 million tokens per second, every id exact |
+| 4 MB messages, 50,000 messages, 1,000 tools, nested arguments | each tokenized or refused within half a second |
+| 9,621 more golden requests | every token id matches |
 
 The suite runs clean ten times in a row with every core saturated.
 
@@ -568,7 +669,7 @@ crates/
   inferrail-control/     replica registry, health, ejection, DNS discovery
   inferrail-load/        engine metrics parsing, scraping, load snapshots
   inferrail-sim/         mock vLLM engine (binary and library)
-  inferrail-tokenize/    chat templates, tokenization, block hashing
+  inferrail-tokenize/    chat templates, tokenizers, block hashing
   inferrail-index/       KV block index
   inferrail-events/      engine KV event subscribers
   inferrail-calibrate/   engine profiler that fits the cost model
@@ -577,7 +678,7 @@ bench/                   benchmark harness and the OpenAI SDK suites
   report/                charts and reports generated from them
 dashboards/              Grafana dashboard JSON
 deploy/                  example, local and compose configurations
-tests/fixtures/          OpenAI, vLLM and SGLang reference payloads
+tests/fixtures/          OpenAI, vLLM and SGLang payloads, tokenizer goldens
 docs/adr/                architecture decision records
 ```
 
@@ -597,12 +698,13 @@ committed, rerunnable benchmarks, not a claim.
   counts, Prometheus metrics, OpenTelemetry traces with routing attributes,
   a sampled decision log, a Grafana dashboard, and a benchmark harness that
   compares the baselines on the simulator.
-* **Tokens and hashes.** Real chat templates and tokenizers with byte level
-  parity against Python `transformers`, and chained XXH3 128 bit block hashes
-  salted by model and LoRA adapter.
-* **KV index.** An approximate mode built from the router's own decisions,
-  and an exact mode fed by engine KV events over ZMQ, with gap detection and
-  safe fallback.
+* **Tokens, hashes and the approximate index.** Shipped in v0.1.6: chat
+  templates and tokenizers with token ids identical to vLLM's, chained
+  XXH3 128 bit block hashes salted by model, adapter and `cache_salt`, and a
+  KV index built from the router's own decisions that predicts every
+  replica's cached prefix.
+* **Exact index.** An exact mode fed by engine KV events over ZMQ, with gap
+  detection and fallback to the approximate mode.
 * **Cost model.** Estimated TTFT per replica as queue wait plus prefill of
   uncached tokens plus tier load time, with bounded load, KV pressure guards,
   hot prefix replication and optional session affinity.

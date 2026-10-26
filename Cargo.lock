@@ -1165,7 +1165,7 @@ version = "0.1.6"
 
 [[package]]
 name = "inferrail-control"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "arc-swap",
  "inferrail-core",
@@ -1178,7 +1178,7 @@ dependencies = [
 
 [[package]]
 name = "inferrail-core"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "humantime-serde",
  "proptest",
@@ -1195,7 +1195,7 @@ version = "0.1.6"
 
 [[package]]
 name = "inferrail-gateway"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "axum",
@@ -1233,7 +1233,7 @@ dependencies = [
 
 [[package]]
 name = "inferrail-index"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "criterion",
  "inferrail-core",
@@ -1242,7 +1242,7 @@ dependencies = [
 
 [[package]]
 name = "inferrail-load"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "arc-swap",
  "criterion",
@@ -1254,7 +1254,7 @@ dependencies = [
 
 [[package]]
 name = "inferrail-policy"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "criterion",
  "inferrail-core",
@@ -1263,7 +1263,7 @@ dependencies = [
 
 [[package]]
 name = "inferrail-sim"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -1287,7 +1287,7 @@ dependencies = [
 
 [[package]]
 name = "inferrail-tokenize"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "criterion",
  "daachorse",
