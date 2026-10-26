@@ -6,8 +6,6 @@
 use std::sync::Arc;
 
 use minijinja::value::{Enumerator, Object, ObjectRepr, Value, ValueKind};
-use serde::Deserialize;
-use serde_json::value::RawValue;
 
 use crate::TokenizeError;
 use crate::json::{self, Failure};
@@ -78,32 +76,33 @@ impl Object for Dict {
     }
 }
 
-/// Fields a template sees are kept raw and read with [`json::loads`], so
-/// their numbers are what Python makes of them.
-#[derive(Deserialize)]
-struct Body<'a> {
-    #[serde(borrow)]
-    messages: &'a RawValue,
-    #[serde(default, borrow)]
-    tools: Option<&'a RawValue>,
-    #[serde(default)]
-    add_generation_prompt: Option<bool>,
-    #[serde(default)]
-    continue_final_message: Option<bool>,
-    #[serde(default)]
-    add_special_tokens: Option<bool>,
-    #[serde(default, borrow)]
-    documents: Option<&'a RawValue>,
-    #[serde(default)]
-    chat_template: Option<Value>,
-    #[serde(default, borrow)]
-    chat_template_kwargs: Option<&'a RawValue>,
-    #[serde(default)]
-    reasoning_effort: Option<Value>,
-    #[serde(default)]
-    cache_salt: Option<String>,
-    #[serde(default)]
-    truncate_prompt_tokens: Option<Value>,
+/// The request body, read once the way Python's `json.loads` reads it, so
+/// a template sees the numbers vLLM's template sees.
+struct Body(Value);
+
+impl Body {
+    fn read(bytes: &[u8]) -> Result<Self, TokenizeError> {
+        let text = std::str::from_utf8(strip_bom(bytes))
+            .map_err(|_| invalid("the request is not UTF-8"))?;
+        let value = json::loads(text).map_err(unreadable)?;
+        if value.kind() != ValueKind::Map {
+            return Err(invalid("the request must be a JSON object"));
+        }
+        Ok(Self(value))
+    }
+
+    /// A field that is present and not null.
+    fn get(&self, key: &str) -> Option<Value> {
+        field(&self.0, key).filter(|v| !v.is_none())
+    }
+
+    fn flag(&self, key: &str) -> Result<Option<bool>, TokenizeError> {
+        match self.get(key) {
+            None => Ok(None),
+            Some(v) if v.kind() == ValueKind::Bool => Ok(Some(v.is_true())),
+            Some(_) => Err(invalid(format!("{key} must be a boolean"))),
+        }
+    }
 }
 
 const REASONING_EFFORTS: [&str; 7] = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
@@ -178,10 +177,6 @@ pub(crate) fn strip_bom(body: &[u8]) -> &[u8] {
     body.strip_prefix(b"\xef\xbb\xbf").unwrap_or(body)
 }
 
-fn read(raw: &RawValue) -> Result<Value, TokenizeError> {
-    json::loads(raw.get()).map_err(unreadable)
-}
-
 fn unreadable(failure: Failure) -> TokenizeError {
     match failure {
         Failure::Malformed => invalid("the request is not valid JSON"),
@@ -191,30 +186,23 @@ fn unreadable(failure: Failure) -> TokenizeError {
     }
 }
 
-fn read_list(raw: &RawValue, what: &str) -> Result<Vec<Value>, TokenizeError> {
-    let value = read(raw)?;
-    if value.kind() != ValueKind::Seq {
-        return Err(invalid(format!("{what} must be a list")));
-    }
-    value
-        .try_iter()
-        .map(Iterator::collect)
-        .map_err(|e| invalid(e.to_string()))
-}
-
 impl Chat {
     pub(crate) fn parse(body: &[u8], defaults: &[(String, Value)]) -> Result<Self, TokenizeError> {
-        let body: Body<'_> = serde_json::from_slice(strip_bom(body))
-            .map_err(|e| invalid(format!("cannot read the request: {e}")))?;
-        let messages = read_list(body.messages, "messages")?;
-        if body.chat_template.is_some() {
+        let body = Body::read(body)?;
+        let messages: Vec<Value> = match body.get("messages") {
+            Some(m) if m.kind() == ValueKind::Seq => {
+                m.try_iter().map_err(|e| invalid(e.to_string()))?.collect()
+            }
+            _ => return Err(invalid("messages must be a list")),
+        };
+        if body.get("chat_template").is_some() {
             return Err(TokenizeError::Unsupported("a chat template in the request"));
         }
-        if body.truncate_prompt_tokens.is_some() {
+        if body.get("truncate_prompt_tokens").is_some() {
             return Err(TokenizeError::Unsupported("truncate_prompt_tokens"));
         }
-        let add_generation_prompt = body.add_generation_prompt.unwrap_or(true);
-        let continue_final = body.continue_final_message.unwrap_or(false);
+        let add_generation_prompt = body.flag("add_generation_prompt")?.unwrap_or(true);
+        let continue_final = body.flag("continue_final_message")?.unwrap_or(false);
         if continue_final && add_generation_prompt {
             return Err(invalid(
                 "continue_final_message needs add_generation_prompt to be false",
@@ -223,7 +211,7 @@ impl Chat {
         if messages.is_empty() {
             return Err(invalid("messages must not be empty"));
         }
-        let tools = match body.tools.map(read).transpose()?.filter(|t| !t.is_none()) {
+        let tools = match body.get("tools") {
             None => None,
             Some(tools) if tools.kind() == ValueKind::Seq => Some(
                 tools
@@ -236,33 +224,29 @@ impl Chat {
             ),
             Some(_) => return Err(invalid("tools must be a list")),
         };
-        let reasoning = match body.reasoning_effort.filter(|v| !v.is_none()) {
+        let reasoning = match body.get("reasoning_effort") {
             None => None,
             Some(v) => match v.as_str() {
                 Some(effort) if REASONING_EFFORTS.contains(&effort) => Some(v),
                 _ => return Err(invalid("unknown reasoning_effort")),
             },
         };
-        let user = match body
-            .chat_template_kwargs
-            .map(read)
-            .transpose()?
-            .filter(|v| !v.is_none())
-        {
+        let user = match body.get("chat_template_kwargs") {
             None => Dict::default(),
             Some(v) if v.kind() == ValueKind::Map => Dict::from_map(&v),
             Some(_) => return Err(invalid("chat_template_kwargs must be an object")),
         };
+        let cache_salt = match body.get("cache_salt") {
+            None => None,
+            Some(salt) if salt.kind() == ValueKind::String => {
+                Some(salt.as_str().unwrap_or_default().to_owned())
+            }
+            Some(_) => return Err(invalid("cache_salt must be a string")),
+        };
         let mut extra = Dict::default();
         extra.insert("add_generation_prompt", Value::from(add_generation_prompt));
         extra.insert("continue_final_message", Value::from(continue_final));
-        extra.insert(
-            "documents",
-            body.documents
-                .map(read)
-                .transpose()?
-                .unwrap_or_default_none(),
-        );
+        extra.insert("documents", body.get("documents").unwrap_or_default_none());
         extra.insert(
             "reasoning_effort",
             reasoning.clone().unwrap_or_default_none(),
@@ -299,8 +283,8 @@ impl Chat {
             messages,
             tools,
             kwargs,
-            add_special_tokens: body.add_special_tokens.unwrap_or(false),
-            cache_salt: body.cache_salt,
+            add_special_tokens: body.flag("add_special_tokens")?.unwrap_or(false),
+            cache_salt,
         })
     }
 

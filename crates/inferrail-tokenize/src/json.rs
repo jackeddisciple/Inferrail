@@ -3,6 +3,8 @@
 //! `-0` is the integer zero, floats too large become infinities, and `NaN`,
 //! `Infinity` and `-Infinity` are accepted.
 
+use std::borrow::Cow;
+
 use indexmap::IndexMap;
 use minijinja::Value;
 
@@ -33,13 +35,38 @@ pub(crate) fn loads(text: &str) -> Result<Value, Failure> {
     }
 }
 
+/// How many leading bytes need no attention inside a string: everything up
+/// to a quote, a backslash or a control character, looked for eight bytes at
+/// a time.
+fn plain_run(bytes: &[u8]) -> Option<usize> {
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    const HIGH: u64 = 0x8080_8080_8080_8080;
+    let mut at = 0;
+    for chunk in bytes.as_chunks::<8>().0 {
+        let word = u64::from_le_bytes(*chunk);
+        let quote = word ^ (ONES * u64::from(b'"'));
+        let slash = word ^ (ONES * u64::from(b'\\'));
+        let found = (quote.wrapping_sub(ONES) & !quote)
+            | (slash.wrapping_sub(ONES) & !slash)
+            | (word.wrapping_sub(ONES * 0x20) & !word);
+        if found & HIGH != 0 {
+            break;
+        }
+        at += 8;
+    }
+    bytes[at..]
+        .iter()
+        .position(|&b| matches!(b, b'"' | b'\\' | 0..0x20))
+        .map(|i| at + i)
+}
+
 struct Parser<'a> {
     text: &'a str,
     bytes: &'a [u8],
     at: usize,
 }
 
-impl Parser<'_> {
+impl<'a> Parser<'a> {
     fn peek(&self) -> Option<u8> {
         self.bytes.get(self.at).copied()
     }
@@ -75,7 +102,7 @@ impl Parser<'_> {
         match self.peek() {
             Some(b'{') => self.object(depth),
             Some(b'[') => self.array(depth),
-            Some(b'"') => self.string().map(Value::from),
+            Some(b'"') => self.string().map(|text| Value::from(text.as_ref())),
             Some(b'-') if self.eat("-Infinity") => Ok(Value::from(f64::NEG_INFINITY)),
             Some(b'-' | b'0'..=b'9') => self.number(),
             _ if self.eat("null") => Ok(Value::from(())),
@@ -100,11 +127,11 @@ impl Parser<'_> {
             if self.peek() != Some(b'"') {
                 return Err(Failure::Malformed);
             }
-            let key = self.string()?;
+            let key = Value::from(self.string()?.as_ref());
             self.expect(b':')?;
             self.space();
             let value = self.value(depth + 1)?;
-            map.insert(Value::from(key), value);
+            map.insert(key, value);
             self.space();
             match self.peek() {
                 Some(b',') => self.at += 1,
@@ -210,20 +237,23 @@ impl Parser<'_> {
         u32::from_str_radix(digits, 16).map_err(|_| Failure::Malformed)
     }
 
-    fn string(&mut self) -> Result<String, Failure> {
+    fn string(&mut self) -> Result<Cow<'a, str>, Failure> {
         self.at += 1;
+        let start = self.at;
         let mut out = String::new();
         loop {
-            let run = self.bytes[self.at..]
-                .iter()
-                .position(|&b| b == b'"' || b == b'\\' || b < 0x20)
-                .ok_or(Failure::Malformed)?;
-            out.push_str(&self.text[self.at..self.at + run]);
-            self.at += run;
+            let run = plain_run(&self.bytes[self.at..]).ok_or(Failure::Malformed)?;
+            let end = self.at + run;
+            if self.bytes[end] == b'"' && out.is_empty() && self.at == start {
+                self.at = end + 1;
+                return Ok(Cow::Borrowed(&self.text[start..end]));
+            }
+            out.push_str(&self.text[self.at..end]);
+            self.at = end;
             match self.bytes[self.at] {
                 b'"' => {
                     self.at += 1;
-                    return Ok(out);
+                    return Ok(Cow::Owned(out));
                 }
                 b'\\' => {
                     self.at += 1;
@@ -310,6 +340,22 @@ mod tests {
             assert_eq!(dumps(text), want, "{text}");
         }
         assert!(loads("-0").unwrap().is_integer());
+    }
+
+    #[test]
+    fn plain_runs_stop_at_the_first_byte_that_needs_attention() {
+        for (text, want) in [
+            ("", None),
+            ("abc", None),
+            ("abc\"", Some(3)),
+            ("0123456789abcdef\\", Some(16)),
+            ("01234567\"", Some(8)),
+            ("é日本語テキスト\n", Some(23)),
+            ("\u{1f}", Some(0)),
+            ("xxxxxxxxxxxxxxx\u{7f}\u{80}\"", Some(18)),
+        ] {
+            assert_eq!(plain_run(text.as_bytes()), want, "{text:?}");
+        }
     }
 
     #[test]
