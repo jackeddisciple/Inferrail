@@ -2,7 +2,7 @@ CARGO ?= cargo
 UV ?= uv
 NEXTEST := $(shell $(CARGO) nextest --version >/dev/null 2>&1 && echo "nextest run" || echo "test")
 
-.PHONY: check fmt lint audit test test-rust test-python bench e2e stress goldens baselines report stack stack-down
+.PHONY: check fmt lint audit test test-rust test-python bench e2e stress goldens baselines routing report stack stack-down
 
 check: fmt lint test
 
@@ -56,8 +56,17 @@ baselines:
 	$(CARGO) build --release -p inferrail-sim -p inferrail-gateway
 	cd bench && $(UV) run --frozen inferrail-bench compare --out results/baselines
 
+routing:
+	$(CARGO) build --release -p inferrail-sim -p inferrail-gateway
+	cd bench && $(UV) run --frozen inferrail-bench compare --workloads w1,w2,w6,mix,hot \
+		--policies round_robin,random,least_request,p2c,prefix_hash,kv_aware,cost_model \
+		--out results/routing
+	cd bench && $(UV) run --frozen inferrail-bench compare --workloads w2 \
+		--policies cost_model+sessions --out results/routing
+
 report:
 	cd bench && $(UV) run --frozen inferrail-bench plot results/baselines/*/*.json.gz --out report/baselines
+	cd bench && $(UV) run --frozen inferrail-bench plot results/routing/*/*.json.gz --out report/routing
 
 COMPOSE := docker compose -f deploy/compose/docker-compose.yaml
 

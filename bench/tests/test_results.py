@@ -49,6 +49,7 @@ def test_summary_counts_slo_goodput_hit_rate_and_errors():
     assert s["hit_rate"] == pytest.approx(0.5)
     assert s["tpot_s"]["p50"] == pytest.approx(0.01)
     assert s["replicas"] == {"r0": 15, "r1": 16}
+    assert s["max_replica_share"] == 16 / 31
     assert s["lag_s"]["max"] == pytest.approx(0.001)
 
 

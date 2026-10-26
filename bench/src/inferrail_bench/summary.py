@@ -103,4 +103,5 @@ def summarize(records: Sequence[Record], warmup: float = 0.0, slo: Slo | None = 
         "hit_rate": cached / prompt if prompt else 0.0,
         "prediction": prediction(ok),
         "replicas": dict(sorted(Counter(r.replica or "" for r in ok).items())),
+        "max_replica_share": max(Counter(r.replica for r in ok).values()) / len(ok) if ok else 0.0,
     }

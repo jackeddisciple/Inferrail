@@ -86,13 +86,17 @@ def _apply(record: Record, chunk: dict, now: float) -> None:
 
 
 async def stream_chat(
-    client: httpx2.AsyncClient, body: dict, record: Record, path: str = "/v1/chat/completions"
+    client: httpx2.AsyncClient,
+    body: dict,
+    record: Record,
+    path: str = "/v1/chat/completions",
+    headers: dict | None = None,
 ) -> Record:
     """Sends `body` and fills `record` as the stream arrives. Never raises:
     failures end up in `record.error`."""
     record.sent = time.perf_counter()
     try:
-        async with client.stream("POST", path, json=body) as response:
+        async with client.stream("POST", path, json=body, headers=headers) as response:
             record.status = response.status_code
             record.replica = response.headers.get(REPLICA_HEADER)
             record.predicted_prompt_tokens = _count(response.headers.get(PROMPT_HEADER))

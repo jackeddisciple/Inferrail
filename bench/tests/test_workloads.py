@@ -1,12 +1,14 @@
+import dataclasses
 import itertools
 import json
 import math
 import random
+from collections import Counter
 
 import pytest
 
 from inferrail_bench import schedule, text
-from inferrail_bench.workloads import WORKLOADS, MultiTurn, SharedPrompt, Unique, generate
+from inferrail_bench.workloads import WORKLOADS, Mixed, MultiTurn, SharedPrompt, Unique, generate
 from inferrail_bench.workloads.multi_turn import load_sharegpt
 
 
@@ -50,6 +52,31 @@ def test_w1_requests_share_one_of_a_few_long_system_prompts():
         assert 32 <= request.max_tokens <= 128
     counts = [sum(r.tags["prompt"] == i for r in requests) for i in range(4)]
     assert min(counts) > 60
+
+
+def test_hot_system_prompts_are_drawn_by_zipf_weight():
+    requests = generate("hot", 4000, seed=2)
+    counts = Counter(r.tags["prompt"] for r in requests)
+    weights = [1 / rank**1.1 for rank in range(1, 33)]
+    assert abs(counts[0] / 4000 - weights[0] / sum(weights)) < 0.03
+    assert counts[0] > counts[3] > counts[31]
+    assert len({r.messages[0].content for r in requests}) <= 32
+    assert SharedPrompt().requests(50, seed=1) == SharedPrompt(skew=0.0).requests(50, seed=1)
+
+
+def test_mix_interleaves_shared_and_unique_prompts():
+    requests = Mixed().requests(1000, seed=4)
+    kinds = Counter(r.tags["kind"] for r in requests)
+    assert 420 < kinds["shared"] < 580
+    shared = [r for r in requests if r.tags["kind"] == "shared"]
+    unique = [r for r in requests if r.tags["kind"] == "unique"]
+    assert all([m.role for m in r.messages] == ["system", "user"] for r in shared)
+    assert len({r.messages[0].content for r in shared}) <= 32
+    assert len({r.messages[0].content[:16] for r in unique}) == len(unique)
+    assert Mixed(shared=1.0).requests(20, seed=4) == [
+        dataclasses.replace(r, tags={**r.tags, "kind": "shared"})
+        for r in SharedPrompt(prompts=32).requests(20, seed=4)
+    ]
 
 
 def test_w2_turns_extend_their_own_history_in_order():

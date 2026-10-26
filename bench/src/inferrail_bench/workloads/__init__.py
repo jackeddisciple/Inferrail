@@ -4,6 +4,7 @@ schedule decides when they are sent."""
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 
+from inferrail_bench.workloads.mixed import Mixed
 from inferrail_bench.workloads.multi_turn import MultiTurn
 from inferrail_bench.workloads.shared_prompt import SharedPrompt
 from inferrail_bench.workloads.types import Message, Request
@@ -22,6 +23,8 @@ WORKLOADS: dict[str, Spec] = {
     "w1": Spec("w1", "Shared system prompt", SharedPrompt),
     "w2": Spec("w2", "Multi turn chat", MultiTurn),
     "w6": Spec("w6", "Unique prompts", Unique),
+    "mix": Spec("mix", "Shared and unique prompts", Mixed),
+    "hot": Spec("hot", "Hot system prompts", SharedPrompt, {"prompts": 32, "skew": 1.1}),
 }
 
 
@@ -34,4 +37,13 @@ def generate(
     return spec.build(**{**spec.defaults, **params}).requests(count, seed, offsets)
 
 
-__all__ = ["WORKLOADS", "Message", "MultiTurn", "Request", "SharedPrompt", "Unique", "generate"]
+__all__ = [
+    "WORKLOADS",
+    "Message",
+    "Mixed",
+    "MultiTurn",
+    "Request",
+    "SharedPrompt",
+    "Unique",
+    "generate",
+]

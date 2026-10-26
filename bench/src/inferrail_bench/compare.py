@@ -1,5 +1,5 @@
-"""Every baseline policy against the same workloads, schedules and cold
-simulators: the comparison behind `make baselines`."""
+"""Policies against the same workloads, schedules and cold simulators: the
+comparisons behind `make baselines` and `make routing`."""
 
 import asyncio
 import tempfile
@@ -10,8 +10,9 @@ from inferrail_bench import fleet, results
 from inferrail_bench.cli import describe, measure
 
 BASELINES = ("round_robin", "random", "least_request", "p2c")
+POLICIES = (*BASELINES, "prefix_hash", "kv_aware", "cost_model")
 SIM_FLAGS = ("--enable-prompt-tokens-details",)
-RATES = {"w1": 6.0, "w2": 25.0, "w6": 9.0}
+RATES = {"w1": 6.0, "w2": 25.0, "w6": 9.0, "mix": 7.0, "hot": 10.0}
 PARAMS = {"w1": {"prompts": 32}}
 
 

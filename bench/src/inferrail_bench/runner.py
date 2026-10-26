@@ -12,6 +12,7 @@ from inferrail_bench.client import Record, stream_chat
 from inferrail_bench.workloads import Request
 
 LEAD = 0.05
+SESSION_HEADER = "x-session-id"
 
 
 def client(base_url: str, timeout: float = 600.0) -> httpx2.AsyncClient:
@@ -39,5 +40,8 @@ async def run(
             if delay > 0:
                 await asyncio.sleep(delay)
             record = Record(index=index, scheduled=due)
-            tasks.append(asyncio.create_task(stream_chat(http, request.body(model), record)))
+            headers = {SESSION_HEADER: request.session} if request.session else None
+            tasks.append(
+                asyncio.create_task(stream_chat(http, request.body(model), record, headers=headers))
+            )
         return list(await asyncio.gather(*tasks))

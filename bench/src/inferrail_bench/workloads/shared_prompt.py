@@ -1,7 +1,8 @@
 """W1: a few long system prompts shared by every user, short user turns.
 
 The product's best case: almost all of each prompt is a prefix some other
-request already sent."""
+request already sent. With `skew` above zero the system prompts are drawn
+with Zipf weights instead of uniformly, so a few of them are hot."""
 
 import random
 from collections.abc import Sequence
@@ -17,6 +18,7 @@ class SharedPrompt:
     system_tokens: tuple[int, int] = (2000, 8000)
     user_tokens: tuple[int, int] = (50, 500)
     output_tokens: tuple[int, int] = (32, 128)
+    skew: float = 0.0
 
     def system_prompts(self, seed: int) -> list[str]:
         rng = random.Random(f"w1-system-{seed}")
@@ -30,9 +32,13 @@ class SharedPrompt:
     ) -> list[Request]:
         systems = self.system_prompts(seed)
         rng = random.Random(f"w1-{seed}")
+        weights = [1 / (rank**self.skew) for rank in range(1, len(systems) + 1)]
         out = []
         for _ in range(count):
-            which = rng.randrange(len(systems))
+            if self.skew:
+                which = rng.choices(range(len(systems)), weights=weights)[0]
+            else:
+                which = rng.randrange(len(systems))
             out.append(
                 Request(
                     messages=(

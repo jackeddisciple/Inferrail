@@ -78,7 +78,11 @@ def gateway_config(
     tokenizer: str | None = "builtin:sim",
 ) -> str:
     """The gateway tokenizes with the simulator's own tokenizer by default,
-    so every response carries the KV index's prediction."""
+    so every response carries the KV index's prediction. A policy named
+    with a `+sessions` suffix runs with session affinity on."""
+    policy, plus, option = policy.partition("+")
+    if plus and option != "sessions":
+        raise ValueError(f"unknown policy option {option!r}")
     lines = [
         "server:",
         f"  listen: 127.0.0.1:{port}",
@@ -92,6 +96,8 @@ def gateway_config(
     for i, url in enumerate(sims):
         lines += [f"  - id: r{i}", f"    url: {url}", f"    models: [{model}]"]
     lines += ["routing:", f"  default_policy: {policy}", "  seed: 7"]
+    if plus:
+        lines.append("  session_affinity: true")
     lines += ["health:", "  interval: 200ms", "  timeout: 100ms", "logging:", "  level: warn"]
     return "\n".join(lines) + "\n"
 

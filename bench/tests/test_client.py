@@ -6,7 +6,7 @@ import time
 import pytest
 from fakes import serve, sse, status
 
-from inferrail_bench import runner
+from inferrail_bench import fleet, runner
 from inferrail_bench.client import Record, stream_chat
 from inferrail_bench.schedule import poisson
 from inferrail_bench.workloads import Message, Request
@@ -132,3 +132,28 @@ def test_a_blocked_event_loop_shows_up_as_lag():
 def test_mismatched_schedules_are_refused():
     with pytest.raises(ValueError, match="offset"):
         run(runner.run("http://127.0.0.1:9", "m", [REQUEST], []))
+
+
+def test_named_conversations_send_their_session(monkeypatch):
+    sent = []
+
+    async def capture(http, body, record, path="/v1/chat/completions", headers=None):
+        sent.append(headers)
+        record.end = record.sent = time.perf_counter()
+        return record
+
+    monkeypatch.setattr(runner, "stream_chat", capture)
+    named = Request(messages=(Message("user", "hi"),), max_tokens=1, session="s7-3")
+    plain = Request(messages=(Message("user", "hi"),), max_tokens=1)
+    asyncio.run(runner.run("http://127.0.0.1:9", "m", [named, plain], [0.0, 0.0]))
+    assert sent == [{"x-session-id": "s7-3"}, None]
+
+
+def test_session_affinity_is_a_policy_option():
+    plain = fleet.gateway_config(1, 2, "m", ["http://h:1"], "cost_model")
+    sticky = fleet.gateway_config(1, 2, "m", ["http://h:1"], "cost_model+sessions")
+    assert "session_affinity" not in plain
+    assert "  default_policy: cost_model\n" in sticky
+    assert "  session_affinity: true\n" in sticky
+    with pytest.raises(ValueError, match="unknown policy option"):
+        fleet.gateway_config(1, 2, "m", ["http://h:1"], "cost_model+other")

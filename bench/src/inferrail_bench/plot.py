@@ -22,6 +22,7 @@ POLICY_ORDER = [
     "prefix_hash",
     "kv_aware",
     "cost_model",
+    "cost_model+sessions",
 ]
 
 
@@ -117,6 +118,7 @@ COLUMNS = [
     ("hit rate", "hit_rate", 1, ".2f"),
     ("engine hit rate", "engine.hit_rate", 1, ".2f"),
     ("prediction agreement", "prediction.cached_agreement", 1, ".2f"),
+    ("max replica share", "max_replica_share", 1, ".2f"),
     ("errors", "errors", 1, ".0f"),
     ("send lag p99 ms", "lag_s.p99", 1e3, ".1f"),
 ]
