@@ -162,7 +162,8 @@ impl CostModel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use inferrail_core::ids::ReplicaId;
+    use crate::{CostModelPolicy, RouteContext, RoutingPolicy, Settings};
+    use inferrail_core::ids::{ModelId, ReplicaId};
     use proptest::prelude::*;
 
     fn linear(token_secs: f64) -> CostModel {
@@ -176,6 +177,61 @@ mod tests {
 
     fn close(a: f64, b: f64) -> bool {
         (a - b).abs() < 1e-9
+    }
+
+    /// The worked example: prefill at 10,000 tokens a second, a 6,000 token
+    /// request sharing a 4,000 token system prompt.
+    #[test]
+    fn the_worked_example_picks_the_replica_with_cache_and_a_short_queue() {
+        let ids: Vec<ReplicaId> = ["r1", "r2", "r3"]
+            .iter()
+            .map(|i| ReplicaId::new(*i).unwrap())
+            .collect();
+        let model = ModelId::new("m").unwrap();
+        let cost = linear(1e-4);
+        let replica = |i: usize, cached: u32, queued: u32| Candidate {
+            cached_tokens: cached,
+            queued_secs: cost.prefill_token_secs * f64::from(queued),
+            ..Candidate::new(&ids[i], 1)
+        };
+        let fleet = [
+            replica(0, 4_000, 6_000),
+            replica(1, 0, 0),
+            replica(2, 4_000, 2_000),
+        ];
+        let ttft: Vec<f64> = fleet
+            .iter()
+            .map(|c| {
+                cost.estimate(6_000, c, Hits::gpu(c.cached_tokens))
+                    .ttft_secs
+            })
+            .collect();
+        assert!(close(ttft[0], 0.8) && close(ttft[1], 0.6) && close(ttft[2], 0.4));
+        let settings = Settings {
+            cost,
+            hot_prefix: None,
+            ..Settings::seeded(1)
+        };
+        let policy = CostModelPolicy::new(&settings);
+        let ctx = RouteContext {
+            prompt_tokens: 6_000,
+            ..RouteContext::new(&model, &fleet)
+        };
+        let choice = policy.choose(&ctx).unwrap();
+        assert_eq!(choice.index, 2);
+        assert!(close(choice.estimate.unwrap().ttft_secs, 0.4));
+        let explained = policy.explain(&ctx);
+        assert_eq!(explained.winner, Some(2));
+        assert_eq!(explained.decided_by, Some(Term::Prefill));
+
+        let mut busier = fleet;
+        busier[2].queued_secs = 0.5;
+        let ctx = RouteContext {
+            prompt_tokens: 6_000,
+            ..RouteContext::new(&model, &busier)
+        };
+        assert_eq!(policy.choose(&ctx).unwrap().index, 1);
+        assert_eq!(policy.explain(&ctx).decided_by, Some(Term::Queue));
     }
 
     #[test]

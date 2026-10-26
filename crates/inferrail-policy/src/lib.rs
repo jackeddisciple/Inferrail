@@ -7,6 +7,8 @@ use inferrail_core::ids::{BlockHash, ModelId, ReplicaId};
 use serde::Serialize;
 
 mod cost;
+mod cost_model;
+mod guards;
 mod hashing;
 mod kv_aware;
 mod least_request;
@@ -17,6 +19,8 @@ mod rng;
 mod round_robin;
 
 pub use cost::{CostModel, Estimate, Hits, Term};
+pub use cost_model::CostModelPolicy;
+pub use guards::load_cap;
 pub use kv_aware::KvAware;
 pub use least_request::LeastRequest;
 pub use p2c::P2c;
@@ -269,12 +273,6 @@ impl Settings {
     }
 }
 
-/// Whether `kind` has its own implementation yet. The cost model routes by
-/// its documented degraded path, power of two choices, until it lands.
-pub const fn is_native(kind: PolicyKind) -> bool {
-    !matches!(kind, PolicyKind::CostModel)
-}
-
 pub fn build(kind: PolicyKind, settings: &Settings) -> Box<dyn RoutingPolicy> {
     let seed = settings.seed;
     match kind {
@@ -284,30 +282,7 @@ pub fn build(kind: PolicyKind, settings: &Settings) -> Box<dyn RoutingPolicy> {
         PolicyKind::P2c => Box::new(P2c::new(seed)),
         PolicyKind::PrefixHash => Box::new(PrefixHash::new(settings.prefix_blocks, seed)),
         PolicyKind::KvAware => Box::new(KvAware::new(&settings.kv_aware, seed)),
-        PolicyKind::CostModel => Box::new(Degraded {
-            kind,
-            fallback: P2c::new(seed),
-        }),
-    }
-}
-
-#[derive(Debug)]
-struct Degraded {
-    kind: PolicyKind,
-    fallback: P2c,
-}
-
-impl RoutingPolicy for Degraded {
-    fn kind(&self) -> PolicyKind {
-        self.kind
-    }
-
-    fn choose(&self, ctx: &RouteContext<'_>) -> Option<Choice> {
-        self.fallback.choose(ctx)
-    }
-
-    fn explain(&self, ctx: &RouteContext<'_>) -> Explanation {
-        self.fallback.explain(ctx)
+        PolicyKind::CostModel => Box::new(CostModelPolicy::new(settings)),
     }
 }
 
@@ -342,23 +317,6 @@ mod tests {
         for kind in PolicyKind::ALL {
             assert_eq!(build(kind, &Settings::seeded(1)).kind(), kind);
         }
-    }
-
-    #[test]
-    fn kinds_without_an_implementation_fall_back_to_p2c_choices() {
-        let pool = Pool::new(6);
-        let candidates = pool.candidates(&[3, 1, 4, 1, 5, 9]);
-        for kind in [PolicyKind::CostModel] {
-            let (degraded, p2c) = (build(kind, &Settings::seeded(77)), P2c::new(77));
-            assert!(!is_native(kind));
-            for _ in 0..200 {
-                assert_eq!(
-                    pool.pick(degraded.as_ref(), &candidates),
-                    pool.pick(&p2c, &candidates)
-                );
-            }
-        }
-        assert!(is_native(PolicyKind::P2c));
     }
 
     #[test]

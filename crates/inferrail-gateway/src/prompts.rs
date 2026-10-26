@@ -245,6 +245,13 @@ impl Prompts {
         })
     }
 
+    /// Whether `model`'s prompts are tokenized.
+    pub(crate) fn tokenizes(&self, model: &ModelId) -> bool {
+        self.models
+            .get(model)
+            .is_some_and(|m| matches!(m.tokenizer, Loaded::Ready(_)))
+    }
+
     /// Whether any model gets predictions at all.
     pub(crate) fn any(&self) -> bool {
         self.models

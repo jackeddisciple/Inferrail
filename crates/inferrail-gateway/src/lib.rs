@@ -10,7 +10,7 @@ use inferrail_control::{
     CheckerConfig, Clock, HealthPolicy, Registry, ReplicaSpec, Resolve, SystemResolver,
     run_checker, run_dns,
 };
-use inferrail_core::config::{Config, ConfigIssues};
+use inferrail_core::config::{Config, ConfigIssues, PolicyKind};
 use inferrail_core::ids::ModelId;
 use inferrail_index::KvIndex;
 use inferrail_load::{CollectorConfig, run_collector};
@@ -166,11 +166,13 @@ impl Gateway {
                 names.insert(alias.clone(), model.name.clone());
             }
             let kind = config.policy_for(model);
-            if !inferrail_policy::is_native(kind) {
+            let sees_prefixes = prompts.tokenizes(&model.name)
+                && (kind == PolicyKind::PrefixHash || index.is_some());
+            if kind.is_cache_aware() && !sees_prefixes {
                 tracing::warn!(
                     model = %model.name,
                     policy = %kind,
-                    "policy needs the KV index, which is not built yet; routing with power of two choices"
+                    "the policy routes on cached prefixes, but this model gets no cache predictions; it routes on load alone"
                 );
             }
             let model_seed = inferrail_policy::mix_seed(seed, model.name.as_str());
