@@ -2,7 +2,7 @@ CARGO ?= cargo
 UV ?= uv
 NEXTEST := $(shell $(CARGO) nextest --version >/dev/null 2>&1 && echo "nextest run" || echo "test")
 
-.PHONY: check fmt lint audit test test-rust test-python bench e2e stress baselines report stack stack-down
+.PHONY: check fmt lint audit test test-rust test-python bench e2e stress goldens baselines report stack stack-down
 
 check: fmt lint test
 
@@ -43,6 +43,9 @@ stress:
 	cd bench && INFERRAIL_SIM_BIN=$(CURDIR)/target/release/inferrail-sim \
 		INFERRAIL_GATEWAY_BIN=$(CURDIR)/target/release/inferrail-gateway \
 		$(UV) run --frozen pytest -q -s -m stress
+
+goldens:
+	cd tests/fixtures/tokenizers && $(UV) run make_goldens.py
 
 baselines:
 	$(CARGO) build --release -p inferrail-sim -p inferrail-gateway

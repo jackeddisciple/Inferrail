@@ -1,0 +1,10 @@
+{
+  "repo": "ibm-granite/granite-3.3-8b-instruct",
+  "revision": "51dd4bc2ade4059a6bd87649d68aa11e4fb2529b",
+  "license": "apache-2.0",
+  "sha256": {
+    "tokenizer.json": "91168e938f05796aa6dcca7e485e4b30ab52785320c7a6391ecef86e6c84681e",
+    "tokenizer_config.json": "f65a6a5a911424c85f157c40cfbdf06e025814c755480ba2e998d7fba1178664",
+    "special_tokens_map.json": "21ce694081bb9ae1bd4bc64549e72e0799ebb74705e6b650e3585d85b71ebdc1"
+  }
+}

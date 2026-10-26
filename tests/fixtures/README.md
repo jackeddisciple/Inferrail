@@ -20,5 +20,15 @@
   `srt/observability/metrics_collector.py`. `make_metrics_fixture.py`
   rebuilds it; the `pid` label changes from run to run.
 
+* `tokenizers/`: the tokenizer files of three model families at pinned
+  Hugging Face revisions (`source.json` names each repository, revision,
+  license and file checksum; `tokenizer.json` is gzipped), and
+  `goldens.jsonl.gz`: 240 request bodies per family with the token ids vLLM
+  v0.31.0 computes for them, or the reason it rejects them. The ids come
+  from `make_goldens.py`, which runs vLLM's request handling, ported, through
+  transformers 5.17.0 and pydantic; `make goldens` rebuilds everything. The
+  families are Qwen3 8B, Granite 3.3 8B Instruct and Hermes 2 Pro Mistral 7B,
+  all Apache 2.0.
+
 When a real engine run is available, replace the derived vLLM files with
 live recordings from the pinned version and keep the tests unchanged.

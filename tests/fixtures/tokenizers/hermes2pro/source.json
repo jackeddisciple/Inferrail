@@ -1,0 +1,10 @@
+{
+  "repo": "NousResearch/Hermes-2-Pro-Mistral-7B",
+  "revision": "24dbda51d986efa05201eec7a093ac91fc5519cf",
+  "license": "apache-2.0",
+  "sha256": {
+    "tokenizer.json": "6fd76dbb783f99e241b2c658787947b00a574125736dc214ecd5484c2dbb36c8",
+    "tokenizer_config.json": "dd39a47d0dfabd1e06601891e1a7e7763bea9cc4c338c9b28303f52f9794c6e8",
+    "special_tokens_map.json": "5a1e50e0e488ce4306a390682135546eeb6a91039212d85520a4db3e650b5c4f"
+  }
+}

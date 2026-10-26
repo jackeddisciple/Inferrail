@@ -1,0 +1,310 @@
+{
+  "add_bos_token": true,
+  "add_eos_token": false,
+  "add_prefix_space": true,
+  "added_tokens_decoder": {
+    "0": {
+      "content": "<unk>",
+      "lstrip": false,
+      "normalized": false,
+      "rstrip": false,
+      "single_word": false,
+      "special": true
+    },
+    "1": {
+      "content": "<s>",
+      "lstrip": false,
+      "normalized": false,
+      "rstrip": false,
+      "single_word": false,
+      "special": true
+    },
+    "2": {
+      "content": "</s>",
+      "lstrip": false,
+      "normalized": false,
+      "rstrip": false,
+      "single_word": false,
+      "special": true
+    },
+    "32000": {
+      "content": "<|im_end|>",
+      "lstrip": false,
+      "normalized": false,
+      "rstrip": false,
+      "single_word": false,
+      "special": true
+    },
+    "32001": {
+      "content": "<|im_start|>",
+      "lstrip": false,
+      "normalized": false,
+      "rstrip": false,
+      "single_word": false,
+      "special": false
+    },
+    "32002": {
+      "content": "<pad2>",
+      "lstrip": false,
+      "normalized": false,
+      "rstrip": false,
+      "single_word": false,
+      "special": false
+    },
+    "32003": {
+      "content": "<pad3>",
+      "lstrip": false,
+      "normalized": false,
+      "rstrip": false,
+      "single_word": false,
+      "special": false
+    },
+    "32004": {
+      "content": "<pad4>",
+      "lstrip": false,
+      "normalized": false,
+      "rstrip": false,
+      "single_word": false,
+      "special": false
+    },
+    "32005": {
+      "content": "<pad5>",
+      "lstrip": false,
+      "normalized": false,
+      "rstrip": false,
+      "single_word": false,
+      "special": false
+    },
+    "32006": {
+      "content": "<pad6>",
+      "lstrip": false,
+      "normalized": false,
+      "rstrip": false,
+      "single_word": false,
+      "special": false
+    },
+    "32007": {
+      "content": "<pad7>",
+      "lstrip": false,
+      "normalized": false,
+      "rstrip": false,
+      "single_word": false,
+      "special": false
+    },
+    "32008": {
+      "content": "<pad8>",
+      "lstrip": false,
+      "normalized": false,
+      "rstrip": false,
+      "single_word": false,
+      "special": false
+    },
+    "32009": {
+      "content": "<pad9>",
+      "lstrip": false,
+      "normalized": false,
+      "rstrip": false,
+      "single_word": false,
+      "special": false
+    },
+    "32010": {
+      "content": "<pad10>",
+      "lstrip": false,
+      "normalized": false,
+      "rstrip": false,
+      "single_word": false,
+      "special": false
+    },
+    "32011": {
+      "content": "<pad11>",
+      "lstrip": false,
+      "normalized": false,
+      "rstrip": false,
+      "single_word": false,
+      "special": false
+    },
+    "32012": {
+      "content": "<pad12>",
+      "lstrip": false,
+      "normalized": false,
+      "rstrip": false,
+      "single_word": false,
+      "special": false
+    },
+    "32013": {
+      "content": "<pad13>",
+      "lstrip": false,
+      "normalized": false,
+      "rstrip": false,
+      "single_word": false,
+      "special": false
+    },
+    "32014": {
+      "content": "<pad14>",
+      "lstrip": false,
+      "normalized": false,
+      "rstrip": false,
+      "single_word": false,
+      "special": false
+    },
+    "32015": {
+      "content": "<pad15>",
+      "lstrip": false,
+      "normalized": false,
+      "rstrip": false,
+      "single_word": false,
+      "special": false
+    },
+    "32016": {
+      "content": "<pad16>",
+      "lstrip": false,
+      "normalized": false,
+      "rstrip": false,
+      "single_word": false,
+      "special": false
+    },
+    "32017": {
+      "content": "<pad17>",
+      "lstrip": false,
+      "normalized": false,
+      "rstrip": false,
+      "single_word": false,
+      "special": false
+    },
+    "32018": {
+      "content": "<pad18>",
+      "lstrip": false,
+      "normalized": false,
+      "rstrip": false,
+      "single_word": false,
+      "special": false
+    },
+    "32019": {
+      "content": "<pad19>",
+      "lstrip": false,
+      "normalized": false,
+      "rstrip": false,
+      "single_word": false,
+      "special": false
+    },
+    "32020": {
+      "content": "<pad20>",
+      "lstrip": false,
+      "normalized": false,
+      "rstrip": false,
+      "single_word": false,
+      "special": false
+    },
+    "32021": {
+      "content": "<pad21>",
+      "lstrip": false,
+      "normalized": false,
+      "rstrip": false,
+      "single_word": false,
+      "special": false
+    },
+    "32022": {
+      "content": "<pad22>",
+      "lstrip": false,
+      "normalized": false,
+      "rstrip": false,
+      "single_word": false,
+      "special": false
+    },
+    "32023": {
+      "content": "<pad23>",
+      "lstrip": false,
+      "normalized": false,
+      "rstrip": false,
+      "single_word": false,
+      "special": false
+    },
+    "32024": {
+      "content": "<pad24>",
+      "lstrip": false,
+      "normalized": false,
+      "rstrip": false,
+      "single_word": false,
+      "special": false
+    },
+    "32025": {
+      "content": "<pad25>",
+      "lstrip": false,
+      "normalized": false,
+      "rstrip": false,
+      "single_word": false,
+      "special": false
+    },
+    "32026": {
+      "content": "<pad26>",
+      "lstrip": false,
+      "normalized": false,
+      "rstrip": false,
+      "single_word": false,
+      "special": false
+    },
+    "32027": {
+      "content": "<pad27>",
+      "lstrip": false,
+      "normalized": false,
+      "rstrip": false,
+      "single_word": false,
+      "special": false
+    },
+    "32028": {
+      "content": "<pad28>",
+      "lstrip": false,
+      "normalized": false,
+      "rstrip": false,
+      "single_word": false,
+      "special": false
+    },
+    "32029": {
+      "content": "<pad29>",
+      "lstrip": false,
+      "normalized": false,
+      "rstrip": false,
+      "single_word": false,
+      "special": false
+    },
+    "32030": {
+      "content": "<pad30>",
+      "lstrip": false,
+      "normalized": false,
+      "rstrip": false,
+      "single_word": false,
+      "special": false
+    },
+    "32031": {
+      "content": "<pad31>",
+      "lstrip": false,
+      "normalized": false,
+      "rstrip": false,
+      "single_word": false,
+      "special": false
+    }
+  },
+  "additional_special_tokens": [],
+  "bos_token": "<s>",
+  "chat_template": [
+    {
+      "name": "default",
+      "template": "{{bos_token}}{% for message in messages %}{{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n'}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}"
+    },
+    {
+      "name": "tool_use",
+      "template": "{%- macro json_to_python_type(json_spec) %}\n{%- set basic_type_map = {\n    \"string\": \"str\",\n    \"number\": \"float\",\n    \"integer\": \"int\",\n    \"boolean\": \"bool\"\n} %}\n\n{%- if basic_type_map[json_spec.type] is defined %}\n    {{- basic_type_map[json_spec.type] }}\n{%- elif json_spec.type == \"array\" %}\n    {{- \"list[\" +  json_to_python_type(json_spec|items) + \"]\"}}\n{%- elif json_spec.type == \"object\" %}\n    {%- if json_spec.additionalProperties is defined %}\n        {{- \"dict[str, \" + json_to_python_type(json_spec.additionalProperties) + ']'}}\n    {%- else %}\n        {{- \"dict\" }}\n    {%- endif %}\n{%- elif json_spec.type is iterable %}\n    {{- \"Union[\" }}\n    {%- for t in json_spec.type %}\n      {{- json_to_python_type({\"type\": t}) }}\n      {%- if not loop.last %}\n        {{- \",\" }} \n    {%- endif %}\n    {%- endfor %}\n    {{- \"]\" }}\n{%- else %}\n    {{- \"Any\" }}\n{%- endif %}\n{%- endmacro %}\n\n\n{{- bos_token }}\n{{- '<|im_start|>system\n' }}\n{{- \"You are a function calling AI model. You are provided with function signatures within <tools></tools> XML tags. You may call one or more functions to assist with the user query. Don't make assumptions about what values to plug into functions. Here are the available tools: <tools> \" }}\n{%- for tool in tools %}\n    {%- if tool.function is defined %}\n        {%- set tool = tool.function %}\n    {%- endif %}\n    {{- '{\"type\": \"function\", \"function\": ' }}\n    {{- '{\"name\": \"' + tool.name + '\", ' }}\n    {{- '\"description\": \"' + tool.name + '(' }}\n    {%- for param_name, param_fields in tool.parameters.properties|items %}\n        {{- param_name + \": \" + json_to_python_type(param_fields) }}\n        {%- if not loop.last %}\n            {{- \", \" }}\n        {%- endif %}\n    {%- endfor %}\n    {{- \")\" }}\n    {%- if tool.return is defined %}\n        {{- \" -> \" + json_to_python_type(tool.return) }}\n    {%- endif %}\n    {{- \" - \" + tool.description + \"\n\n\" }}\n    {%- for param_name, param_fields in tool.parameters.properties|items %}\n        {%- if loop.first %}\n            {{- \"    Args:\n\" }}\n        {%- endif %}\n        {{- \"        \" + param_name + \"(\" + json_to_python_type(param_fields) + \"): \" + param_fields.description|trim }}\n    {%- endfor %}\n    {%- if tool.return is defined and tool.return.description is defined %}\n        {{- \"\n    Returns:\n        \" + tool.return.description }}\n    {%- endif %}\n    {{- '\"' }}\n    {{- ', \"parameters\": ' }}\n    {%- if tool.parameters.properties | length == 0 %}\n        {{- \"{}\" }}\n    {%- else %}\n        {{- tool.parameters|tojson }}\n    {%- endif %}\n    {{- \"}\" }}\n    {%- if not loop.last %}\n        {{- \"\n\" }}\n    {%- endif %}\n{%- endfor %}\n{{- \" </tools>\" }}\n{{- 'Use the following pydantic model json schema for each tool call you will make: {\"properties\": {\"name\": {\"title\": \"Name\", \"type\": \"string\"}, \"arguments\": {\"title\": \"Arguments\", \"type\": \"object\"}}, \"required\": [\"name\", \"arguments\"], \"title\": \"FunctionCall\", \"type\": \"object\"}}\n' }}\n{{- \"For each function call return a json object with function name and arguments within <tool_call></tool_call> XML tags as follows:\n\" }}\n{{- \"<tool_call>\n\" }}\n{{- '{\"name\": <function-name>, \"arguments\": <args-dict>}\n' }}\n{{- '</tool_call><|im_end|>\n' }}\n{%- for message in messages %}\n    {%- if message.role == \"user\" or message.role == \"system\" or (message.role == \"assistant\" and message.tool_calls is not defined) %}\n        {{- '<|im_start|>' + message.role + '\n' + message.content + '<|im_end|>' + '\n' }}\n    {%- elif message.role == \"assistant\" %}\n        {{- '<|im_start|>' + message.role }}\n    {%- for tool_call in message.tool_calls %}\n       {{- '\n<tool_call>\n' }}           {%- if tool_call.function is defined %}\n                {%- set tool_call = tool_call.function %}\n            {%- endif %}\n            {{- '{' }}\n            {{- '\"name\": \"' }}\n            {{- tool_call.name }}\n            {{- '\"' }}\n            {{- ', '}}\n            {%- if tool_call.arguments is defined %}\n                {{- '\"arguments\": ' }}\n                {%- if tool_call.arguments is string %}\n                    {{- tool_call.arguments }}\n                {%- else %}\n                    {{- tool_call.arguments|tojson }}\n                {%- endif %}\n            {%- endif %}\n             {{- '}' }}\n            {{- '\n</tool_call>' }}\n    {%- endfor %}\n        {{- '<|im_end|>\n' }}\n    {%- elif message.role == \"tool\" %}\n        {%- if loop.previtem and loop.previtem.role != \"tool\" %}\n            {{- '<|im_start|>tool\n' }}\n        {%- endif %}\n        {{- '<tool_response>\n' }}\n        {{- message.content }}\n        {%- if not loop.last %}\n            {{- '\n</tool_response>\n' }}\n        {%- else %}\n            {{- '\n</tool_response>' }}\n        {%- endif %}\n        {%- if not loop.last and loop.nextitem.role != \"tool\" %}\n            {{- '<|im_end|>' }}\n        {%- elif loop.last %}\n            {{- '<|im_end|>' }}\n        {%- endif %}\n    {%- endif %}\n{%- endfor %}\n{%- if add_generation_prompt %}\n    {{- '<|im_start|>assistant\n' }}\n{%- endif %}\n"    
+    }
+  ],
+  "clean_up_tokenization_spaces": true,
+  "eos_token": "<|im_end|>",
+  "legacy": true,
+  "model_max_length": 1000000000000000019884624838656,
+  "pad_token": "</s>",
+  "sp_model_kwargs": {},
+  "spaces_between_special_tokens": false,
+  "tokenizer_class": "LlamaTokenizer",
+  "unk_token": "<unk>",
+  "use_default_system_prompt": false,
+  "use_fast": true
+}
