@@ -4,17 +4,18 @@
 use std::sync::Arc;
 
 use axum::body::Bytes;
+use axum::extract::Request;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use inferrail_core::ids::{ModelId, ReplicaId};
 use inferrail_policy::{Estimate, Exclusion, Guarded, HotPrefix, Steer, Term};
 use inferrail_tokenize::Endpoint;
 use serde::Serialize;
-use tokio::time::Instant;
+use tokio::time::{Instant, timeout};
 
 use crate::Shared;
 use crate::errors::GatewayError;
-use crate::proxy::{Resolved, estimate_tokens, resolve_model, session_key};
+use crate::proxy::{Resolved, estimate_tokens, read_body, resolve_model, session_key};
 use crate::route;
 
 #[derive(Debug, Serialize)]
@@ -54,13 +55,22 @@ struct Row {
     estimate: Option<Estimate>,
 }
 
-pub(crate) async fn handle(
-    shared: Arc<Shared>,
-    endpoint: Endpoint,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    let (status, body) = match report(&shared, endpoint, &headers, body).await {
+/// Reads the body as the client port does, within the request timeout and
+/// its size limit, draining what is left of one too large so the client
+/// gets the error rather than a reset.
+pub(crate) async fn handle(shared: Arc<Shared>, endpoint: Endpoint, request: Request) -> Response {
+    let (parts, body) = request.into_parts();
+    let server = &shared.config.server;
+    let read = timeout(
+        server.request_timeout,
+        read_body(&parts.headers, body, server.max_body_bytes),
+    );
+    let explained = match read.await {
+        Ok(Ok(body)) => report(&shared, endpoint, &parts.headers, body).await,
+        Ok(Err(err)) => Err(err),
+        Err(_) => Err(GatewayError::slow_body()),
+    };
+    let (status, body) = match explained {
         Ok(report) => (
             StatusCode::OK,
             serde_json::to_vec_pretty(&report).unwrap_or_default(),

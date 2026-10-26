@@ -1,6 +1,6 @@
 [project]
 name = "inferrail-bench"
-version = "0.1.7"
+version = "0.1.8"
 description = "Workload generation, benchmark runner and analysis for Inferrail."
 requires-python = ">=3.12"
 license = "MIT"

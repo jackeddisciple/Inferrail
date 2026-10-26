@@ -12,17 +12,18 @@ most of its prompt in cache, without letting any replica overload.
 The goal is lower tail latency and fewer GPUs for the same traffic, proven
 with benchmarks anyone can rerun.
 
-> **Status: v0.1.7, tokens, hashes and the approximate KV index,
-> hardened.** The gateway proxies chat and completions to a fleet of
-> engines, streams responses untouched, retries before the first byte,
-> ejects failing replicas, discovers replicas through DNS, reads every
-> engine's load ten times a second and exports metrics, traces and a
-> decision log. It now
-> tokenizes prompts at the edge with token ids identical to vLLM's, hashes
-> them into chained blocks, and predicts for every replica how much of each
-> prompt it already holds. The policies that act on those predictions come
-> next, so the cache aware policies still route by their documented
-> fallback, power of two choices. See [Roadmap](#roadmap).
+> **Status: v0.1.8, the routing brain.** The gateway proxies chat and
+> completions to a fleet of engines, streams responses untouched, retries
+> before the first byte, ejects failing replicas, discovers replicas
+> through DNS, reads every engine's load ten times a second, tokenizes
+> prompts at the edge with token ids identical to vLLM's and predicts for
+> every replica how much of each prompt it already holds. It now routes on
+> those predictions: `cost_model` sends each request to the replica with
+> the lowest estimated time to first token, inside load guards that keep
+> any replica from melting, `kv_aware` and `prefix_hash` stand in for the
+> weighted and hashing routers others ship, `inferrail-calibrate` measures
+> the cost model on an engine, and `/admin/explain` shows why a replica
+> won. See [Roadmap](#roadmap).
 
 ## Why this exists
 
@@ -49,21 +50,22 @@ the cache away. Inferrail treats routing as a cost estimate instead: for each
 replica, how long until this request's first token, given what is cached
 there and what is queued there?
 
-## What is in v0.1.7
+## What is in v0.1.8
 
 | Piece | What it does |
 | --- | --- |
-| `inferrail-gateway` | OpenAI compatible proxy on hyper: chat and completions, streaming pass through, model list, request IDs, retries before the first byte, health checks, outlier ejection, breakers, DNS discovery, graceful shutdown, edge tokenization on a bounded worker pool, cache predictions per replica, Prometheus metrics on an admin port, OpenTelemetry traces and a sampled decision log |
+| `inferrail-gateway` | OpenAI compatible proxy on hyper: chat and completions, streaming pass through, model list, request IDs, retries before the first byte, health checks, outlier ejection, breakers, DNS discovery, graceful shutdown, edge tokenization on a bounded worker pool, cache predictions per replica, a virtual prefill queue per replica, session keys, `/admin/explain`, Prometheus metrics on an admin port, OpenTelemetry traces and a sampled decision log |
+| `inferrail-policy` | The `RoutingPolicy` trait and seven policies: the round robin, random, least request and power of two choices baselines, `prefix_hash` on rendezvous hashing, the weighted `kv_aware` score, and `cost_model`, the lowest estimated time to first token with bounded load, KV pressure, hot prefix replication and session affinity |
+| `inferrail-calibrate` | Measures an idle engine's prefill with prompts of known cached and uncached length, timed by the engine's own histogram, and fits the cost model's parameters into a config fragment |
 | `inferrail-tokenize` | Chat templates and Hugging Face tokenizers with token ids identical to vLLM v0.31.0 on three model families, a cache of repeated prompt pieces, the simulator's tokenizer, and chained XXH3 128 bit block hashes salted by model, adapter and `cache_salt` |
 | `inferrail-index` | The KV index in approximate mode: a sharded map from block hash to replicas and a shadow LRU per replica sized to its KV capacity, with longest prefix lookup in microseconds |
 | `inferrail-load` | Reads vLLM and SGLang `/metrics` pages, scrapes every replica ten times a second and publishes load snapshots that are never used once stale |
-| `inferrail-policy` | The `RoutingPolicy` trait, whose candidates now carry predicted cached tokens, and the round robin, random, least request and power of two choices baselines, chosen per model |
-| `inferrail-control` | Lock free replica registry with request and prompt token counters, health state with exponential ejection backoff, the active health checker and DNS discovery |
+| `inferrail-control` | Lock free replica registry with request, prompt token and queued prefill counters, health state with exponential ejection backoff, the active health checker and DNS discovery |
 | `inferrail-core` | Lossless OpenAI wire types, an incremental SSE decoder and validated YAML configuration |
 | `inferrail-sim` | A CPU mock of vLLM v0.31.0 with the same HTTP API, streaming bytes and Prometheus metrics, a calibrated latency model and a real prefix cache |
-| Other crates | `events` and `calibrate` compile as stubs with the boundaries the router will use |
-| `bench/` | The benchmark harness (`inferrail-bench`): open loop workloads W1, W2 and W6, TTFT, TPOT and ITL measurement, prediction accuracy against the engines' own counts, JSON results, charts and policy comparisons on simulators, plus the OpenAI SDK suites |
-| `deploy/compose`, `dashboards/` | Gateway, simulators, Prometheus, Grafana and Jaeger in one `make stack`, with the first dashboard |
+| Other crates | `events` compiles as a stub with the boundaries the exact index will use |
+| `bench/` | The benchmark harness (`inferrail-bench`): open loop workloads W1, W2 and W6 plus a mix of shared and unique prompts and Zipf hot system prompts, TTFT, TPOT and ITL measurement, prediction accuracy against the engines' own counts, replica shares, JSON results, charts and policy comparisons on simulators, plus the OpenAI SDK suites |
+| `deploy/compose`, `dashboards/` | Gateway, simulators, Prometheus, Grafana and Jaeger in one `make stack`, with a dashboard that now shows estimated against measured TTFT, queued prefill and the load guards |
 | CI | fmt, clippy with warnings denied, nextest, doc tests, ruff, pytest, `cargo audit`, `cargo machete`, and the official OpenAI SDK and the harness against the simulator and the gateway on every push |
 
 ## Quick start
@@ -75,7 +77,7 @@ rustup), [uv](https://docs.astral.sh/uv/) for the Python side, and optionally
 Start three simulated engines and a gateway in front of them:
 
 ```sh
-cargo build --release -p inferrail-sim -p inferrail-gateway
+cargo build --release -p inferrail-sim -p inferrail-gateway -p inferrail-calibrate
 for port in 8001 8002 8003; do
   ./target/release/inferrail-sim --port $port --enable-prompt-tokens-details &
 done
@@ -115,6 +117,24 @@ stream = client.chat.completions.create(
 )
 for chunk in stream:
     print(chunk)
+```
+
+Ask the gateway why it would send a request where it would, without
+sending it: the admin port answers with every replica's queue, predicted
+cache and estimated time to first token, the winner and the term that
+decided it.
+
+```sh
+curl -s localhost:9090/admin/explain/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{"model": "sim", "messages": [{"role": "user", "content": "Hello"}]}'
+```
+
+Measure an engine's prefill and get the cost model for it, ready to paste
+under `routing` or a model's entry:
+
+```sh
+./target/release/inferrail-calibrate --url http://127.0.0.1:8001
 ```
 
 Kill one of the simulators while traffic is flowing: only responses it was
@@ -315,8 +335,11 @@ default) serves OpenMetrics, apart from the client port:
 | `inferrail_prompt_tokens_total`, `inferrail_predicted_cached_tokens_total` | model | prompt tokens and the cached tokens predicted on the chosen replica, per decision |
 | `inferrail_tokenize_cache_lookups_total` | model, result | repeated prompt pieces served from the tokenization cache |
 | `inferrail_index_entries`, `inferrail_index_bytes`, `inferrail_index_resets_total` | replica for resets | blocks the index holds, its memory, engines found restarted |
+| `inferrail_estimated_ttft_seconds` | model, policy | the cost model's estimate for the chosen replica, at every decision, to set against `inferrail_ttft_seconds` |
+| `inferrail_routing_guards_total` | model, guard | decisions where `bounded_load` or `kv_pressure` set replicas aside, or `kv_waived` when every replica was under KV pressure |
+| `inferrail_routing_steered_total` | model, reason | decisions decided by `session` affinity, landing on a `hot_prefix` owner, or routed by the `no_prefix` fallback |
 | `inferrail_ejections_total`, `inferrail_load_scrapes_total` | replica (and result) | passive ejections, engine scrapes |
-| `inferrail_replica_*` | replica | health, ejection, in flight requests and prompt tokens, the engine's running, waiting, KV usage and prefix cache counters, the age of its report, and the blocks and capacity the index assumes |
+| `inferrail_replica_*` | replica | health, ejection, in flight requests and prompt tokens, queued prefill, the engine's running, waiting, KV usage and prefix cache counters, the age of its report, and the blocks and capacity the index assumes |
 
 Replica gauges are read from the fleet when Prometheus scrapes, series of
 replicas that leave are removed, and recording one streamed request costs
@@ -330,13 +353,17 @@ and the winner's predicted cached tokens) and an
 `trace_sample_ratio`. A bare collector address such as
 `http://collector:4318` gets the standard `/v1/traces` path. A client's
 W3C `traceparent` is continued, and the engine receives the gateway's span
-as its parent. A warning is logged when export starts failing and a note
-when it recovers. Without an endpoint the spans are never created.
+as its parent. Route spans also carry the winner's estimated time to first
+token and what steered the decision. A warning is logged when export
+starts failing and a note when it recovers. Without an endpoint the spans
+are never created.
 
 **Decision log.** With `observability.decision_log.sample_rate` above zero,
 sampled requests write one JSON line per routing decision to
 `decision_log.path`: the policy, the attempt, the prompt's tokens, the
-winner and every candidate's state, load and predicted cached tokens. Requests are sampled by id, so all attempts of
+winner, its estimated time to first token, what steered it and what the
+guards set aside, and every candidate's state, load, queued prefill and
+predicted cached tokens. Requests are sampled by id, so all attempts of
 a request are kept together. A writer thread drains a bounded queue; if
 the disk falls behind, records are dropped and counted, never waited for.
 Prompts are never logged. See [ADR 006](docs/adr/006-observability.md).
@@ -349,30 +376,110 @@ shows TTFT per replica and per policy from both the gateway and the
 engines, in flight requests, engine queues and KV usage per replica, each
 policy's traffic share, prefix cache hit rates, decision time, retries,
 ejections and errors, and the predicted hit rate next to the engines' own,
-tokenization outcomes and time, and the blocks the index holds per replica.
+tokenization outcomes and time, the blocks the index holds per replica, the
+cost model's estimated TTFT next to the measured one, queued prefill per
+replica, and how often the load guards and steering act.
 
-## Routing policies
+## Routing
 
 Every policy implements one `RoutingPolicy` trait and is chosen per model in
 the config, so baselines and the main policy run in the same binary on the
 same candidates. The gateway only ever offers a policy replicas that serve
-the model, are healthy and have room, each with the prompt tokens the KV
-index predicts it has cached, and tells it the prompt's length. See
-[ADR 004](docs/adr/004-routing-policies.md).
+the model, are healthy and have room. Each comes with its requests in
+flight, the prompt tokens the KV index predicts it has cached, the prefill
+work queued on it, its running requests and, while the engine's report is
+fresh, its KV cache usage. The policy also sees the prompt's length and
+block hashes and the conversation it belongs to. See
+[ADR 004](docs/adr/004-routing-policies.md) and
+[ADR 010](docs/adr/010-cost-model-routing.md).
 
-| Policy | Rule | Status |
-| --- | --- | --- |
-| `round_robin` | next replica in turn | available |
-| `random` | uniform choice | available |
-| `least_request` | fewest requests in flight, ties broken at random | available |
-| `p2c` | two random replicas, the less loaded wins | available |
-| `prefix_hash` | consistent hash on the first blocks | needs the KV index; routes as `p2c` meanwhile |
-| `kv_aware` | weighted cache hit and load score | needs the KV index; routes as `p2c` meanwhile |
-| `cost_model` | lowest estimated time to first token | needs the KV index; routes as `p2c` meanwhile |
+| Policy | Rule |
+| --- | --- |
+| `round_robin` | next replica in turn |
+| `random` | uniform choice |
+| `least_request` | fewest requests in flight, ties broken at random |
+| `p2c` | two random replicas, the less loaded wins |
+| `prefix_hash` | rendezvous hash on the prompt's first `prefix_hash.blocks` blocks, whatever the load; power of two choices for prompts without a full block |
+| `kv_aware` | best `cache_weight * cached / prompt - load_weight * in_flight / busiest`, ties to fewer requests in flight |
+| `cost_model` | lowest estimated time to first token among the replicas the load guards allow |
 
-Randomized policies are seeded from `routing.seed`, so a fixed seed replays
-the same choices. A choice takes 2 to 106 ns on an Apple silicon laptop, from
-round robin to least request over 256 replicas.
+**The cost model.** For each candidate `cost_model` estimates
+
+```
+TTFT = W + P(u, c) + X
+P(u, c) = a*u + b*u*(c + u/2) + d
+```
+
+where `u` is the prompt tokens the replica would compute, `c` those it has
+cached, and `a`, `b`, `d` come from `routing.cost_model` or the model's own
+`cost_model`. `W` is the prefill already queued there plus
+`decode_interference_secs` per running request. The gateway keeps that queue
+itself: every routed request adds its estimated prefill to its replica's
+queue, which drains in real time and counts as empty once every request on
+the replica has had its first byte, so a replica of a fresh fleet costs
+nothing to wait for and one with three long prompts ahead costs their
+prefill. `X` prices cached tokens held in CPU or disk tiers by their load
+time and only counts when loading beats recomputing; it is zero until the
+index tracks tiers. Ties go to fewer requests in flight, then to chance.
+
+**Load guards.** `cost_model` never picks a replica that
+
+* would hold more than `ceil((1 + epsilon) * (in_flight + 1) / n)` requests,
+  twice its share with the default `epsilon` of 1.0 (bounded load, after
+  consistent hashing with bounded loads, so some replica always qualifies),
+* reports more than `kappa` (0.92) of its KV cache in use, for a prompt with
+  more than `short_prompt_tokens` (256) tokens to compute there, unless
+  every replica does.
+
+A root prefix (its first `hot_prefix.blocks` blocks) whose prefill demand,
+counted in a decaying count min sketch over `hot_prefix.window`, needs more
+than `hot_prefix.utilization` of a replica gets `ceil(demand /
+utilization)` owners, priced as if they held it, so the cost model shares
+it among them by their queues. With `session_affinity`, a request naming its
+conversation in `x-session-id` or the `user` field goes back to the
+conversation's last replica while the guards allow it. Why `epsilon` is 1.0
+rather than the 0.25 the design started from is in
+[ADR 011](docs/adr/011-load-guards.md), with the measurements.
+
+**Explaining a decision.** `POST /admin/explain/v1/chat/completions` (or
+`/v1/completions`) on the admin port takes a request as a client would send
+it and answers with what the model's policy would do now: the prompt's
+length and blocks, every replica serving the model, whether it was offered
+and why not, its load, queued prefill, predicted cache, any guard that set
+it aside and its estimate, the winner, and the term (`queue`, `prefill` or
+`tier_load`) that put it furthest ahead of the runner up. Nothing is routed
+and no state changes; bodies are read as on the client port, within the
+same timeout and size limit.
+
+```json
+{
+  "policy": "cost_model",
+  "prompt_tokens": 625,
+  "winner": "r0",
+  "decided_by": "prefill",
+  "replicas": [
+    {"replica": "r0", "cached_tokens": 592, "queued_secs": 0.0,
+     "estimate": {"queue_secs": 0.0, "prefill_secs": 0.0084, "tier_secs": 0.0, "ttft_secs": 0.0084}},
+    {"replica": "r1", "cached_tokens": 0, "queued_secs": 0.0,
+     "estimate": {"queue_secs": 0.0, "prefill_secs": 0.0681, "tier_secs": 0.0, "ttft_secs": 0.0681}}
+  ]
+}
+```
+
+**Calibration.** `inferrail-calibrate --url <engine>` sends an idle engine
+prompts of known cached and uncached length, one at a time, the cached part
+sent alone first so the probe finds it cached. Each probe's TTFT comes from
+the engine's own histogram (vLLM and SGLang export one), so network and
+HTTP time stay out of the fit and are reported apart. A least squares fit
+that keeps every term non negative gives `a`, `b` and `d`, printed or
+written with `--out` as a `cost_model` fragment. Against the simulator it
+recovers all three to nine significant digits.
+
+**Cost.** Randomized policies are seeded from `routing.seed`, so a fixed
+seed replays the same choices. A full `cost_model` decision for an 8,000
+token prompt, the index lookup of every candidate included, takes 7 µs at
+p99 over 64 replicas and 20 µs over 256 (benchmark A5, target 200 µs); a
+baseline choice takes nanoseconds.
 
 ## The simulator
 
@@ -400,8 +507,10 @@ of `u` uncached tokens attending to `c` cached ones costs
 P(u, c) = a*u + b*u*(c + u/2) + d
 ```
 
-the same shape as the router's future cost model, so calibration can recover
-the parameters. Decode emits tokens at a fixed time per output token, and
+the same shape as the router's cost model, so calibration can recover the
+parameters. Its TTFT and prefill time histograms are stamped when the model
+produces the first token, as vLLM stamps them in its engine core, so they
+carry no timer rounding. Decode emits tokens at a fixed time per output token, and
 deadlines are planned ahead so timer overshoot never accumulates. The
 defaults approximate an 8B model on one 24 GB GPU.
 
@@ -458,14 +567,20 @@ benchmark plan requires (see [ADR 007](docs/adr/007-benchmark-harness.md)):
 * **Workloads.** W1: a handful of 2k to 8k token system prompts shared by
   every user, with 50 to 500 token questions. W2: multi turn chats whose
   history is resent each turn, each user thinking 10 to 20 s before the
-  next question, generated or replayed from a ShareGPT file. W6: prompts that share nothing, the control
-  where cache affinity must not hurt.
+  next question, generated or replayed from a ShareGPT file, each request
+  naming its conversation in `x-session-id`. W6: prompts that share
+  nothing, the control where cache affinity must not hurt. `mix`: W1 and
+  W6 requests arriving together, half each, so a policy must weigh the
+  cache one kind finds against the prefill the other queues. `hot`: W1
+  with its system prompts drawn by Zipf weight (exponent 1.1), so a few
+  are hot.
 * **Measurements.** TTFT, time per output token, inter token latency, end
   to end latency, throughput, goodput against the default SLO (TTFT at most
   2 s, TPOT at most 100 ms), the prefix hit rate from usage and from the
   engines' own counters (read from vLLM or SGLang over the same requests,
-  after the warmup), errors, send lag and requests per replica. Time per
-  output token counts tokens from usage, not stream chunks.
+  after the warmup), errors, send lag, requests per replica and the
+  busiest replica's share. Time per output token counts tokens from usage,
+  not stream chunks.
 * **Prediction accuracy.** When the gateway tokenized a request, its
   predicted prompt and cached tokens are compared with the engine's usage:
   the share of exact predictions, of over and under predictions, the mean
@@ -476,41 +591,68 @@ benchmark plan requires (see [ADR 007](docs/adr/007-benchmark-harness.md)):
   warmup, and repeats with new seeds.
 
 ```sh
-make baselines   # every baseline on W1, W2 and W6, 3 repetitions
+make routing     # every policy on W1, W2, W6, mix and hot, 3 repetitions
+make baselines   # the four cache blind baselines on W1, W2 and W6
 make report      # charts and report.md from bench/results
 ```
 
-The committed results in [`bench/results/baselines`](bench/results/baselines)
-compare the four baselines on three simulators with the default latency
-model of an 8B model on one 24 GB GPU. Each workload runs at about 70% of
-what the fleet sustains: W1 with 32 system prompts (more than one
-replica's KV cache holds) at 6 req/s, W2 with users who think 10 to 20 s
-between turns at 25 req/s, and W6 at 9 req/s. Medians over three
-repetitions:
+The committed results in [`bench/results/routing`](bench/results/routing)
+compare all seven policies on three simulators with the default latency
+model of an 8B model on one 24 GB GPU, every run recorded from one clean
+commit. Each workload runs at about 70% of what a cache blind fleet
+sustains: W1 with 32 system prompts (more than one replica's KV cache
+holds) at 6 req/s, W2 with users who think 10 to 20 s between turns at 25
+req/s, W6 at 9 req/s, `mix` at 7 req/s and `hot` at 10 req/s. Medians over
+three repetitions, TTFT p50 / p99 in ms:
 
-| Policy | W1 TTFT p50 / p99 | W1 hit rate | W2 TTFT p50 / p99 | W2 hit rate | W6 TTFT p50 / p99 |
-| --- | --- | --- | --- | --- | --- |
-| `round_robin` | 510 / 1,843 ms | 0.39 | 104 / 906 ms | 0.03 | 313 / 846 ms |
-| `random` | 712 / 3,392 ms | 0.39 | 134 / 1,589 ms | 0.03 | 397 / 1,656 ms |
-| `least_request` | 670 / 1,899 ms | 0.42 | 127 / 1,146 ms | 0.03 | 369 / 1,034 ms |
-| `p2c` | 708 / 2,256 ms | 0.40 | 131 / 1,301 ms | 0.03 | 352 / 1,105 ms |
+| Policy | W1 | W1 hit rate | W2 | W6 | mix | hot | hot busiest replica |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `round_robin` | 512 / 1,846 | 0.39 | 105 / 909 | 314 / 855 | 485 / 2,028 | 291 / 2,154 | 33% |
+| `random` | 716 / 3,395 | 0.39 | 135 / 1,592 | 400 / 1,658 | 732 / 3,390 | 342 / 1,892 | 37% |
+| `least_request` | 685 / 1,900 | 0.41 | 135 / 1,264 | 353 / 1,085 | 614 / 2,283 | 305 / 1,908 | 34% |
+| `p2c` | 637 / 2,425 | 0.40 | 136 / 1,226 | 356 / 1,105 | 555 / 2,293 | 280 / 1,910 | 35% |
+| `prefix_hash` | 52 / 792 | 0.89 | 109 / 1,446 | 400 / 1,931 | 363 / 2,156 | 55 / 950 | 47% |
+| `kv_aware` | 51 / 845 | 0.88 | 115 / 1,307 | 352 / 1,057 | 299 / 1,295 | 52 / 896 | 38% |
+| `cost_model` | 48 / 836 | 0.91 | 95 / 867 | 289 / 679 | 265 / 898 | 50 / 749 | 37% |
+| `cost_model` with sessions | | | 112 / 1,534 | | | | |
 
-![TTFT by policy on W1](bench/report/baselines/w1_ttft.png)
+![TTFT by policy on W1](bench/report/routing/w1_ttft.png)
 
-Two things stand out. Under cache pressure every cache blind policy finds
-a warm prefix for only about 40% of W1's prompt tokens, close to the one
-in three a replica's share of the traffic would give, and p99 TTFT
-reaches 1.8 to 3.4 s, at or past the 2 s SLO. Multi turn chat is worse:
-by the time a user asks again, the conversation's history has been evicted
-or the turn lands on another replica, so only 3% of it is reused. That gap
-is what the cache aware policies are built to close. Even among cache
-blind policies the load signal matters: least request and power of two
-choices balance requests in flight, which here are mostly decoding and say
-little about the prefill queue, so they trail plain round robin, and
-random's uneven spread is worst everywhere. No run lost a request, the
-engines' own hit rates match the ones measured from usage, and the client
-sent every request within about 2 ms of its schedule at p99. The full
-report, with distributions and hit rates for every workload, is in
+What the numbers say:
+
+* **Shared prompts.** Routing on the cache keeps 88 to 91% of W1's prompt
+  tokens cached where every cache blind policy keeps about 40%, close to
+  the one in three a replica's share of the traffic gives. `cost_model`
+  cuts round robin's p99 TTFT by 55% (1,846 to 836 ms) and its median
+  tenfold. `prefix_hash` has the lowest W1 p99, 792 ms, while putting 46%
+  of the requests on one of three replicas.
+* **Mixed traffic.** When long unique prompts arrive with shared ones,
+  `cost_model` has a p99 TTFT 31% below `kv_aware` (898 against 1,295 ms)
+  and 61% below `least_request`: requests in flight, the load `kv_aware`
+  and the baselines see, are mostly decoding and say little about the
+  prefill queued ahead of a new request.
+* **No regression.** With nothing to share (W6), `cost_model` still has the
+  lowest TTFT, 37% below `least_request` at p99, because queued prefill is
+  the better load signal; `prefix_hash`, blind to load, is worst.
+* **Hot prompts.** Under Zipf traffic `cost_model` has the lowest p99 and
+  `prefix_hash` the most lopsided fleet, 47% of the requests on one
+  replica.
+* **Conversations.** With 10 to 20 s between turns most history is evicted
+  before the next one, and every cache aware policy reuses about 10% of W2
+  against 3%. `cost_model` has the best p50 and p99; `prefix_hash` and
+  `kv_aware` pin conversations to replicas whatever their queues and raise
+  p99. Session affinity does the same to `cost_model` (p99 867 to 1,534
+  ms): the index already finds each conversation's history, so on the
+  simulator affinity adds nothing over cache scoring and costs tail
+  latency.
+
+No run lost a request, the gateway's prediction matched the engine's cached
+tokens on all but 2 of 64,263 requests, the engines' own hit rates match the
+ones measured from usage, and the client sent every request within 3 ms of
+its schedule at p99. The full report, with distributions, hit rates and replica
+shares for every workload, is in
+[`bench/report/routing/report.md`](bench/report/routing/report.md); the
+earlier comparison of the baselines alone is in
 [`bench/report/baselines/report.md`](bench/report/baselines/report.md).
 
 ## Configuration
@@ -542,7 +684,14 @@ discovery:
       refresh: 2s
 routing:
   default_policy: cost_model
+  epsilon: 1.0
+  kappa: 0.92
+  session_affinity: true
   seed: 42
+  cost_model:
+    prefill_token_secs: 0.0001
+    prefill_pair_secs: 0.0000000033
+    prefill_fixed_secs: 0.005
 health:
   interval: 1s
   timeout: 500ms
@@ -601,6 +750,24 @@ includes:
   counters against naive reference models, the request splice changing
   nothing but the model, metrics pages that never crash the parser, and
   rendered pages that always parse back to the reference totals.
+* **Routing invariants**: across any random sequence of arrivals and
+  departures, with sessions and hot prefixes in play, `cost_model` never
+  gives a replica more than `ceil((1 + epsilon) * average)` requests; some
+  replica is always within the cap; explaining never changes the next
+  choice; more cache never costs more and a tier hit never costs more than
+  ignoring it; the count min sketch never underestimates; the calibration
+  fit recovers random parameters through noise. The worked example of the
+  design (a cached replica behind a long queue loses to an idle cold one,
+  and wins once the cold one is busier) is a test.
+* **Fleet simulations** (`crates/inferrail-policy/tests/fleet.rs`): every
+  policy routing the same seeded traffic over replicas that prefill at the
+  simulator's speed and evict their prefix caches. The cache aware policies
+  keep at least 80% of W1's prompt tokens cached where round robin keeps
+  37%; `cost_model` has a 26% lower p99 TTFT than `kv_aware` on a mix of
+  shared and unique prompts; under Zipf traffic it puts at most 29% of
+  requests on one of four replicas where `prefix_hash` puts 39%; and a hot
+  system prompt that sends `prefix_hash` past 20 s at p99 leaves it under
+  0.3 s.
 * **Gateway invariants**: no policy ever routes to an unhealthy replica or
   one that does not serve the model; bytes the engine sends reach the client
   unchanged under any chunking; request bodies reach the engine byte for
@@ -625,6 +792,15 @@ includes:
   really cached on every one of 300 requests under eviction pressure,
   through streams and completions, with capacity learned from engine
   metrics, after an engine restart, and when a tokenizer cannot load.
+* **Routing tests** against in process simulators: the cache aware
+  policies serve 92 to 95% of shared prompt tokens from cache where round
+  robin serves 37%; sessions stick to their replica until it is overloaded
+  and then follow the new one; queued prefill is estimated while it waits
+  and drains after; `/admin/explain` output is a snapshot, sends nothing to
+  any engine, and marks replicas that were unhealthy or full.
+* **Calibration tests**: `inferrail-calibrate` against simulators with two
+  different parameter sets recovers `a`, `b` and `d` within 5%, with every
+  probe's engine time equal to the latency model to a microsecond.
 * **Harness tests**: workload shapes and determinism, Poisson statistics,
   TTFT, TPOT and ITL against servers with known timing, coordinated
   omission against a server that falls behind, a blocked client loop
@@ -669,6 +845,10 @@ includes:
 | 16 threads sharing one tokenizer and its cache | 20 to 33 million tokens per second, every id exact |
 | 4 MB messages, 50,000 messages, 1,000 tools, nested arguments | each tokenized or refused within half a second |
 | 9,621 more golden requests | every token id matches |
+| A full `cost_model` decision for an 8,000 token prompt, index lookup included, 20,000 times | p99 6.5 µs at 8 replicas, 7 µs at 64, 20 µs at 256 |
+| 16 threads sharing one policy of each kind, sessions and hot prefixes in play | 800,000 decisions each, every one valid |
+| Open loop at 2,000 and 5,000 req/s over 8 replicas with each cache aware policy, three runs | decisions under 50 µs at p99; the gateway adds 0.2 to 0.4 ms at p50, and its p99, 0.9 to 3.4 ms with client, gateway and eight simulators on one laptop, varies as much between runs as between policies |
+| 4,000 requests at 400 req/s over 4 simulators, Zipf over 16 system prompts, 300 sessions, explain requests mixed in | the busiest replica took 26.6 to 27.3%; 97 to 98% of each session's turns stayed on its replica; zero errors |
 
 The suite runs clean ten times in a row with every core saturated.
 
@@ -716,13 +896,19 @@ committed, rerunnable benchmarks, not a claim.
   XXH3 128 bit block hashes salted by model, adapter and `cache_salt`, and a
   KV index built from the router's own decisions that predicts every
   replica's cached prefix.
+* **The routing brain.** Shipped in v0.1.8: `prefix_hash` and `kv_aware`
+  as the cache aware baselines, and `cost_model`, estimated TTFT per replica
+  as queued prefill plus prefill of uncached tokens plus tier load time,
+  with bounded load, KV pressure guards, hot prefix replication and optional
+  session affinity, `inferrail-calibrate` to fit it to an engine, and
+  `/admin/explain` to show why a replica won.
+* **Realistic simulation.** Continuous batching, prefill and decode
+  interference, preemption and KV events in the simulator, more workloads
+  and one command for the full sweep.
 * **Exact index.** An exact mode fed by engine KV events over ZMQ, with gap
   detection and fallback to the approximate mode.
-* **Cost model.** Estimated TTFT per replica as queue wait plus prefill of
-  uncached tokens plus tier load time, with bounded load, KV pressure guards,
-  hot prefix replication and optional session affinity.
 * **Production controls.** SLO aware admission, token based rate limits,
-  hot reload, shadow mode, an explain endpoint, API keys and TLS.
+  hot reload, shadow mode, API keys and TLS.
 * **Advanced regimes.** Disaggregated prefill and decode pools, tiered KV
   cache across GPU, CPU and disk, and Kubernetes packaging.
 * **Proof.** A benchmark report against cache blind baselines on synthetic

@@ -190,3 +190,33 @@ async fn explain_marks_replicas_that_were_not_offered() {
     assert_eq!(report["winner"], Value::Null);
     drop(held);
 }
+
+#[tokio::test]
+async fn an_oversized_explain_request_gets_a_413_not_a_reset() {
+    let sims = fleet_of(1, 4_096, LatencyModel::ZERO).await;
+    let mut config = routed(&sims, "");
+    config.server.max_body_bytes = 256 * 1024;
+    let gw = TestGateway::start(config).await;
+    let admin = serve_admin(&gw.gateway).await;
+    let url = format!("{admin}/admin/explain/v1/chat/completions");
+    for _ in 0..3 {
+        let response = gw
+            .client
+            .post(&url)
+            .json(&chat(&"x ".repeat(512 * 1024), 1))
+            .send()
+            .await
+            .expect("an answer rather than a reset");
+        assert_eq!(response.status(), 413);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["error"]["type"], "RequestTooLargeError");
+    }
+    let response = gw
+        .client
+        .post(&url)
+        .json(&chat(&"x ".repeat(100 * 1024), 1))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+}

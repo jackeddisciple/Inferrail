@@ -3,6 +3,124 @@
 Notable changes to Inferrail. Versions follow
 [Semantic Versioning](https://semver.org).
 
+## [0.1.8] The Routing Brain (26 October 2026)
+
+The gateway now routes on what it predicts each replica has cached. The
+main policy estimates every replica's time to first token from the prefill
+queued there and the prefill its cache saves, inside load guards that keep
+any replica from melting; two cache aware baselines run beside it; a new
+binary fits the estimate to an engine; and an admin route shows why any
+replica would win. On three simulators, `cost_model` keeps 91% of shared
+system prompt tokens cached where round robin keeps 39%, and has the
+lowest median TTFT on all five workloads measured: its p99 is 55% below
+round robin's on shared prompts, 31% below `kv_aware`'s on a mix of shared
+and unique prompts, and 37% below `least_request`'s on unique prompts.
+
+### Added
+
+#### `inferrail-policy`
+
+* `cost_model`: the lowest estimated `TTFT = W + P + X` among the replicas
+  the load guards allow. `P(u, c) = a*u + b*u*(c + u/2) + d` prices the
+  prompt tokens a replica would compute against those it has cached, `W`
+  the prefill already queued there plus `decode_interference_secs` per
+  running request, and `X` cached tokens in CPU or disk tiers, counted only
+  when loading beats recomputing. Ties go to fewer requests in flight, then
+  to chance.
+* Load guards for `cost_model`: bounded load skips a replica that would
+  hold more than `ceil((1 + epsilon) * (in_flight + 1) / n)` requests; KV
+  pressure keeps prompts with more than `short_prompt_tokens` to compute
+  off replicas using more than `kappa` of their KV cache, standing down
+  when every replica is; hot prefix replication tracks each root prefix's
+  prefill demand in a lock free decaying count min sketch and gives one
+  that needs more than `utilization` of a replica enough owners, priced as
+  holding it; session affinity, off by default, keeps a conversation named
+  by `x-session-id` or the `user` field on its last replica while the
+  guards allow it.
+* `prefix_hash`: rendezvous hashing on the prompt's first blocks, so
+  removing a replica only moves the prefixes it owned; power of two choices
+  for prompts without a full block.
+* `kv_aware`: the weighted score of open routers, `cache_weight` times the
+  share cached minus `load_weight` times requests in flight over the
+  busiest candidate's.
+* `Choice`, what steered a decision and what the guards set aside, and
+  `explain`, how a policy sees every candidate without changing any state.
+  Candidates carry queued prefill, running requests and KV usage; the
+  context carries the prompt's block hashes, a session key and the clock.
+
+#### `inferrail-gateway`
+
+* A virtual prefill queue per replica: every decision, whatever the
+  policy, adds the request's estimated prefill, which drains in real time
+  and counts as empty once every request on the replica has had its first
+  byte.
+* `POST /admin/explain/v1/chat/completions` and `/v1/completions` on the
+  admin port: the prompt, every replica serving the model and why any was
+  not offered, its load, queued prefill, predicted cache, guard and
+  estimate, the winner and the term that put it ahead. Nothing is routed.
+  Bodies are read as on the client port, within `server.request_timeout`
+  and `server.max_body_bytes`.
+* The metrics `inferrail_estimated_ttft_seconds`,
+  `inferrail_routing_guards_total`, `inferrail_routing_steered_total` and
+  `inferrail_replica_queued_seconds`; the estimate, steering and guards in
+  the decision log and on route spans, and each candidate's queued prefill
+  in the decision log.
+
+#### `inferrail-calibrate`
+
+* Probes an idle engine with prompts of known cached and uncached length,
+  one at a time with the cached part sent first, reads each probe's TTFT
+  from the engine's own vLLM or SGLang histogram, fits `a`, `b` and `d` by
+  least squares with no term negative, and writes a `cost_model` fragment,
+  with the fit's error and the client side overhead reported apart.
+
+#### Configuration
+
+* `routing.short_prompt_tokens`, `session_affinity`, `prefix_hash.blocks`,
+  `kv_aware` weights, `cost_model` and `hot_prefix` (`enabled`, `blocks`,
+  `utilization`, `window`), and a per model `cost_model`, all validated.
+* The local and compose fleets route with `cost_model`.
+
+#### Benchmark harness (`bench/`)
+
+* The `mix` workload of shared and unique prompts and the `hot` workload
+  of Zipf weighted system prompts, the busiest replica's share in every
+  summary and report, `x-session-id` on W2 requests, a `+sessions` policy
+  option, and `make routing`, which compares every policy on five
+  workloads into `bench/results/routing` and `bench/report/routing`.
+* The committed comparison: 108 runs from one clean commit, zero failed
+  requests, and the gateway's predicted cached tokens equal to the engine's
+  on all but 2 of 64,263 requests.
+
+#### Dashboard
+
+* A cost model row: estimated next to measured TTFT by policy, queued
+  prefill per replica, and how often the guards and steering act.
+
+#### Tests
+
+* Fleet simulations of every policy on the same seeded traffic, a property
+  test that no replica ever takes more than its bounded share, the design's
+  worked example, routing tests against in process simulators, an explain
+  snapshot, calibration recovering two simulator parameter sets within 5%,
+  the A5 decision benchmark and stress tests for shared policies, eight
+  replicas and Zipf traffic with conversations.
+* ADR 010 (routing on estimated time to first token) and ADR 011 (load
+  guards).
+
+### Changed
+
+* `routing.epsilon` defaults to 1.0. At the 0.25 the design started from,
+  bounded load turned away a third of W1's cache hits on ordinary noise in
+  requests in flight; ADR 011 has the measurements.
+* `RoutingPolicy::choose` returns a `Choice` and `build` takes the model's
+  `Settings`.
+* The simulator records TTFT and prefill time when its model produces the
+  first token, as vLLM stamps them in its engine core, rather than when its
+  timer wakes the stream, which added up to a millisecond.
+* Request inspection reads the `user` field; a repeated `user` keeps its
+  last value, as Python does.
+
 ## [0.1.7] Bug Fixes and Improvements (26 October 2026)
 
 Fixes from an adversarial pass over tokenization at the edge and the KV

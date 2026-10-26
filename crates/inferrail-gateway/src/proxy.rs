@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use http_body_util::{BodyExt, Full, Limited};
-use hyper::body::{Bytes, Incoming};
+use hyper::body::{Body, Bytes, Incoming};
 use hyper::header::{self, HeaderMap, HeaderValue};
 use hyper::http::request::Parts;
 use hyper::{Method, Request, Response, StatusCode};
@@ -123,7 +123,7 @@ const DRAIN_TIME: Duration = Duration::from_secs(2);
 /// Reads and discards what is left of a request body, so a client that is
 /// still uploading gets the answer rather than a connection reset. Bounded
 /// in bytes and time; past either bound the connection simply closes.
-async fn drain(mut body: Incoming, limit: usize) {
+async fn drain<B: Body<Data = Bytes> + Unpin>(mut body: B, limit: usize) {
     let mut left = limit.max(DRAIN_FLOOR);
     let discard = async {
         while let Some(Ok(frame)) = body.frame().await {
@@ -470,9 +470,9 @@ fn backoff(base: Duration, attempt: u32) -> Duration {
 /// Collects the body without keeping an allocation per frame: one frame is
 /// kept as it arrived, more are copied into a single buffer, so memory stays
 /// proportional to the body however finely the client chunks it.
-async fn read_body(
+pub(crate) async fn read_body<B: Body<Data = Bytes> + Unpin>(
     headers: &HeaderMap,
-    mut body: Incoming,
+    mut body: B,
     limit: usize,
 ) -> Result<Bytes, GatewayError> {
     let declared = headers

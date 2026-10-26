@@ -4,9 +4,8 @@
 use std::sync::Arc;
 
 use axum::Router;
-use axum::body::Bytes;
-use axum::extract::DefaultBodyLimit;
-use axum::http::{HeaderMap, header};
+use axum::extract::Request;
+use axum::http::header;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use inferrail_tokenize::Endpoint;
@@ -16,12 +15,9 @@ use crate::{Shared, explain};
 pub(crate) const CONTENT_TYPE: &str = "application/openmetrics-text; version=1.0.0; charset=utf-8";
 
 pub(crate) fn router(shared: Arc<Shared>) -> Router {
-    let limit = shared.config.server.max_body_bytes;
     let explains = |endpoint: Endpoint| {
         let shared = Arc::clone(&shared);
-        post(move |headers: HeaderMap, body: Bytes| {
-            explain::handle(Arc::clone(&shared), endpoint, headers, body)
-        })
+        post(move |request: Request| explain::handle(Arc::clone(&shared), endpoint, request))
     };
     let metrics = Arc::clone(&shared);
     Router::new()
@@ -44,5 +40,4 @@ pub(crate) fn router(shared: Arc<Shared>) -> Router {
             "/admin/explain/v1/completions",
             explains(Endpoint::Completion),
         )
-        .layer(DefaultBodyLimit::max(limit))
 }
