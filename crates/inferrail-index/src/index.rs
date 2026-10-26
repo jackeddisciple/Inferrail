@@ -129,12 +129,15 @@ impl KvIndex {
     }
 
     /// Records a prompt routed to `slot`: its blocks become the most recent
-    /// on that replica, whose shadow cache holds `capacity` blocks.
-    pub fn record(&self, slot: Slot, hashes: &[BlockHash], capacity: usize) {
-        let Some(cell) = self.cell(slot) else { return };
+    /// on that replica, whose shadow cache holds `capacity` blocks. Returns
+    /// the blocks the replica did not hold before, for [`KvIndex::revoke`].
+    pub fn record(&self, slot: Slot, hashes: &[BlockHash], capacity: usize) -> Vec<BlockHash> {
+        let Some(cell) = self.cell(slot) else {
+            return Vec::new();
+        };
         let mut cell = cell.lock().unwrap_or_else(PoisonError::into_inner);
         if cell.generation != slot.generation {
-            return;
+            return Vec::new();
         }
         let index = slot.index;
         if cell.shadow.capacity() != capacity {
@@ -142,11 +145,39 @@ impl KvIndex {
                 .resize(capacity, |gone| self.blocks.remove(gone, index));
         }
         let chain: Vec<u128> = raw(hashes).collect();
+        let fresh: Vec<u128> = chain
+            .iter()
+            .copied()
+            .filter(|&hash| !cell.shadow.contains(hash))
+            .collect();
         cell.shadow.insert(
             &chain,
             |added| self.blocks.insert(added, index),
             |gone| self.blocks.remove(gone, index),
         );
+        fresh
+            .into_iter()
+            .filter(|&hash| cell.shadow.contains(hash))
+            .map(BlockHash::new)
+            .collect()
+    }
+
+    /// Takes back blocks a record added, for a prompt the engine never
+    /// computed because it refused the request or failed before answering.
+    pub fn revoke(&self, slot: Slot, hashes: &[BlockHash]) {
+        if hashes.is_empty() {
+            return;
+        }
+        let Some(cell) = self.cell(slot) else { return };
+        let mut cell = cell.lock().unwrap_or_else(PoisonError::into_inner);
+        if cell.generation != slot.generation {
+            return;
+        }
+        for hash in raw(hashes) {
+            if cell.shadow.remove(hash) {
+                self.blocks.remove(hash, slot.index);
+            }
+        }
     }
 
     /// Drops everything recorded for `slot`, as when its engine restarted.
@@ -352,9 +383,41 @@ mod tests {
         assert_eq!(index.longest_prefix(&chain(3, 3), &[fresh]), [0]);
     }
 
+    #[test]
+    fn revoking_takes_back_only_what_a_record_added() {
+        let index = KvIndex::new();
+        let a = index.slot(&id(0));
+        let shared = chain(1, 6);
+        assert_eq!(index.record(a, &shared[..4], 100), &shared[..4]);
+        let fresh = index.record(a, &shared, 100);
+        assert_eq!(fresh, &shared[4..]);
+        index.revoke(a, &fresh);
+        assert_eq!(index.longest_prefix(&shared, &[a]), [4]);
+        assert_eq!(index.stats().replicas[0].blocks, 4);
+        index.verify().unwrap();
+        let long = chain(2, 10);
+        let kept = index.record(a, &long, 3);
+        assert_eq!(
+            kept,
+            &long[..3],
+            "blocks evicted while recording are not returned"
+        );
+        index.forget(&id(0));
+        let b = index.slot(&id(1));
+        index.record(b, &long[..3], 10);
+        index.revoke(a, &kept);
+        assert_eq!(
+            index.longest_prefix(&long, &[b]),
+            [3],
+            "a stale slot revokes nothing"
+        );
+        index.verify().unwrap();
+    }
+
     #[derive(Debug, Clone)]
     enum Op {
         Record(usize, u128, usize, usize),
+        Revoke(usize),
         Clear(usize),
         Forget(usize),
         Lookup(u128, usize),
@@ -363,6 +426,7 @@ mod tests {
     fn op() -> impl Strategy<Value = Op> {
         prop_oneof![
             8 => (0usize..5, 0u128..4, 0usize..12, 0usize..20).prop_map(|(r, s, n, c)| Op::Record(r, s, n, c)),
+            2 => (0usize..5).prop_map(Op::Revoke),
             1 => (0usize..5).prop_map(Op::Clear),
             1 => (0usize..5).prop_map(Op::Forget),
             4 => (0u128..4, 0usize..14).prop_map(|(s, n)| Op::Lookup(s, n)),
@@ -403,13 +467,38 @@ mod tests {
         fn matches_a_naive_reference_model(ops in prop::collection::vec(op(), 0..120)) {
             let index = KvIndex::new();
             let mut naive = Naive::default();
+            let mut receipts: Std<usize, (Slot, Vec<BlockHash>)> = Std::new();
             for op in &ops {
                 match *op {
                     Op::Record(r, seed, len, capacity) => {
                         let hashes = chain(seed, len);
-                        index.record(index.slot(&id(r)), &hashes, capacity);
+                        let slot = index.slot(&id(r));
+                        let before: HashSet<u128> = naive
+                            .0
+                            .get(&r)
+                            .map(|(order, _)| order.iter().take(capacity).copied().collect())
+                            .unwrap_or_default();
+                        let fresh = index.record(slot, &hashes, capacity);
                         let raw: Vec<u128> = hashes.iter().map(|h| h.get()).collect();
                         naive.record(r, &raw, capacity);
+                        let want: Vec<u128> = raw.iter().copied().filter(|h| !before.contains(h) && naive.holds(r, *h)).collect();
+                        let mut got: Vec<u128> = fresh.iter().map(|h| h.get()).collect();
+                        got.sort_unstable();
+                        let mut want = want;
+                        want.sort_unstable();
+                        want.dedup();
+                        prop_assert_eq!(got, want);
+                        receipts.insert(r, (slot, fresh));
+                    }
+                    Op::Revoke(r) => {
+                        if let Some((slot, fresh)) = receipts.remove(&r) {
+                            index.revoke(slot, &fresh);
+                            if index.find(&id(r)) == Some(slot)
+                                && let Some((order, _)) = naive.0.get_mut(&r)
+                            {
+                                order.retain(|h| !fresh.iter().any(|f| f.get() == *h));
+                            }
+                        }
                     }
                     Op::Clear(r) => {
                         if let Some(slot) = index.find(&id(r)) {

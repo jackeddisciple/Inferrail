@@ -98,6 +98,7 @@ tokenizer:
 # Every routed prompt is recorded as cached on the replica it went to, in a
 # shadow LRU sized to that replica's KV capacity: kv_capacity_blocks when
 # set, otherwise what its engine reports, otherwise default_capacity_blocks.
+# An attempt the engine refuses or fails before answering is taken back.
 index:
   enabled: true
   default_capacity_blocks: 16384

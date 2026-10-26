@@ -274,15 +274,19 @@ async fn attempt(
             prompt_tokens: p.tokens,
             cached_tokens: selected.cached_tokens,
         });
-        if let (Some(index), Some(prompt)) = (&shared.index, &prompt) {
-            let replica = lease.replica();
-            let capacity = prompts::capacity(
-                replica,
-                prompt.block_size,
-                shared.config.index.default_capacity_blocks,
-            );
-            index.record(index.slot(replica.id()), &prompt.hashes, capacity);
-        }
+        let recorded = match (shared.index.as_deref(), &prompt) {
+            (Some(index), Some(prompt)) => {
+                let replica = lease.replica();
+                let capacity = prompts::capacity(
+                    replica,
+                    prompt.block_size,
+                    shared.config.index.default_capacity_blocks,
+                );
+                let slot = index.slot(replica.id());
+                Some((index, slot, index.record(slot, &prompt.hashes, capacity)))
+            }
+            _ => None,
+        };
         let routed = Routed {
             model: model.clone(),
             policy: policy.kind(),
@@ -345,6 +349,11 @@ async fn attempt(
         )
         .instrument(upstream_span)
         .await;
+        if let Some((index, slot, fresh)) = recorded
+            && !forwarded.computed()
+        {
+            index.revoke(slot, &fresh);
+        }
         match forwarded {
             Attempt::Done(response) => return Ok(response),
             Attempt::Fatal(err) => return Err(err),
@@ -543,6 +552,19 @@ enum Attempt {
     Done(Response<ResponseBody>),
     Retry(Result<Response<ResponseBody>, GatewayError>),
     Fatal(GatewayError),
+}
+
+impl Attempt {
+    /// Whether the engine took the prompt in, so what the index recorded
+    /// for it stands: it answered with success, or was still working when
+    /// the request ran out of time.
+    fn computed(&self) -> bool {
+        match self {
+            Self::Done(response) => response.status().is_success(),
+            Self::Retry(_) => false,
+            Self::Fatal(err) => err.status() == StatusCode::GATEWAY_TIMEOUT,
+        }
+    }
 }
 
 const MAX_ERROR_BODY: usize = 64 * 1024;

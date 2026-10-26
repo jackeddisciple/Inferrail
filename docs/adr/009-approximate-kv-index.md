@@ -35,6 +35,10 @@ with dozens of replicas and thousands of blocks per prompt.
   inserted tail first, so eviction trims long prefixes from the end as
   engines free them. Blocks entering and leaving the shadow update the
   shared map under the replica's lock, so the two always agree.
+* An attempt the engine refuses, answers with an error, or fails before
+  answering never computed its prompt, so the blocks its record added are
+  taken back. An attempt that runs out of time keeps them, since the engine
+  was most likely computing it.
 * An engine can serve from cache every block but the one holding the
   prompt's last token, so predictions are capped there, as engines cap
   their hits.
@@ -58,7 +62,8 @@ with dozens of replicas and thousands of blocks per prompt.
   every request, and 3,000 concurrent requests at 400 per second over three
   simulators matched exactly as well.
 * Approximate mode drifts where engines evict differently, cache generated
-  tokens, or receive traffic from other gateways or clients. A request
-  that fails after it was recorded still counts as cached. The exact mode,
-  fed by engine KV events, replaces predictions with observations where
-  events are available.
+  tokens, or receive traffic from other gateways or clients. Taking back a
+  failed attempt's blocks can also drop ones another request on the same
+  replica added meanwhile, so that race errs toward predicting too little.
+  The exact mode, fed by engine KV events, replaces predictions with
+  observations where events are available.

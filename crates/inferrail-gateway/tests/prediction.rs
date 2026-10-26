@@ -228,6 +228,61 @@ async fn an_engine_that_restarts_is_forgotten() {
 }
 
 #[tokio::test]
+async fn prompts_the_engine_never_computed_are_not_predicted() {
+    let upstream = Upstream::spawn(sim(1_000)).await;
+    let gw = TestGateway::start(tokenized(fleet(&urls(&[&upstream]), FAST_HEALTH))).await;
+    let mut refused = shared_prompt(4, 4);
+    refused["max_tokens"] = json!(1 << 30);
+    let response = gw.post("/v1/chat/completions", &refused).await;
+    assert_eq!(response.status(), 400);
+    let after = send(&gw, &shared_prompt(4, 4)).await;
+    assert_eq!(
+        after.cached,
+        (Some(0), 0),
+        "a refused prompt left blocks behind"
+    );
+    let again = send(&gw, &shared_prompt(4, 5)).await;
+    assert_eq!(again.cached.0, Some(again.cached.1));
+    assert!(again.cached.1 > 0);
+
+    let sims = [
+        Upstream::spawn(sim(1_000)).await,
+        Upstream::spawn(sim(1_000)).await,
+    ];
+    let gw = TestGateway::start(tokenized(fleet(
+        &urls(&[&sims[0], &sims[1]]),
+        &format!(
+            "{FAST_HEALTH}routing:\n  default_policy: round_robin\nretry:\n  max_attempts: 2\n"
+        ),
+    )))
+    .await;
+    sims[0].set_request_fault(Fault::Status(503));
+    let body = shared_prompt(6, 6);
+    let response = gw.post("/v1/chat/completions", &body).await;
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()["x-inferrail-replica"], "r1");
+    response.bytes().await.unwrap();
+    sims[0].set_request_fault(Fault::None);
+    let mut landed = std::collections::HashSet::new();
+    for _ in 0..4 {
+        let response = gw.post("/v1/chat/completions", &body).await;
+        landed.insert(
+            response.headers()["x-inferrail-replica"]
+                .to_str()
+                .unwrap()
+                .to_owned(),
+        );
+        let predicted = header(&response, "x-inferrail-cached-tokens");
+        let answer: Value = response.json().await.unwrap();
+        let cached = answer["usage"]["prompt_tokens_details"]["cached_tokens"]
+            .as_u64()
+            .unwrap_or(0);
+        assert_eq!(predicted, Some(cached));
+    }
+    assert_eq!(landed.len(), 2, "{landed:?}");
+}
+
+#[tokio::test]
 async fn a_tokenizer_that_cannot_load_degrades_to_plain_routing() {
     let upstream = Upstream::spawn(sim(1_000)).await;
     let mut config = fleet(&urls(&[&upstream]), FAST_HEALTH);

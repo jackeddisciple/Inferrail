@@ -46,6 +46,10 @@ impl Lru {
         self.index.keys().copied()
     }
 
+    pub(crate) fn contains(&self, hash: u128) -> bool {
+        self.index.contains_key(&hash)
+    }
+
     /// Inserts or refreshes a chain tail first, so its root ends most recent
     /// and eviction trims long prefixes from the end, the order engines free
     /// blocks in. Calls `added` and `evicted` for blocks entering and leaving.
@@ -84,6 +88,16 @@ impl Lru {
                 None => break,
             }
         }
+    }
+
+    /// Drops one block, wherever it is in the recency order.
+    pub(crate) fn remove(&mut self, hash: u128) -> bool {
+        let Some(slot) = self.index.remove(&hash) else {
+            return false;
+        };
+        self.unlink(slot);
+        self.free.push(slot);
+        true
     }
 
     pub(crate) fn clear(&mut self) {
@@ -219,6 +233,19 @@ mod tests {
         assert_eq!(insert(&mut empty, &[1]), (vec![], vec![]));
         lru.clear();
         assert_eq!((lru.len(), lru.capacity()), (0, 2));
+    }
+
+    #[test]
+    fn removed_blocks_leave_the_order_and_free_their_node() {
+        let mut lru = Lru::new(4);
+        insert(&mut lru, &[1, 2, 3, 4]);
+        assert!(lru.remove(2) && !lru.remove(2) && !lru.remove(9));
+        assert!(lru.remove(1) && lru.remove(4));
+        assert_eq!(lru.recency(), [3]);
+        assert!(!lru.contains(1) && lru.contains(3));
+        insert(&mut lru, &[5, 6, 7]);
+        assert_eq!(lru.recency(), [5, 6, 7, 3]);
+        assert_eq!(lru.nodes.len(), 4);
     }
 
     /// The same reference model the simulator's cache is held to.

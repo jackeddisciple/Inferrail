@@ -274,7 +274,9 @@ used. Hashing costs about 5.5 ns per block.
 
 **The index.** Every routed prompt is recorded on the replica it went to, in
 a shadow LRU as large as that replica's KV cache: `kv_capacity_blocks` when
-set, else what its engine reports, else `index.default_capacity_blocks`. A
+set, else what its engine reports, else `index.default_capacity_blocks`.
+What an attempt recorded is taken back when the engine refuses it, answers
+with an error or fails before answering, since it never computed the prompt. A
 shared map from block hash to replicas answers, for every candidate, how many
 leading blocks of a prompt it holds: 2.4 µs for 512 blocks over 64
 replicas. Predictions stop one block short of a fully cached prompt, as
