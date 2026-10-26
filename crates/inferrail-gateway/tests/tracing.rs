@@ -66,11 +66,12 @@ async fn spans_carry_routing_attributes() {
         Upstream::zero(&[MODEL]).await,
         Upstream::zero(&[MODEL]).await,
     ];
-    let gw = TestGateway::start(fleet(
+    let mut config = fleet(
         &urls(&[&sims[0], &sims[1]]),
         &format!("{FAST_HEALTH}routing:\n  default_policy: round_robin\nload:\n  max_age: 5s\n"),
-    ))
-    .await;
+    );
+    config.models[0].tokenizer = Some("builtin:sim".to_owned());
+    let gw = TestGateway::start(config).await;
     wait_until(Duration::from_secs(2), || {
         ["r0", "r1"]
             .iter()
@@ -143,6 +144,12 @@ async fn spans_carry_routing_attributes() {
         Some("0")
     );
     assert!(attr(route, "inferrail.engine.kv_usage").is_some());
+    let prompt: u64 = attr(route, "inferrail.prompt_tokens")
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(prompt > 4, "{prompt}");
+    assert_eq!(attr(route, "inferrail.cached_tokens").as_deref(), Some("0"));
     assert!(
         attr(route, "inferrail.load.age_ms")
             .unwrap()
@@ -212,6 +219,12 @@ async fn retries_show_as_attempts_and_client_traces_are_continued() {
         .filter_map(|s| attr(s, "inferrail.attempt"))
         .collect();
     assert_eq!(attempts, ["0", "1"]);
+    assert!(
+        children("route")
+            .iter()
+            .all(|s| attr(s, "inferrail.prompt_tokens").is_none()),
+        "a model without a tokenizer has no prompt attributes"
+    );
     let upstreams = children("upstream");
     let statuses: Vec<_> = upstreams
         .iter()

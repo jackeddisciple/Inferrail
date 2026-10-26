@@ -90,10 +90,12 @@ async fn every_decision_is_logged_with_candidates_and_never_the_prompt() {
             "decision_ns",
             "model",
             "policy",
+            "prompt_tokens",
             "request_id",
             "ts_ms"
         ])
     );
+    assert!(logged.iter().all(|l| l["prompt_tokens"].is_null()));
     let mut seen = BTreeSet::new();
     for line in &logged {
         assert_eq!(line["model"], MODEL);

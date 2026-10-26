@@ -31,6 +31,8 @@ pub(crate) struct CandidateState {
     pub(crate) engine_waiting: Option<u32>,
     pub(crate) engine_kv_usage: Option<f64>,
     pub(crate) load_age_ms: Option<f64>,
+    /// Prompt tokens the KV index predicted it had cached, when offered.
+    pub(crate) cached_tokens: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -42,6 +44,7 @@ pub(crate) struct Decision {
     pub(crate) attempt: u32,
     pub(crate) chosen: ReplicaId,
     pub(crate) decision_ns: u64,
+    pub(crate) prompt_tokens: Option<u32>,
     pub(crate) candidates: Vec<CandidateState>,
 }
 
@@ -73,6 +76,7 @@ pub(crate) fn candidates(
                 engine_waiting: load.engine.map(|e| e.waiting),
                 engine_kv_usage: load.engine.map(|e| e.kv_usage),
                 load_age_ms: load.age.map(|a| a.as_secs_f64() * 1e3),
+                cached_tokens: None,
             }
         })
         .collect()
@@ -202,6 +206,7 @@ mod tests {
             attempt: n,
             chosen: ReplicaId::new("r0").unwrap(),
             decision_ns: 100,
+            prompt_tokens: None,
             candidates: Vec::new(),
         }
     }

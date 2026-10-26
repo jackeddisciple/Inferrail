@@ -56,7 +56,9 @@ async fn main() -> anyhow::Result<()> {
     let _telemetry = telemetry::init(filter, &config.observability)?;
     let addr = config.server.listen;
     if args.check {
-        Gateway::check(&config)?;
+        for warning in Gateway::check(&config)? {
+            tracing::warn!("{warning}");
+        }
         println!(
             "{}: {} models, {} replicas, {} DNS groups",
             args.config.display(),

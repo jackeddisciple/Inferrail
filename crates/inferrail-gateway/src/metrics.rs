@@ -23,6 +23,7 @@ use prometheus_client::metrics::histogram::Histogram;
 use prometheus_client::registry::Registry as MetricRegistry;
 
 use crate::errors::GatewayError;
+use crate::proxy::Prediction;
 
 const TTFT_BUCKETS: [f64; 19] = [
     0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.15, 0.2, 0.3, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0, 10.0,
@@ -33,6 +34,9 @@ const DURATION_BUCKETS: [f64; 16] = [
 ];
 const DECISION_BUCKETS: [f64; 11] = [
     1e-6, 2.5e-6, 5e-6, 1e-5, 2.5e-5, 5e-5, 1e-4, 2.5e-4, 5e-4, 1e-3, 5e-3,
+];
+const TOKENIZE_BUCKETS: [f64; 12] = [
+    1e-5, 2.5e-5, 5e-5, 1e-4, 2.5e-4, 5e-4, 1e-3, 2.5e-3, 5e-3, 1e-2, 2.5e-2, 0.1,
 ];
 
 /// A label value that is cheap to clone: ids share their string.
@@ -107,6 +111,12 @@ struct ReplicaLabels {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, EncodeLabelSet)]
+struct TokenizeLabels {
+    model: Text,
+    result: Text,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, EncodeLabelSet)]
 struct ScrapeLabels {
     replica: Text,
     result: Text,
@@ -157,6 +167,10 @@ pub struct Metrics {
     duration: Histograms<RouteLabels>,
     decision_time: Histograms<PolicyLabels>,
     decision_log: (Counter, Counter),
+    tokenize: Family<TokenizeLabels, Counter>,
+    tokenize_time: Histograms<ModelLabels>,
+    prompt_tokens: Family<ModelLabels, Counter>,
+    predicted_tokens: Family<ModelLabels, Counter>,
     series: Mutex<HashMap<ReplicaId, Vec<Series>>>,
 }
 
@@ -180,6 +194,10 @@ impl Metrics {
             duration: histograms(|| Histogram::new(DURATION_BUCKETS)),
             decision_time: histograms(|| Histogram::new(DECISION_BUCKETS)),
             decision_log: (Counter::default(), Counter::default()),
+            tokenize: Family::default(),
+            tokenize_time: histograms(|| Histogram::new(TOKENIZE_BUCKETS)),
+            prompt_tokens: Family::default(),
+            predicted_tokens: Family::default(),
             series: Mutex::default(),
         };
         let mut registry = MetricRegistry::default();
@@ -243,6 +261,26 @@ impl Metrics {
             "Sampled routing decisions dropped because the log writer fell behind.",
             this.decision_log.1.clone(),
         );
+        registry.register(
+            "inferrail_tokenized_requests",
+            "Requests whose prompt the gateway tried to tokenize, by result: ok, or why the request was routed without a cache prediction.",
+            this.tokenize.clone(),
+        );
+        registry.register(
+            "inferrail_tokenize_seconds",
+            "Time to tokenize and hash a prompt, waiting for a worker included.",
+            this.tokenize_time.clone(),
+        );
+        registry.register(
+            "inferrail_prompt_tokens",
+            "Prompt tokens of tokenized requests, counted at every routing decision.",
+            this.prompt_tokens.clone(),
+        );
+        registry.register(
+            "inferrail_predicted_cached_tokens",
+            "Prompt tokens the KV index predicted the chosen replica had cached, at every routing decision.",
+            this.predicted_tokens.clone(),
+        );
         registry.register_collector(Box::new(fleet));
         Self { registry, ..this }
     }
@@ -289,6 +327,32 @@ impl Metrics {
                 policy: Text::Fixed(routed.policy.as_str()),
             })
             .observe(took.as_secs_f64());
+    }
+
+    pub fn tokenized(&self, model: &ModelId, result: &'static str, took: Duration) {
+        self.tokenize
+            .get_or_create(&TokenizeLabels {
+                model: Text::Model(model.clone()),
+                result: Text::Fixed(result),
+            })
+            .inc();
+        self.tokenize_time
+            .get_or_create(&ModelLabels {
+                model: Text::Model(model.clone()),
+            })
+            .observe(took.as_secs_f64());
+    }
+
+    pub(crate) fn predicted(&self, model: &ModelId, prediction: Prediction) {
+        let labels = ModelLabels {
+            model: Text::Model(model.clone()),
+        };
+        self.prompt_tokens
+            .get_or_create(&labels)
+            .inc_by(u64::from(prediction.prompt_tokens));
+        self.predicted_tokens
+            .get_or_create(&labels)
+            .inc_by(u64::from(prediction.cached_tokens));
     }
 
     pub fn retried(&self, model: &ModelId) {

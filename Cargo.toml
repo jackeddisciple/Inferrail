@@ -13,6 +13,7 @@ publish = false
 [workspace.dependencies]
 inferrail-control = { path = "crates/inferrail-control" }
 inferrail-core = { path = "crates/inferrail-core" }
+inferrail-index = { path = "crates/inferrail-index" }
 inferrail-load = { path = "crates/inferrail-load" }
 inferrail-policy = { path = "crates/inferrail-policy" }
 inferrail-sim = { path = "crates/inferrail-sim" }

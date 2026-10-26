@@ -9,6 +9,7 @@ use hyper::http::request::Parts;
 use hyper::{Method, Request, Response, StatusCode};
 use inferrail_control::{Lease, Nanos, Replica};
 use inferrail_core::ids::{ModelId, ReplicaId};
+use inferrail_tokenize::Endpoint;
 use tokio::time::{Instant, sleep, timeout, timeout_at};
 use tracing::field::Empty;
 use tracing::{Instrument, Span};
@@ -16,9 +17,10 @@ use tracing::{Instrument, Span};
 use crate::body::{Recording, ResponseBody, UpstreamBody};
 use crate::decision_log::{self, Decision};
 use crate::errors::GatewayError;
-use crate::headers::{self, REPLICA};
+use crate::headers::{self, CACHED_TOKENS, PROMPT_TOKENS, REPLICA};
 use crate::inspect::{InspectError, inspect};
 use crate::metrics::Routed;
+use crate::prompts::{self, Prompt, Skip};
 use crate::request_id::REQUEST_ID;
 use crate::telemetry::{self, SPAN_TARGET};
 use crate::{Shared, models, route};
@@ -202,7 +204,15 @@ async fn attempt(
         tracing::debug!(request_id = ?id, body = %String::from_utf8_lossy(&body), "request body");
     }
     let policy = shared.policy(&model)?;
-    let tokens = estimate_tokens(body.len());
+    let endpoint = if parts.uri.path() == "/v1/chat/completions" {
+        Endpoint::Chat
+    } else {
+        Endpoint::Completion
+    };
+    let prompt = prepare_prompt(shared, &model, endpoint, &body).await;
+    let tokens = prompt
+        .as_ref()
+        .map_or_else(|| estimate_tokens(body.len()), |p| p.tokens);
     let sampled = shared
         .decisions
         .as_ref()
@@ -231,6 +241,8 @@ async fn attempt(
             inferrail.engine.kv_usage = Empty,
             inferrail.load.age_ms = Empty,
             inferrail.decision_ns = Empty,
+            inferrail.prompt_tokens = Empty,
+            inferrail.cached_tokens = Empty,
         );
         let now = shared.clock.now();
         let seen_by_policy = sampled.map(|_| {
@@ -242,21 +254,52 @@ async fn attempt(
                 shared.config.load.max_age,
             )
         });
+        let request = route::Request {
+            model: &model,
+            tokens,
+            prompt: prompt.as_ref(),
+            index: shared.index.as_deref(),
+            explain: sampled.is_some(),
+        };
         let started = std::time::Instant::now();
-        let selected = route_span
-            .in_scope(|| route::select(&shared.registry, policy, &model, now, &tried, tokens));
+        let selected =
+            route_span.in_scope(|| route::select(&shared.registry, policy, request, now, &tried));
         let took = started.elapsed();
-        let (lease, candidates) = match selected {
+        let selected = match selected {
             Ok(selected) => selected,
             Err(err) => return last.unwrap_or(Err(err)),
         };
+        let (lease, candidates) = (selected.lease, selected.offered);
+        let prediction = prompt.as_ref().map(|p| Prediction {
+            prompt_tokens: p.tokens,
+            cached_tokens: selected.cached_tokens,
+        });
+        if let (Some(index), Some(prompt)) = (&shared.index, &prompt) {
+            let replica = lease.replica();
+            let capacity = prompts::capacity(
+                replica,
+                prompt.block_size,
+                shared.config.index.default_capacity_blocks,
+            );
+            index.record(index.slot(replica.id()), &prompt.hashes, capacity);
+        }
         let routed = Routed {
             model: model.clone(),
             policy: policy.kind(),
             replica: lease.replica().id().clone(),
         };
         shared.metrics.decided(&routed, took);
-        if let (Some(log), Some(candidates)) = (sampled, seen_by_policy) {
+        if let Some(prediction) = prediction {
+            shared.metrics.predicted(&model, prediction);
+        }
+        if let (Some(log), Some(mut seen)) = (sampled, seen_by_policy) {
+            for candidate in &mut seen {
+                candidate.cached_tokens = selected
+                    .predictions
+                    .iter()
+                    .find(|(id, _)| *id == candidate.replica)
+                    .map(|(_, cached)| *cached);
+            }
             log.record(Decision {
                 ts_ms: decision_log::unix_ms(),
                 request_id: id.to_str().unwrap_or_default().to_owned(),
@@ -265,11 +308,12 @@ async fn attempt(
                 attempt,
                 chosen: routed.replica.clone(),
                 decision_ns: u64::try_from(took.as_nanos()).unwrap_or(u64::MAX),
-                candidates,
+                prompt_tokens: prediction.map(|p| p.prompt_tokens),
+                candidates: seen,
             });
         }
         if !route_span.is_disabled() {
-            describe(&route_span, shared, &lease, candidates, took);
+            describe(&route_span, shared, &lease, candidates, took, prediction);
         }
         drop(route_span);
         if attempt > 0 {
@@ -287,9 +331,20 @@ async fn attempt(
             error.type = Empty,
         );
         let recording = Recording::new(routed, arrival, Span::current());
-        let forwarded = forward(shared, lease, recording, &parts, body.clone(), id, deadline)
-            .instrument(upstream_span)
-            .await;
+        let forwarded = forward(
+            shared,
+            lease,
+            recording,
+            Upstream {
+                parts: &parts,
+                body: body.clone(),
+                id,
+                deadline,
+                prediction,
+            },
+        )
+        .instrument(upstream_span)
+        .await;
         match forwarded {
             Attempt::Done(response) => return Ok(response),
             Attempt::Fatal(err) => return Err(err),
@@ -306,11 +361,54 @@ async fn attempt(
     })
 }
 
+/// What the KV index predicted for the chosen replica.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Prediction {
+    pub(crate) prompt_tokens: u32,
+    pub(crate) cached_tokens: u32,
+}
+
+/// Tokenizes and hashes the prompt, counting the outcome; `None` routes the
+/// request without cache predictions.
+async fn prepare_prompt(
+    shared: &Shared,
+    model: &ModelId,
+    endpoint: Endpoint,
+    body: &Bytes,
+) -> Option<Prompt> {
+    let (outcome, took) = shared.prompts.prepare(model, endpoint, body).await;
+    match outcome {
+        Ok(prompt) => {
+            shared.metrics.tokenized(model, "ok", took);
+            Some(prompt)
+        }
+        Err(Skip::Unconfigured) => None,
+        Err(skip) => {
+            if let Skip::Failed(err) = &skip {
+                tracing::debug!(%model, error = %err, "routing without a cache prediction");
+            }
+            shared.metrics.tokenized(model, skip.label(), took);
+            None
+        }
+    }
+}
+
 /// Puts the decision on its span: how many replicas were offered, which one
-/// won, and its load at that moment.
-fn describe(span: &Span, shared: &Shared, lease: &Lease, candidates: usize, took: Duration) {
+/// won, its load at that moment and what the index predicted for it.
+fn describe(
+    span: &Span,
+    shared: &Shared,
+    lease: &Lease,
+    candidates: usize,
+    took: Duration,
+    prediction: Option<Prediction>,
+) {
     let replica = lease.replica();
     let load = replica.load(Instant::now(), shared.config.load.max_age);
+    if let Some(prediction) = prediction {
+        span.record("inferrail.prompt_tokens", prediction.prompt_tokens);
+        span.record("inferrail.cached_tokens", prediction.cached_tokens);
+    }
     span.record("inferrail.candidates", candidates);
     span.record("inferrail.replica", replica.id().as_str());
     span.record("inferrail.replica.in_flight", load.in_flight);
@@ -326,7 +424,7 @@ fn describe(span: &Span, shared: &Shared, lease: &Lease, candidates: usize, took
 }
 
 /// Prompt tokens a body of `len` bytes holds, at about four bytes a token,
-/// until requests are tokenized at the edge.
+/// for models whose prompts are not tokenized at the edge.
 fn estimate_tokens(len: usize) -> u32 {
     u32::try_from(len.div_ceil(4)).unwrap_or(u32::MAX)
 }
@@ -456,17 +554,30 @@ fn is_retryable(status: StatusCode) -> bool {
     )
 }
 
+/// The request one attempt sends.
+struct Upstream<'a> {
+    parts: &'a Parts,
+    body: Bytes,
+    id: &'a HeaderValue,
+    deadline: Instant,
+    prediction: Option<Prediction>,
+}
+
 /// One try against one replica. Nothing reaches the client until this
 /// returns `Done`, which is what makes retrying the other outcomes safe.
 async fn forward(
     shared: &Arc<Shared>,
     mut lease: Lease,
     recording: Recording,
-    parts: &Parts,
-    body: Bytes,
-    id: &HeaderValue,
-    deadline: Instant,
+    upstream: Upstream<'_>,
 ) -> Attempt {
+    let Upstream {
+        parts,
+        body,
+        id,
+        deadline,
+        prediction,
+    } = upstream;
     let replica = Arc::clone(lease.replica());
     let request = match upstream_request(&replica, parts, body, id) {
         Ok(request) => request,
@@ -523,6 +634,12 @@ async fn forward(
     headers::for_downstream(&mut head.headers);
     if let Ok(value) = HeaderValue::from_str(replica.id().as_str()) {
         head.headers.insert(REPLICA, value);
+    }
+    if let Some(prediction) = prediction {
+        head.headers
+            .insert(PROMPT_TOKENS, HeaderValue::from(prediction.prompt_tokens));
+        head.headers
+            .insert(CACHED_TOKENS, HeaderValue::from(prediction.cached_tokens));
     }
     if is_retryable(status) {
         drop(lease);

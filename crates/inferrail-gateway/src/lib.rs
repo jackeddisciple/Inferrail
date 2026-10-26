@@ -12,6 +12,7 @@ use inferrail_control::{
 };
 use inferrail_core::config::{Config, ConfigIssues};
 use inferrail_core::ids::ModelId;
+use inferrail_index::KvIndex;
 use inferrail_load::{CollectorConfig, run_collector};
 use inferrail_policy::RoutingPolicy;
 use tokio::net::TcpListener;
@@ -25,6 +26,7 @@ pub mod headers;
 pub mod inspect;
 pub mod metrics;
 mod models;
+mod prompts;
 mod proxy;
 pub mod request_id;
 mod route;
@@ -45,6 +47,8 @@ pub enum BuildError {
         path: std::path::PathBuf,
         source: std::io::Error,
     },
+    #[error("cannot start the tokenizer workers: {0}")]
+    Workers(std::io::Error),
 }
 
 const PRUNE_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
@@ -70,6 +74,8 @@ pub(crate) struct Shared {
     ejecting: Mutex<()>,
     metrics: Arc<metrics::Metrics>,
     decisions: Option<decision_log::DecisionLog>,
+    prompts: prompts::Prompts,
+    index: Option<Arc<KvIndex>>,
 }
 
 impl Shared {
@@ -87,9 +93,25 @@ impl Gateway {
         Self::with_resolver(config, Arc::new(SystemResolver))
     }
 
-    /// Every check startup makes, without opening files or starting
-    /// anything: what `--check` runs.
-    pub fn check(config: &Config) -> Result<(), BuildError> {
+    /// Every check startup makes, without opening files for writing or
+    /// starting anything: what `--check` runs. Tokenizers that cannot be
+    /// loaded do not stop startup, since their models still route, so they
+    /// come back as warnings.
+    pub fn check(config: &Config) -> Result<Vec<String>, BuildError> {
+        Self::check_startup(config)?;
+        let (_, failures) = prompts::load_tokenizers(config);
+        Ok(failures
+            .iter()
+            .map(|f| {
+                format!(
+                    "model {}: {}; it routes without cache predictions",
+                    f.model, f.error
+                )
+            })
+            .collect())
+    }
+
+    fn check_startup(config: &Config) -> Result<(), BuildError> {
         config.validate().map_err(BuildError::Invalid)?;
         let urls = config
             .replicas
@@ -119,7 +141,13 @@ impl Gateway {
 
     /// Like [`Gateway::new`] with a custom resolver for DNS discovery.
     pub fn with_resolver(config: Config, resolver: Arc<dyn Resolve>) -> Result<Self, BuildError> {
-        Self::check(&config)?;
+        Self::check_startup(&config)?;
+        let (tokenizers, failures) = prompts::load_tokenizers(&config);
+        for failure in &failures {
+            tracing::warn!(model = %failure.model, error = %failure.error, "cannot load the tokenizer; routing this model without cache predictions");
+        }
+        let prompts = prompts::Prompts::new(&config, &tokenizers).map_err(BuildError::Workers)?;
+        let index = (config.index.enabled && prompts.any()).then(|| Arc::new(KvIndex::new()));
         let seed = config
             .routing
             .seed
@@ -186,6 +214,8 @@ impl Gateway {
             ejecting: Mutex::new(()),
             names,
             policies,
+            prompts,
+            index,
             config,
         };
         Ok(Self {

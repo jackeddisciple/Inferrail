@@ -2,23 +2,48 @@ use std::sync::Arc;
 
 use inferrail_control::{Lease, Nanos, Registry, Replica};
 use inferrail_core::ids::{ModelId, ReplicaId};
+use inferrail_index::{KvIndex, Slot};
 use inferrail_policy::{Candidate, RouteContext, RoutingPolicy};
 
 use crate::errors::GatewayError;
+use crate::prompts::Prompt;
 
-/// Picks a replica for `model` and takes a lease on it for a request of
-/// about `tokens` prompt tokens, returning it with the number of replicas
-/// offered to the policy. Only replicas that serve the model, are routable
-/// and have room are ever offered; untried ones are preferred over ones this
-/// request already used.
+/// The policy's choice, with what the KV index predicted.
+#[derive(Debug)]
+pub(crate) struct Selected {
+    pub(crate) lease: Lease,
+    /// How many replicas were offered to the policy.
+    pub(crate) offered: usize,
+    /// Prompt tokens predicted to be cached on the chosen replica.
+    pub(crate) cached_tokens: u32,
+    /// Each offered replica's prediction, when asked for.
+    pub(crate) predictions: Vec<(ReplicaId, u32)>,
+}
+
+/// What a routing decision knows about the prompt.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Request<'a> {
+    pub(crate) model: &'a ModelId,
+    /// Prompt tokens, counted or estimated, for the lease.
+    pub(crate) tokens: u32,
+    pub(crate) prompt: Option<&'a Prompt>,
+    pub(crate) index: Option<&'a KvIndex>,
+    /// Whether to return every offered replica's prediction.
+    pub(crate) explain: bool,
+}
+
+/// Picks a replica for the request and takes a lease on it. Only replicas
+/// that serve the model, are routable and have room are ever offered;
+/// untried ones are preferred over ones this request already used. Each
+/// is offered with the prompt tokens the KV index predicts it has cached.
 pub(crate) fn select(
     registry: &Registry,
     policy: &dyn RoutingPolicy,
-    model: &ModelId,
+    request: Request<'_>,
     now: Nanos,
     tried: &[ReplicaId],
-    tokens: u32,
-) -> Result<(Lease, usize), GatewayError> {
+) -> Result<Selected, GatewayError> {
+    let model = request.model;
     let fleet = registry.load();
     let pool = fleet.serving(model);
     let routable = pool.iter().filter(|r| r.is_routable(now));
@@ -27,32 +52,67 @@ pub(crate) fn select(
         eligible.retain(|r| !tried.contains(r.id()));
     }
     let offered = eligible.len();
+    let mut cached = predict(&eligible, request);
+    let predictions = if request.explain {
+        eligible
+            .iter()
+            .map(|r| r.id().clone())
+            .zip(cached.iter().copied())
+            .collect()
+    } else {
+        Vec::new()
+    };
     let mut candidates: Vec<Candidate<'_>> = Vec::with_capacity(eligible.len());
     while !eligible.is_empty() {
         candidates.clear();
-        candidates.extend(eligible.iter().map(|r| Candidate {
-            id: r.id(),
-            in_flight: r.in_flight(),
-            cached_tokens: 0,
-        }));
+        candidates.extend(
+            eligible
+                .iter()
+                .zip(&cached)
+                .map(|(r, &cached_tokens)| Candidate {
+                    id: r.id(),
+                    in_flight: r.in_flight(),
+                    cached_tokens,
+                }),
+        );
         let ctx = RouteContext {
             model,
-            prompt_tokens: None,
+            prompt_tokens: request.prompt.map(|p| p.tokens),
             candidates: &candidates,
         };
         let Some(i) = policy.choose(&ctx).filter(|&i| i < eligible.len()) else {
             break;
         };
-        if let Some(lease) = eligible[i].try_acquire(tokens) {
-            return Ok((lease, offered));
+        if let Some(lease) = eligible[i].try_acquire(request.tokens) {
+            return Ok(Selected {
+                lease,
+                offered,
+                cached_tokens: cached[i],
+                predictions,
+            });
         }
         eligible.remove(i);
+        cached.remove(i);
     }
     Err(if routable.count() == 0 {
         GatewayError::unavailable(format!("no healthy replica serves `{model}`"))
     } else {
         GatewayError::unavailable(format!("every replica serving `{model}` is at capacity"))
     })
+}
+
+fn predict(eligible: &[&Arc<Replica>], request: Request<'_>) -> Vec<u32> {
+    match (request.prompt, request.index) {
+        (Some(prompt), Some(index)) if prompt.cacheable > 0 && !eligible.is_empty() => {
+            let slots: Vec<Slot> = eligible.iter().map(|r| index.slot(r.id())).collect();
+            index
+                .longest_prefix(&prompt.hashes[..prompt.cacheable], &slots)
+                .into_iter()
+                .map(|blocks| prompt.cached_tokens(blocks))
+                .collect()
+        }
+        _ => vec![0; eligible.len()],
+    }
 }
 
 #[cfg(test)]
@@ -65,6 +125,16 @@ mod tests {
     use proptest::prelude::*;
 
     const MODELS: [&str; 3] = ["a", "b", "c"];
+
+    fn plain(model: &ModelId) -> Request<'_> {
+        Request {
+            model,
+            tokens: 0,
+            prompt: None,
+            index: None,
+            explain: false,
+        }
+    }
 
     #[derive(Debug, Clone)]
     struct Member {
@@ -158,9 +228,9 @@ mod tests {
                     .iter()
                     .any(|r| r.is_routable(now) && r.has_room());
                 for _ in 0..4 {
-                    match select(&registry, policy.as_ref(), &model, now, &tried, 0) {
-                        Ok((lease, _)) => {
-                            let replica = lease.replica();
+                    match select(&registry, policy.as_ref(), plain(&model), now, &tried) {
+                        Ok(selected) => {
+                            let replica = selected.lease.replica();
                             prop_assert!(replica.serves(&model));
                             prop_assert!(replica.is_routable(now));
                             if let Some(cap) = replica.limits().max_concurrency {
@@ -194,15 +264,73 @@ mod tests {
             .map(|id| ReplicaId::new(id).unwrap())
             .collect();
         for _ in 0..5 {
-            let (lease, offered) =
-                select(&registry, policy.as_ref(), &model, 1, &tried, 0).unwrap();
-            assert_eq!(offered, 1);
-            assert_eq!(lease.replica().id().as_str(), "r1");
+            let selected = select(&registry, policy.as_ref(), plain(&model), 1, &tried).unwrap();
+            assert_eq!(selected.offered, 1);
+            assert_eq!(selected.lease.replica().id().as_str(), "r1");
         }
         let all: Vec<ReplicaId> = (0..3)
             .map(|i| ReplicaId::new(format!("r{i}")).unwrap())
             .collect();
-        assert!(select(&registry, policy.as_ref(), &model, 1, &all, 0).is_ok());
+        assert!(select(&registry, policy.as_ref(), plain(&model), 1, &all).is_ok());
+    }
+
+    #[test]
+    fn candidates_carry_what_the_index_predicts() {
+        let members = vec![
+            Member {
+                models: vec![true, false, false],
+                probe_down: false,
+                ejected: false,
+                cap: None,
+                held: 0,
+            };
+            3
+        ];
+        let (registry, _) = build(&members);
+        let policy = inferrail_policy::build(PolicyKind::RoundRobin, 0);
+        let model = ModelId::new("a").unwrap();
+        let index = KvIndex::new();
+        let prompt = Prompt {
+            tokens: 64,
+            hashes: (1..=4).map(inferrail_core::ids::BlockHash::new).collect(),
+            cacheable: 3,
+            block_size: 16,
+        };
+        index.record(
+            index.slot(&ReplicaId::new("r1").unwrap()),
+            &prompt.hashes,
+            100,
+        );
+        let request = Request {
+            model: &model,
+            tokens: prompt.tokens,
+            prompt: Some(&prompt),
+            index: Some(&index),
+            explain: true,
+        };
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..6 {
+            let selected = select(&registry, policy.as_ref(), request, 1, &[]).unwrap();
+            let winner = selected.lease.replica().id().as_str().to_owned();
+            assert_eq!(selected.cached_tokens, if winner == "r1" { 48 } else { 0 });
+            assert_eq!(selected.lease.tokens(), 64);
+            let mut predictions = selected.predictions.clone();
+            predictions.sort();
+            let r = |i: &str| ReplicaId::new(i).unwrap();
+            assert_eq!(predictions, [(r("r0"), 0), (r("r1"), 48), (r("r2"), 0)]);
+            seen.insert(winner);
+        }
+        assert_eq!(seen.len(), 3);
+        let quiet = Request {
+            explain: false,
+            ..request
+        };
+        assert!(
+            select(&registry, policy.as_ref(), quiet, 1, &[])
+                .unwrap()
+                .predictions
+                .is_empty()
+        );
     }
 
     #[test]
@@ -217,12 +345,12 @@ mod tests {
         let (registry, _held) = build(&members);
         let policy = inferrail_policy::build(PolicyKind::P2c, 0);
         let model = ModelId::new("a").unwrap();
-        let err = select(&registry, policy.as_ref(), &model, 1, &[], 0).unwrap_err();
+        let err = select(&registry, policy.as_ref(), plain(&model), 1, &[]).unwrap_err();
         assert!(err.message().contains("at capacity"), "{}", err.message());
 
         members[0].probe_down = true;
         let (registry, _held) = build(&members);
-        let err = select(&registry, policy.as_ref(), &model, 1, &[], 0).unwrap_err();
+        let err = select(&registry, policy.as_ref(), plain(&model), 1, &[]).unwrap_err();
         assert!(
             err.message().contains("no healthy replica"),
             "{}",
@@ -231,6 +359,6 @@ mod tests {
         assert!(err.retry_after().is_some());
 
         let other = ModelId::new("b").unwrap();
-        assert!(select(&registry, policy.as_ref(), &other, 1, &[], 0).is_err());
+        assert!(select(&registry, policy.as_ref(), plain(&other), 1, &[]).is_err());
     }
 }
