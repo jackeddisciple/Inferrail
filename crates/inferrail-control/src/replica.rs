@@ -107,6 +107,8 @@ pub struct Replica {
     peak_in_flight: AtomicU32,
     in_flight_tokens: AtomicU64,
     prefill_tokens: AtomicU64,
+    prefilling: AtomicU32,
+    queue_until: AtomicU64,
     health: Health,
     cards: ArcSwapOption<Cards>,
     engine_load: LoadCell,
@@ -129,6 +131,8 @@ impl Replica {
             peak_in_flight: AtomicU32::new(0),
             in_flight_tokens: AtomicU64::new(0),
             prefill_tokens: AtomicU64::new(0),
+            prefilling: AtomicU32::new(0),
+            queue_until: AtomicU64::new(0),
             health: Health::default(),
             cards: ArcSwapOption::empty(),
             engine_load: LoadCell::default(),
@@ -213,6 +217,21 @@ impl Replica {
         self.prefill_tokens.load(Ordering::Relaxed)
     }
 
+    /// Requests that have not had a response byte back yet.
+    pub fn prefilling(&self) -> u32 {
+        self.prefilling.load(Ordering::Relaxed)
+    }
+
+    /// Prefill work queued on the replica at `now`, as estimated when each
+    /// request was sent and drained in real time. Once every request has
+    /// had its first byte back, nothing is queued, whatever was estimated.
+    pub fn queued(&self, now: Nanos) -> Duration {
+        if self.prefilling() == 0 {
+            return Duration::ZERO;
+        }
+        Duration::from_nanos(self.queue_until.load(Ordering::Relaxed).saturating_sub(now))
+    }
+
     /// The most requests ever in flight at once, as seen by the lease that
     /// reached it.
     pub fn peak_in_flight(&self) -> u32 {
@@ -242,6 +261,7 @@ impl Replica {
         let tokens = u64::from(tokens);
         self.in_flight_tokens.fetch_add(tokens, Ordering::Relaxed);
         self.prefill_tokens.fetch_add(tokens, Ordering::Relaxed);
+        self.prefilling.fetch_add(1, Ordering::Relaxed);
         Some(Lease {
             replica: Arc::clone(self),
             pending: true,
@@ -300,7 +320,22 @@ impl Lease {
             self.replica
                 .prefill_tokens
                 .fetch_sub(self.tokens, Ordering::Relaxed);
+            self.replica.prefilling.fetch_sub(1, Ordering::Relaxed);
         }
+    }
+
+    /// Queues `prefill` of work on the replica behind what is already
+    /// there, or from `now` when no other request is waiting on it.
+    pub fn enqueue(&self, now: Nanos, prefill: Duration) {
+        let alone = self.replica.prefilling() <= u32::from(self.prefilling);
+        let work = u64::try_from(prefill.as_nanos()).unwrap_or(u64::MAX);
+        let _ =
+            self.replica
+                .queue_until
+                .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |until| {
+                    let start = if alone { now } else { until.max(now) };
+                    Some(start.saturating_add(work))
+                });
     }
 
     pub fn tokens(&self) -> u64 {
@@ -475,13 +510,24 @@ pub(crate) mod tests {
     }
 
     impl Reference {
-        fn counters(&self) -> (u32, u32, u64, u64) {
+        fn counters(&self) -> (u32, u32, u64, u64, u32) {
             let in_flight = self.leases.len() as u32;
             let pending = self.leases.iter().filter(|l| l.1).count() as u32;
             let tokens = self.leases.iter().map(|l| l.0).sum();
             let prefill = self.leases.iter().filter(|l| l.2).map(|l| l.0).sum();
-            (in_flight, pending, tokens, prefill)
+            let prefilling = self.leases.iter().filter(|l| l.2).count() as u32;
+            (in_flight, pending, tokens, prefill, prefilling)
         }
+    }
+
+    fn counters(replica: &Replica) -> (u32, u32, u64, u64, u32) {
+        (
+            replica.in_flight(),
+            replica.pending(),
+            replica.in_flight_tokens(),
+            replica.prefill_tokens(),
+            replica.prefilling(),
+        )
     }
 
     proptest! {
@@ -519,17 +565,43 @@ pub(crate) mod tests {
                     }
                     _ => {}
                 }
-                prop_assert_eq!(
-                    (replica.in_flight(), replica.pending(), replica.in_flight_tokens(), replica.prefill_tokens()),
-                    model.counters()
-                );
+                prop_assert_eq!(counters(&replica), model.counters());
             }
             drop(leases);
-            prop_assert_eq!(
-                (replica.in_flight(), replica.pending(), replica.in_flight_tokens(), replica.prefill_tokens()),
-                (0, 0, 0, 0)
-            );
+            prop_assert_eq!(counters(&replica), (0, 0, 0, 0, 0));
+            prop_assert_eq!(replica.queued(1), Duration::ZERO);
         }
+    }
+
+    #[test]
+    fn the_prefill_queue_builds_drains_and_empties() {
+        let replica = capped(None, None);
+        let ms = Duration::from_millis;
+        let at = |millis: u64| millis * 1_000_000;
+        assert_eq!(replica.queued(at(0)), Duration::ZERO);
+        let mut first = replica.try_acquire(10).unwrap();
+        first.enqueue(at(100), ms(50));
+        assert_eq!(replica.queued(at(100)), ms(50));
+        assert_eq!(replica.queued(at(120)), ms(30));
+        let second = replica.try_acquire(10).unwrap();
+        second.enqueue(at(110), ms(30));
+        assert_eq!(replica.queued(at(110)), ms(70));
+        assert_eq!(replica.queued(at(180)), Duration::ZERO);
+        assert_eq!(replica.queued(at(500)), Duration::ZERO);
+        first.first_byte();
+        assert_eq!(replica.prefilling(), 1);
+        drop(second);
+        assert_eq!(replica.prefilling(), 0);
+
+        let mut slow = replica.try_acquire(1).unwrap();
+        slow.enqueue(at(1_000), ms(900));
+        slow.first_byte();
+        assert_eq!(replica.queued(at(1_100)), Duration::ZERO);
+        let next = replica.try_acquire(1).unwrap();
+        next.enqueue(at(1_200), ms(40));
+        assert_eq!(replica.queued(at(1_200)), ms(40));
+        drop((first, slow, next));
+        assert_eq!(counters(&replica), (0, 0, 0, 0, 0));
     }
 
     #[tokio::test(start_paused = true)]
