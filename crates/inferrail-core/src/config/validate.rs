@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use url::Url;
 
-use super::{Config, ContentFormat, ModelConfig, SIM_TOKENIZER};
+use super::{Config, ContentFormat, CostModelConfig, ModelConfig, SIM_TOKENIZER};
 use crate::ids::ModelId;
 
 pub const MAX_BLOCK_SIZE: u32 = 4096;
@@ -13,6 +13,11 @@ pub const MAX_TOKENIZER_QUEUE: usize = 1 << 20;
 pub const MAX_CAPACITY_BLOCKS: u64 = 1 << 32;
 pub const MAX_RETRY_ATTEMPTS: u32 = 10;
 pub const MIN_SCRAPE_INTERVAL: Duration = Duration::from_millis(10);
+pub const MAX_PREFIX_BLOCKS: u32 = 4096;
+const MAX_WEIGHT: f64 = 1000.0;
+const MAX_COST_SECS: f64 = 60.0;
+const MIN_HOT_WINDOW: Duration = Duration::from_millis(100);
+const MAX_HOT_WINDOW: Duration = Duration::from_secs(3600);
 const LOG_LEVELS: [&str; 5] = ["trace", "debug", "info", "warn", "error"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -176,6 +181,30 @@ fn check_tokenization(path: &str, model: &ModelConfig, c: &mut Collector) {
                 "is not allowed; vLLM refuses it too",
             );
         }
+    }
+}
+
+/// Every cost is a time, so finite and never negative; prefill must cost
+/// something per token or cached tokens would be worth nothing.
+fn check_cost(path: &str, cost: &CostModelConfig, c: &mut Collector) {
+    for (name, value) in [
+        ("prefill_token_secs", cost.prefill_token_secs),
+        ("prefill_pair_secs", cost.prefill_pair_secs),
+        ("prefill_fixed_secs", cost.prefill_fixed_secs),
+        ("decode_interference_secs", cost.decode_interference_secs),
+    ] {
+        if !(value.is_finite() && (0.0..=MAX_COST_SECS).contains(&value)) {
+            c.push(
+                format!("{path}.{name}"),
+                format!("must be between 0 and {MAX_COST_SECS} seconds"),
+            );
+        }
+    }
+    if cost.prefill_token_secs == 0.0 {
+        c.push(
+            format!("{path}.prefill_token_secs"),
+            "must be greater than zero",
+        );
     }
 }
 
@@ -391,6 +420,39 @@ impl Config {
         if !(routing.kappa.is_finite() && routing.kappa > 0.0 && routing.kappa <= 1.0) {
             c.push("routing.kappa", "must be in (0, 1]");
         }
+        for (path, blocks) in [
+            ("routing.prefix_hash.blocks", routing.prefix_hash.blocks),
+            ("routing.hot_prefix.blocks", routing.hot_prefix.blocks),
+        ] {
+            if blocks == 0 || blocks > MAX_PREFIX_BLOCKS {
+                c.push(path, format!("must be between 1 and {MAX_PREFIX_BLOCKS}"));
+            }
+        }
+        let weights = &routing.kv_aware;
+        for (path, weight) in [
+            ("routing.kv_aware.cache_weight", weights.cache_weight),
+            ("routing.kv_aware.load_weight", weights.load_weight),
+        ] {
+            if !(weight.is_finite() && (0.0..=MAX_WEIGHT).contains(&weight)) {
+                c.push(path, format!("must be between 0 and {MAX_WEIGHT}"));
+            }
+        }
+        if weights.cache_weight == 0.0 && weights.load_weight == 0.0 {
+            c.push("routing.kv_aware", "needs a weight above zero");
+        }
+        check_cost("routing.cost_model", &routing.cost_model, c);
+        let hot = &routing.hot_prefix;
+        if !(hot.utilization.is_finite() && hot.utilization > 0.0 && hot.utilization <= 1.0) {
+            c.push("routing.hot_prefix.utilization", "must be in (0, 1]");
+        }
+        if !(MIN_HOT_WINDOW..=MAX_HOT_WINDOW).contains(&hot.window) {
+            c.push("routing.hot_prefix.window", "must be between 100ms and 1h");
+        }
+        for (i, model) in self.models.iter().enumerate() {
+            if let Some(cost) = &model.cost_model {
+                check_cost(&format!("models[{i}].cost_model"), cost, c);
+            }
+        }
     }
 
     fn check_health(&self, c: &mut Collector) {
@@ -486,7 +548,10 @@ mod tests {
     use super::super::{
         Config, ConfigError, ContentFormat, DnsGroupConfig, ReplicaConfig, SIM_TOKENIZER,
     };
-    use super::{MAX_BLOCK_SIZE, MAX_CAPACITY_BLOCKS, MAX_TOKENIZER_QUEUE, MAX_TOKENIZER_WORKERS};
+    use super::{
+        MAX_BLOCK_SIZE, MAX_CAPACITY_BLOCKS, MAX_PREFIX_BLOCKS, MAX_TOKENIZER_QUEUE,
+        MAX_TOKENIZER_WORKERS,
+    };
     use crate::ids::{ModelId, ReplicaId};
     use proptest::prelude::*;
 
@@ -827,6 +892,91 @@ discovery:
         let mut config = base();
         config.routing.kappa = 1.0;
         config.routing.epsilon = 10.0;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn policy_settings_are_bounded() {
+        for blocks in [0, MAX_PREFIX_BLOCKS + 1] {
+            let mut config = base();
+            config.routing.prefix_hash.blocks = blocks;
+            config.routing.hot_prefix.blocks = blocks;
+            let found = issues(&config);
+            assert_eq!(found.len(), 2, "{found:?}");
+            assert!(found[0].starts_with("routing.prefix_hash.blocks"));
+            assert!(found[1].starts_with("routing.hot_prefix.blocks"));
+        }
+        for weight in [-0.1, f64::NAN, f64::INFINITY, 1000.5] {
+            let mut config = base();
+            config.routing.kv_aware.load_weight = weight;
+            assert!(
+                only_issue(&config).starts_with("routing.kv_aware.load_weight"),
+                "{weight}"
+            );
+        }
+        let mut config = base();
+        config.routing.kv_aware.cache_weight = 0.0;
+        config.routing.kv_aware.load_weight = 0.0;
+        assert_eq!(
+            only_issue(&config),
+            "routing.kv_aware: needs a weight above zero"
+        );
+        for utilization in [0.0, 1.5, f64::NAN] {
+            let mut config = base();
+            config.routing.hot_prefix.utilization = utilization;
+            assert!(
+                only_issue(&config).starts_with("routing.hot_prefix.utilization"),
+                "{utilization}"
+            );
+        }
+        for window in [Duration::from_millis(99), Duration::from_secs(3601)] {
+            let mut config = base();
+            config.routing.hot_prefix.window = window;
+            assert!(only_issue(&config).starts_with("routing.hot_prefix.window"));
+        }
+        let mut config = base();
+        config.routing.prefix_hash.blocks = MAX_PREFIX_BLOCKS;
+        config.routing.kv_aware.cache_weight = 0.0;
+        config.routing.hot_prefix.utilization = 1.0;
+        config.routing.hot_prefix.window = Duration::from_millis(100);
+        assert!(config.validate().is_ok(), "{:?}", issues(&config));
+    }
+
+    #[test]
+    fn cost_models_must_be_finite_times() {
+        let mut config = base();
+        config.routing.cost_model.prefill_pair_secs = -1e-9;
+        config.routing.cost_model.decode_interference_secs = f64::NAN;
+        config.routing.cost_model.prefill_fixed_secs = 61.0;
+        let found = issues(&config);
+        assert_eq!(found.len(), 3, "{found:?}");
+        for field in [
+            "prefill_pair_secs",
+            "decode_interference_secs",
+            "prefill_fixed_secs",
+        ] {
+            assert!(
+                found
+                    .iter()
+                    .any(|i| i.starts_with(&format!("routing.cost_model.{field}"))),
+                "{field}: {found:?}"
+            );
+        }
+        let mut config = base();
+        config.models[1].cost_model = Some(super::super::CostModelConfig {
+            prefill_token_secs: 0.0,
+            ..Default::default()
+        });
+        assert_eq!(
+            only_issue(&config),
+            "models[1].cost_model.prefill_token_secs: must be greater than zero"
+        );
+        config.models[1].cost_model = Some(super::super::CostModelConfig {
+            prefill_token_secs: 1e-5,
+            prefill_pair_secs: 0.0,
+            prefill_fixed_secs: 0.0,
+            decode_interference_secs: 0.0,
+        });
         assert!(config.validate().is_ok());
     }
 

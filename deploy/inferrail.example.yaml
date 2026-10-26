@@ -55,10 +55,36 @@ upstream:
   pool_max_idle_per_host: 1024
   http2: false
 
+# cost_model sends each request to the replica with the lowest estimated
+# time to first token: prefill work queued there, plus prefill of what it
+# does not have cached. Its guards: no replica past (1 + epsilon) times the
+# average requests in flight, no prompt longer than short_prompt_tokens to
+# compute on a replica with more than kappa of its KV cache in use, hot root
+# prefixes spread over enough owners to keep each under hot_prefix
+# utilization, and, with session_affinity, conversations kept on their last
+# replica. inferrail-calibrate measures cost_model for a model and GPU; a
+# model's own cost_model replaces this one.
 routing:
   default_policy: cost_model
-  epsilon: 0.25
+  epsilon: 1.0
   kappa: 0.92
+  short_prompt_tokens: 256
+  session_affinity: false
+  prefix_hash:
+    blocks: 4
+  kv_aware:
+    cache_weight: 1.0
+    load_weight: 1.0
+  cost_model:
+    prefill_token_secs: 0.0001
+    prefill_pair_secs: 0.0000000033
+    prefill_fixed_secs: 0.005
+    decode_interference_secs: 0.0
+  hot_prefix:
+    enabled: true
+    blocks: 4
+    utilization: 0.5
+    window: 10s
 
 health:
   interval: 1s

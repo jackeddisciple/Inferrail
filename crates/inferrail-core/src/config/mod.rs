@@ -14,13 +14,15 @@ use crate::ids::{ModelId, ReplicaId};
 mod validate;
 
 pub use validate::{
-    ConfigIssue, ConfigIssues, MAX_BLOCK_SIZE, MAX_CAPACITY_BLOCKS, MAX_RETRY_ATTEMPTS,
-    MAX_TOKENIZER_QUEUE, MAX_TOKENIZER_WORKERS, MIN_SCRAPE_INTERVAL,
+    ConfigIssue, ConfigIssues, MAX_BLOCK_SIZE, MAX_CAPACITY_BLOCKS, MAX_PREFIX_BLOCKS,
+    MAX_RETRY_ATTEMPTS, MAX_TOKENIZER_QUEUE, MAX_TOKENIZER_WORKERS, MIN_SCRAPE_INTERVAL,
 };
 
 pub const DEFAULT_BLOCK_SIZE: u32 = 16;
-pub const DEFAULT_EPSILON: f64 = 0.25;
+pub const DEFAULT_EPSILON: f64 = 1.0;
 pub const DEFAULT_KAPPA: f64 = 0.92;
+pub const DEFAULT_SHORT_PROMPT_TOKENS: u32 = 256;
+pub const DEFAULT_PREFIX_BLOCKS: u32 = 4;
 pub const DEFAULT_CAPACITY_BLOCKS: u64 = 16_384;
 /// The tokenizer of `inferrail-sim`, which needs no model files.
 pub const SIM_TOKENIZER: &str = "builtin:sim";
@@ -103,6 +105,10 @@ impl Config {
 
     pub fn policy_for(&self, model: &ModelConfig) -> PolicyKind {
         model.policy.unwrap_or(self.routing.default_policy)
+    }
+
+    pub fn cost_model_for(&self, model: &ModelConfig) -> CostModelConfig {
+        model.cost_model.unwrap_or(self.routing.cost_model)
     }
 
     pub fn replicas_serving<'a>(
@@ -194,6 +200,9 @@ pub struct ModelConfig {
     /// As vLLM's `--default-chat-template-kwargs`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub chat_template_kwargs: BTreeMap<String, serde_json::Value>,
+    /// This model's measured prefill costs, replacing `routing.cost_model`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_model: Option<CostModelConfig>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -306,10 +315,24 @@ impl fmt::Display for PolicyKind {
 #[serde(deny_unknown_fields, default)]
 pub struct RoutingConfig {
     pub default_policy: PolicyKind,
+    /// Bounded load: `cost_model` skips a replica whose requests in flight
+    /// would exceed (1 + epsilon) times the pool average.
     pub epsilon: f64,
+    /// KV pressure: `cost_model` sends no long prompt to a replica whose
+    /// engine reports more than this share of its KV cache in use.
     pub kappa: f64,
+    /// Prompts with at most this many tokens to compute on a replica are
+    /// short and pass the KV pressure guard.
+    pub short_prompt_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seed: Option<u64>,
+    pub prefix_hash: PrefixHashConfig,
+    pub kv_aware: KvAwareConfig,
+    pub cost_model: CostModelConfig,
+    pub hot_prefix: HotPrefixConfig,
+    /// Keeps a conversation on its last replica, named by `x-session-id` or
+    /// the request's `user` field, while that replica is not overloaded.
+    pub session_affinity: bool,
 }
 
 impl Default for RoutingConfig {
@@ -318,7 +341,97 @@ impl Default for RoutingConfig {
             default_policy: PolicyKind::CostModel,
             epsilon: DEFAULT_EPSILON,
             kappa: DEFAULT_KAPPA,
+            short_prompt_tokens: DEFAULT_SHORT_PROMPT_TOKENS,
             seed: None,
+            prefix_hash: PrefixHashConfig::default(),
+            kv_aware: KvAwareConfig::default(),
+            cost_model: CostModelConfig::default(),
+            hot_prefix: HotPrefixConfig::default(),
+            session_affinity: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct PrefixHashConfig {
+    /// Leading blocks of the prompt that pick its replica.
+    pub blocks: u32,
+}
+
+impl Default for PrefixHashConfig {
+    fn default() -> Self {
+        Self {
+            blocks: DEFAULT_PREFIX_BLOCKS,
+        }
+    }
+}
+
+/// `kv_aware` scores each replica as `cache_weight` times the share of the
+/// prompt it holds minus `load_weight` times its requests in flight over
+/// the busiest candidate's.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct KvAwareConfig {
+    pub cache_weight: f64,
+    pub load_weight: f64,
+}
+
+impl Default for KvAwareConfig {
+    fn default() -> Self {
+        Self {
+            cache_weight: 1.0,
+            load_weight: 1.0,
+        }
+    }
+}
+
+/// Prefill time of `u` uncached tokens attending to `c` cached ones,
+/// `prefill_token_secs * u + prefill_pair_secs * u * (c + u / 2) +
+/// prefill_fixed_secs`, and the time each running decode adds to a
+/// replica's queue. `inferrail-calibrate` measures the prefill terms.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct CostModelConfig {
+    pub prefill_token_secs: f64,
+    pub prefill_pair_secs: f64,
+    pub prefill_fixed_secs: f64,
+    pub decode_interference_secs: f64,
+}
+
+impl Default for CostModelConfig {
+    /// Roughly an 8B model on one 24 GB GPU, as `inferrail-sim` models it.
+    fn default() -> Self {
+        Self {
+            prefill_token_secs: 100e-6,
+            prefill_pair_secs: 3.3e-9,
+            prefill_fixed_secs: 5e-3,
+            decode_interference_secs: 0.0,
+        }
+    }
+}
+
+/// Hot prefix replication: the prefill work each root prefix (its first
+/// `blocks` blocks) brings is tracked over `window`; one that needs more
+/// than `utilization` of a replica gets enough owner replicas to stay
+/// under it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct HotPrefixConfig {
+    pub enabled: bool,
+    pub blocks: u32,
+    pub utilization: f64,
+    #[serde(with = "humantime_serde")]
+    pub window: Duration,
+}
+
+impl Default for HotPrefixConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            blocks: DEFAULT_PREFIX_BLOCKS,
+            utilization: 0.5,
+            window: Duration::from_secs(10),
         }
     }
 }
@@ -509,7 +622,7 @@ replicas:
         let config = Config::from_yaml_str(MINIMAL).unwrap();
         assert_eq!(config.server, ServerConfig::default());
         assert_eq!(config.routing.default_policy, PolicyKind::CostModel);
-        assert_eq!(config.routing.epsilon, 0.25);
+        assert_eq!(config.routing.epsilon, 1.0);
         assert_eq!(config.routing.kappa, 0.92);
         assert_eq!(config.models[0].block_size, 16);
         assert!(!config.logging.log_prompts);
@@ -544,6 +657,63 @@ replicas:
         assert_eq!(config.tokenizer.cache_tokens, 1 << 22);
         assert!(config.index.enabled);
         assert_eq!(config.index.default_capacity_blocks, 16_384);
+        let routing = &config.routing;
+        assert_eq!(routing.short_prompt_tokens, 256);
+        assert_eq!(routing.prefix_hash.blocks, 4);
+        assert_eq!(
+            (routing.kv_aware.cache_weight, routing.kv_aware.load_weight),
+            (1.0, 1.0)
+        );
+        assert_eq!(routing.cost_model.prefill_token_secs, 100e-6);
+        assert_eq!(routing.cost_model.prefill_pair_secs, 3.3e-9);
+        assert_eq!(routing.cost_model.prefill_fixed_secs, 5e-3);
+        assert_eq!(routing.cost_model.decode_interference_secs, 0.0);
+        assert!(routing.hot_prefix.enabled);
+        assert_eq!(routing.hot_prefix.blocks, 4);
+        assert_eq!(routing.hot_prefix.utilization, 0.5);
+        assert_eq!(routing.hot_prefix.window, Duration::from_secs(10));
+        assert!(!routing.session_affinity);
+        assert_eq!(config.models[0].cost_model, None);
+        assert_eq!(
+            config.cost_model_for(&config.models[0]),
+            CostModelConfig::default()
+        );
+    }
+
+    #[test]
+    fn routing_settings_parse_and_models_override_the_cost_model() {
+        let text = MINIMAL.replace(
+            "  - name: meta-llama/Llama-3.1-8B-Instruct\n",
+            "  - name: meta-llama/Llama-3.1-8B-Instruct\n    cost_model:\n      prefill_token_secs: 0.00005\n      prefill_fixed_secs: 0.002\n",
+        );
+        let config = Config::from_yaml_str(&format!(
+            "{text}routing:\n  short_prompt_tokens: 64\n  session_affinity: true\n  prefix_hash:\n    blocks: 2\n  kv_aware:\n    cache_weight: 3\n    load_weight: 0.5\n  cost_model:\n    decode_interference_secs: 0.001\n  hot_prefix:\n    enabled: false\n    blocks: 8\n    utilization: 0.8\n    window: 30s\n"
+        ))
+        .unwrap();
+        let routing = &config.routing;
+        assert_eq!(routing.short_prompt_tokens, 64);
+        assert!(routing.session_affinity);
+        assert_eq!(routing.prefix_hash.blocks, 2);
+        assert_eq!(routing.kv_aware.cache_weight, 3.0);
+        assert_eq!(routing.kv_aware.load_weight, 0.5);
+        assert_eq!(routing.cost_model.decode_interference_secs, 0.001);
+        assert_eq!(routing.cost_model.prefill_token_secs, 100e-6);
+        assert_eq!(
+            routing.hot_prefix,
+            HotPrefixConfig {
+                enabled: false,
+                blocks: 8,
+                utilization: 0.8,
+                window: Duration::from_secs(30),
+            }
+        );
+        let model = config.cost_model_for(&config.models[0]);
+        assert_eq!(model.prefill_token_secs, 5e-5);
+        assert_eq!(model.prefill_fixed_secs, 0.002);
+        assert_eq!(model.prefill_pair_secs, 3.3e-9);
+        assert_eq!(model.decode_interference_secs, 0.0);
+        let again = Config::from_yaml_str(&config.to_yaml_string().unwrap()).unwrap();
+        assert_eq!(again, config);
     }
 
     #[test]
@@ -652,6 +822,10 @@ replicas:
         for extra in [
             "typo_section: 1\n",
             "routing:\n  epsilonn: 0.3\n",
+            "routing:\n  kv_aware:\n    weight: 1\n",
+            "routing:\n  cost_model:\n    prefill_secs: 1\n",
+            "routing:\n  hot_prefix:\n    rate: 1\n",
+            "routing:\n  prefix_hash:\n    tokens: 64\n",
             "server:\n  listen_addr: 0.0.0.0:1\n",
             "upstream:\n  http3: true\n",
             "discovery:\n  consul: []\n",
