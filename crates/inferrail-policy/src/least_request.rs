@@ -1,6 +1,6 @@
 use inferrail_core::config::PolicyKind;
 
-use crate::{RouteContext, RoutingPolicy, SplitMix};
+use crate::{Choice, Explanation, RouteContext, RoutingPolicy, SplitMix};
 
 /// Fewest in flight requests; ties are broken uniformly at random.
 #[derive(Debug)]
@@ -21,7 +21,7 @@ impl RoutingPolicy for LeastRequest {
         PolicyKind::LeastRequest
     }
 
-    fn choose(&self, ctx: &RouteContext<'_>) -> Option<usize> {
+    fn choose(&self, ctx: &RouteContext<'_>) -> Option<Choice> {
         let (first, rest) = ctx.candidates.split_first()?;
         let (mut best, mut min, mut ties) = (0, first.in_flight, 1);
         for (i, candidate) in rest.iter().enumerate() {
@@ -35,7 +35,22 @@ impl RoutingPolicy for LeastRequest {
                 }
             }
         }
-        Some(best)
+        Some(Choice::new(best))
+    }
+
+    fn explain(&self, ctx: &RouteContext<'_>) -> Explanation {
+        let loads = ctx.candidates.iter().map(|c| c.in_flight);
+        let min = loads.clone().min();
+        let mut least = loads.enumerate().filter(|&(_, load)| Some(load) == min);
+        let winner = match (least.next(), least.next()) {
+            (Some((i, _)), None) => Some(i),
+            _ => None,
+        };
+        Explanation::plain(
+            "fewest requests in flight, ties at random",
+            winner,
+            ctx.candidates.len(),
+        )
     }
 }
 
@@ -67,6 +82,22 @@ mod tests {
         let tied = [counts[0], counts[2], counts[3], counts[5]];
         let stat = chi_square(&tied);
         assert!(stat < 16.27, "chi square {stat} for {tied:?}");
+    }
+
+    #[test]
+    fn explain_names_a_unique_minimum_only() {
+        let pool = Pool::new(3);
+        let policy = LeastRequest::new(0);
+        let unique = pool.candidates(&[4, 1, 7]);
+        let explained = policy.explain(&RouteContext::new(&pool.model, &unique));
+        assert_eq!(explained.winner, Some(1));
+        let tied = pool.candidates(&[1, 1, 7]);
+        assert_eq!(
+            policy
+                .explain(&RouteContext::new(&pool.model, &tied))
+                .winner,
+            None
+        );
     }
 
     #[test]

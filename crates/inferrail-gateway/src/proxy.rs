@@ -259,6 +259,9 @@ async fn attempt(
             tokens,
             prompt: prompt.as_ref(),
             index: shared.index.as_deref(),
+            session: None,
+            cost: shared.cost(&model),
+            max_age: shared.config.load.max_age,
             explain: sampled.is_some(),
         };
         let started = std::time::Instant::now();

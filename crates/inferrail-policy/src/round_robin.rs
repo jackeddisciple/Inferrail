@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use inferrail_core::config::PolicyKind;
 
-use crate::{RouteContext, RoutingPolicy};
+use crate::{Choice, Explanation, RouteContext, RoutingPolicy};
 
 #[derive(Debug, Default)]
 pub struct RoundRobin {
@@ -22,9 +22,15 @@ impl RoutingPolicy for RoundRobin {
         PolicyKind::RoundRobin
     }
 
-    fn choose(&self, ctx: &RouteContext<'_>) -> Option<usize> {
+    fn choose(&self, ctx: &RouteContext<'_>) -> Option<Choice> {
         let len = ctx.candidates.len();
-        (len > 0).then(|| self.next.fetch_add(1, Ordering::Relaxed) % len)
+        (len > 0).then(|| Choice::new(self.next.fetch_add(1, Ordering::Relaxed) % len))
+    }
+
+    fn explain(&self, ctx: &RouteContext<'_>) -> Explanation {
+        let len = ctx.candidates.len();
+        let next = (len > 0).then(|| self.next.load(Ordering::Relaxed) % len);
+        Explanation::plain("the next replica in turn", next, len)
     }
 }
 
@@ -85,12 +91,20 @@ mod tests {
     #[test]
     fn empty_set_gives_none() {
         let pool = Pool::new(0);
-        let ctx = RouteContext {
-            model: &pool.model,
-            prompt_tokens: None,
-            candidates: &[],
-        };
+        let ctx = RouteContext::new(&pool.model, &[]);
         assert_eq!(RoundRobin::default().choose(&ctx), None);
         assert_eq!(RoundRobin::default().kind(), PolicyKind::RoundRobin);
+    }
+
+    #[test]
+    fn explain_names_the_next_replica_without_taking_it() {
+        let pool = Pool::new(3);
+        let candidates = pool.candidates(&[]);
+        let ctx = RouteContext::new(&pool.model, &candidates);
+        let policy = RoundRobin::new(4);
+        assert_eq!(policy.explain(&ctx).winner, Some(1));
+        assert_eq!(policy.explain(&ctx).winner, Some(1));
+        assert_eq!(pool.pick(&policy, &candidates), 1);
+        assert_eq!(policy.explain(&ctx).winner, Some(2));
     }
 }

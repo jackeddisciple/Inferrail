@@ -1,6 +1,6 @@
 use inferrail_core::config::PolicyKind;
 
-use crate::{RouteContext, RoutingPolicy, SplitMix};
+use crate::{Choice, Explanation, RouteContext, RoutingPolicy, SplitMix};
 
 /// Power of two choices: sample two distinct candidates, keep the less loaded.
 #[derive(Debug)]
@@ -21,24 +21,34 @@ impl RoutingPolicy for P2c {
         PolicyKind::P2c
     }
 
-    fn choose(&self, ctx: &RouteContext<'_>) -> Option<usize> {
+    fn choose(&self, ctx: &RouteContext<'_>) -> Option<Choice> {
         let candidates = ctx.candidates;
-        match candidates.len() {
-            0 => None,
-            1 => Some(0),
+        let index = match candidates.len() {
+            0 => return None,
+            1 => 0,
             len => {
                 let a = self.rng.below(len);
                 let mut b = self.rng.below(len - 1);
                 if b >= a {
                     b += 1;
                 }
-                Some(if candidates[b].in_flight < candidates[a].in_flight {
+                if candidates[b].in_flight < candidates[a].in_flight {
                     b
                 } else {
                     a
-                })
+                }
             }
-        }
+        };
+        Some(Choice::new(index))
+    }
+
+    fn explain(&self, ctx: &RouteContext<'_>) -> Explanation {
+        let len = ctx.candidates.len();
+        Explanation::plain(
+            "the less loaded of two at random",
+            (len == 1).then_some(0),
+            len,
+        )
     }
 }
 

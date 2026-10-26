@@ -14,7 +14,7 @@ use inferrail_core::config::{Config, ConfigIssues};
 use inferrail_core::ids::ModelId;
 use inferrail_index::KvIndex;
 use inferrail_load::{CollectorConfig, run_collector};
-use inferrail_policy::RoutingPolicy;
+use inferrail_policy::{CostModel, RoutingPolicy, Settings};
 use tokio::net::TcpListener;
 use tokio::task::JoinSet;
 
@@ -65,6 +65,7 @@ pub(crate) struct Shared {
     registry: Arc<Registry>,
     names: HashMap<String, ModelId>,
     policies: HashMap<ModelId, Box<dyn RoutingPolicy>>,
+    costs: HashMap<ModelId, CostModel>,
     client: upstream::Client,
     ids: request_id::RequestIds,
     clock: Clock,
@@ -84,6 +85,10 @@ impl Shared {
             .get(model)
             .map(Box::as_ref)
             .ok_or_else(|| errors::GatewayError::unknown_model(model.as_str()))
+    }
+
+    fn cost(&self, model: &ModelId) -> CostModel {
+        self.costs.get(model).copied().unwrap_or_default()
     }
 }
 
@@ -154,6 +159,7 @@ impl Gateway {
             .unwrap_or_else(|| RandomState::new().hash_one("inferrail routing"));
         let mut names = HashMap::new();
         let mut policies = HashMap::new();
+        let mut costs = HashMap::new();
         for model in &config.models {
             names.insert(model.name.as_str().to_owned(), model.name.clone());
             for alias in &model.aliases {
@@ -168,10 +174,9 @@ impl Gateway {
                 );
             }
             let model_seed = inferrail_policy::mix_seed(seed, model.name.as_str());
-            policies.insert(
-                model.name.clone(),
-                inferrail_policy::build(kind, model_seed),
-            );
+            let settings = Settings::new(&config, model, model_seed);
+            policies.insert(model.name.clone(), inferrail_policy::build(kind, &settings));
+            costs.insert(model.name.clone(), settings.cost);
         }
         let registry = Arc::new(Registry::new(ReplicaSpec::statics(&config)));
         let clock = Clock::default();
@@ -221,6 +226,7 @@ impl Gateway {
             ejecting: Mutex::new(()),
             names,
             policies,
+            costs,
             prompts,
             index,
             config,

@@ -1259,6 +1259,7 @@ dependencies = [
  "criterion",
  "inferrail-core",
  "proptest",
+ "serde",
 ]
 
 [[package]]
