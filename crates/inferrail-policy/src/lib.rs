@@ -17,6 +17,7 @@ mod prefix_hash;
 mod random;
 mod rng;
 mod round_robin;
+mod sketch;
 
 pub use cost::{CostModel, Estimate, Hits, Term};
 pub use cost_model::CostModelPolicy;

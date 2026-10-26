@@ -1,24 +1,37 @@
+use std::cmp::Reverse;
+
 use inferrail_core::config::PolicyKind;
 
 use crate::cost::{CostModel, Estimate, Hits};
 use crate::guards::{load_cap, under_pressure, within_load};
+use crate::hashing::{prefix_key, weight};
+use crate::sketch::Sketch;
 use crate::{
-    Choice, Exclusion, Explanation, Guarded, RouteContext, RoutingPolicy, Scored, Settings,
-    SplitMix, pick_among,
+    Choice, Exclusion, Explanation, Guarded, HotPrefix, RouteContext, RoutingPolicy, Scored,
+    Settings, SplitMix, Steer, pick_among,
 };
 
 const RULE: &str = "the lowest estimated time to first token within the load guards";
 
+#[derive(Debug)]
+struct Hot {
+    blocks: u32,
+    utilization: f64,
+    sketch: Sketch,
+}
+
 /// Inferrail's policy: the replica with the lowest estimated time to first
 /// token, `W + P + X`, among those the load guards allow. Bounded load
-/// skips replicas past their share of requests in flight, and KV pressure
-/// keeps long prompts off replicas whose cache is nearly full.
+/// skips replicas past their share of requests in flight, KV pressure keeps
+/// long prompts off replicas whose cache is nearly full, and a hot root
+/// prefix is spread over just enough owners.
 #[derive(Debug)]
 pub struct CostModelPolicy {
     cost: CostModel,
     epsilon: f64,
     kappa: f64,
     short_prompt_tokens: u32,
+    hot: Option<Hot>,
     rng: SplitMix,
 }
 
@@ -27,6 +40,8 @@ struct Plan {
     estimates: Vec<Estimate>,
     excluded: Vec<Option<Exclusion>>,
     guarded: Guarded,
+    hot: Option<HotPrefix>,
+    owner: Vec<bool>,
 }
 
 impl Plan {
@@ -46,12 +61,18 @@ impl CostModelPolicy {
             epsilon: settings.epsilon,
             kappa: settings.kappa,
             short_prompt_tokens: settings.short_prompt_tokens,
+            hot: settings.hot_prefix.as_ref().map(|hot| Hot {
+                blocks: hot.blocks,
+                utilization: hot.utilization,
+                sketch: Sketch::new(hot.window),
+            }),
             rng: SplitMix::new(settings.seed),
         }
     }
 
-    /// Estimates every candidate and applies the guards.
-    fn plan(&self, ctx: &RouteContext<'_>) -> Plan {
+    /// Estimates every candidate and applies the guards. With `observe`,
+    /// the request's prefill work counts toward its root prefix's demand.
+    fn plan(&self, ctx: &RouteContext<'_>, observe: bool) -> Plan {
         let candidates = ctx.candidates;
         let n = candidates.len();
         let prompt = ctx.prompt_tokens;
@@ -84,10 +105,56 @@ impl CostModelPolicy {
             }
             guarded.kv_pressure = pressured.len() as u32;
         }
-        Plan {
+        let mut plan = Plan {
             estimates,
             excluded,
             guarded,
+            hot: None,
+            owner: vec![false; n],
+        };
+        self.spread_hot_prefix(ctx, &mut plan, observe);
+        plan
+    }
+
+    /// A root prefix that needs more than `utilization` of one replica's
+    /// prefill gets `ceil(demand / utilization)` owners: the candidates
+    /// holding most of it, then those its key hashes to. Every owner is
+    /// priced as if it held what the best of them holds, so the cost model
+    /// shares the prefix among them by their queues; the first request an
+    /// owner takes warms it.
+    fn spread_hot_prefix(&self, ctx: &RouteContext<'_>, plan: &mut Plan, observe: bool) {
+        let Some(hot) = &self.hot else { return };
+        let Some(root) = prefix_key(ctx.blocks, hot.blocks) else {
+            return;
+        };
+        let candidates = ctx.candidates;
+        let n = candidates.len();
+        if observe {
+            let work = plan
+                .estimates
+                .iter()
+                .map(|e| e.prefill_secs + e.tier_secs)
+                .fold(f64::INFINITY, f64::min);
+            hot.sketch.add(root, micros(work), ctx.now);
+        }
+        let demand = hot.sketch.rate(root, ctx.now) / 1e6;
+        let owners = ((demand / hot.utilization).ceil() as usize).clamp(1, n.max(1));
+        plan.hot = Some(HotPrefix { demand, owners });
+        if owners < 2 {
+            return;
+        }
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by_key(|&i| {
+            let c = &candidates[i];
+            Reverse((c.cached_tokens, weight(root, c.id)))
+        });
+        let warm = candidates[order[0]].cached_tokens;
+        for &i in &order[..owners] {
+            plan.owner[i] = true;
+            let warmed = Hits::gpu(warm.max(candidates[i].cached_tokens));
+            plan.estimates[i] = self
+                .cost
+                .estimate(ctx.prompt_tokens, &candidates[i], warmed);
         }
     }
 
@@ -113,6 +180,14 @@ impl CostModelPolicy {
     }
 }
 
+fn micros(secs: f64) -> u64 {
+    if secs.is_finite() && secs > 0.0 {
+        (secs * 1e6).round() as u64
+    } else {
+        0
+    }
+}
+
 impl RoutingPolicy for CostModelPolicy {
     fn kind(&self) -> PolicyKind {
         PolicyKind::CostModel
@@ -122,12 +197,13 @@ impl RoutingPolicy for CostModelPolicy {
         if ctx.candidates.is_empty() {
             return None;
         }
-        let plan = self.plan(ctx);
+        let plan = self.plan(ctx, true);
         let best = Self::cheapest(ctx, &plan);
         let index = pick_among(&self.rng, ctx.candidates.len(), best)?;
+        let steer = plan.owner[index].then_some(Steer::HotPrefix);
         Some(Choice {
             index,
-            steer: None,
+            steer,
             guarded: plan.guarded,
             estimate: Some(plan.estimates[index]),
         })
@@ -138,13 +214,13 @@ impl RoutingPolicy for CostModelPolicy {
         if n == 0 {
             return Explanation::plain(RULE, None, 0);
         }
-        let plan = self.plan(ctx);
+        let plan = self.plan(ctx, false);
         let candidates = (0..n)
             .map(|i| Scored {
                 excluded: plan.excluded[i],
                 score: None,
                 estimate: Some(plan.estimates[i]),
-                owner: false,
+                owner: plan.owner[i],
             })
             .collect();
         let best = Self::cheapest(ctx, &plan);
@@ -157,13 +233,14 @@ impl RoutingPolicy for CostModelPolicy {
             (plan.ttft(runner_up) > plan.ttft(w))
                 .then(|| plan.estimates[w].ahead_of(&plan.estimates[runner_up]))
         });
+        let steer = winner.filter(|&w| plan.owner[w]).map(|_| Steer::HotPrefix);
         Explanation {
             rule: RULE,
             winner,
             decided_by,
-            steer: None,
+            steer,
             guarded: plan.guarded,
-            hot_prefix: None,
+            hot_prefix: plan.hot,
             candidates,
         }
     }
@@ -171,9 +248,12 @@ impl RoutingPolicy for CostModelPolicy {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use crate::testing::{Pool, chain};
     use crate::{Candidate, Term};
+    use inferrail_core::config::HotPrefixConfig;
     use inferrail_core::ids::{BlockHash, ReplicaId};
     use proptest::prelude::*;
 
@@ -280,6 +360,115 @@ mod tests {
         assert_eq!((explained.winner, explained.decided_by), (None, None));
     }
 
+    fn hot_settings(window: Duration) -> Settings {
+        Settings {
+            hot_prefix: Some(HotPrefixConfig {
+                enabled: true,
+                blocks: 4,
+                utilization: 0.5,
+                window,
+            }),
+            ..Settings::seeded(1)
+        }
+    }
+
+    /// Routes `count` requests for one prompt every `interval` ns through a
+    /// fleet whose queues drain in real time and whose replicas hold the
+    /// prompt's prefix once they served it; returns each choice.
+    fn serve_one_prefix(
+        policy: &CostModelPolicy,
+        pool: &Pool,
+        count: u64,
+        interval: u64,
+        prompt: &[BlockHash],
+    ) -> Vec<Choice> {
+        let cost = CostModel::default();
+        let n = pool.ids.len();
+        let (tokens, held) = (prompt.len() as u32 * 16 + 6, prompt.len() as u32 * 16);
+        let mut busy_until = vec![0u64; n];
+        let mut cached = vec![0u32; n];
+        (0..count)
+            .map(|i| {
+                let now = i * interval;
+                let candidates: Vec<Candidate<'_>> = pool
+                    .ids
+                    .iter()
+                    .enumerate()
+                    .map(|(r, id)| Candidate {
+                        cached_tokens: cached[r],
+                        queued_secs: busy_until[r].saturating_sub(now) as f64 / 1e9,
+                        ..Candidate::new(id, 0)
+                    })
+                    .collect();
+                let ctx = RouteContext {
+                    now,
+                    ..context(pool, &candidates, tokens, prompt)
+                };
+                let choice = policy.choose(&ctx).unwrap();
+                let r = choice.index;
+                let work = cost.prefill_secs(tokens - cached[r], cached[r]);
+                busy_until[r] = busy_until[r].max(now) + (work * 1e9) as u64;
+                cached[r] = held;
+                choice
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_hot_prefix_spreads_over_just_enough_owners_without_losing_hits() {
+        let pool = Pool::new(6);
+        let prompt = chain(1, 64);
+        let hot = CostModelPolicy::new(&hot_settings(Duration::from_secs(2)));
+        let choices = serve_one_prefix(&hot, &pool, 2_000, 10_000_000, &prompt);
+        let late = &choices[1_000..];
+        let mut share = [0u64; 6];
+        for choice in late {
+            share[choice.index] += 1;
+        }
+        let used: Vec<usize> = (0..6).filter(|&r| share[r] > 0).collect();
+        let work = CostModel::default().prefill_secs(6, 1_024);
+        let owners = (work * 100.0 / 0.5).ceil() as usize;
+        assert_eq!(owners, 2);
+        assert_eq!(used.len(), owners, "{share:?}");
+        assert!(used.iter().all(|&r| share[r] > 300), "{share:?}");
+        assert!(late.iter().all(|c| c.steer == Some(Steer::HotPrefix)));
+        let first_visits = choices
+            .iter()
+            .enumerate()
+            .filter(|(i, c)| choices[..*i].iter().all(|p| p.index != c.index))
+            .count();
+        assert_eq!(
+            first_visits, owners,
+            "only a new owner computes the prefix again"
+        );
+
+        let plain = CostModelPolicy::new(&settings());
+        let choices = serve_one_prefix(&plain, &pool, 2_000, 10_000_000, &prompt);
+        let spot = choices[0].index;
+        assert!(
+            choices.iter().all(|c| c.index == spot),
+            "one replica takes it all"
+        );
+    }
+
+    #[test]
+    fn a_cold_prefix_keeps_a_single_owner() {
+        let pool = Pool::new(4);
+        let prompt = chain(5, 64);
+        let policy = CostModelPolicy::new(&hot_settings(Duration::from_secs(2)));
+        let choices = serve_one_prefix(&policy, &pool, 300, 100_000_000, &prompt);
+        assert!(choices.iter().all(|c| c.index == choices[0].index));
+        assert!(choices.iter().all(|c| c.steer.is_none()));
+        let candidates = fleet(&pool.ids, &[(0, 1_024, 0.0, None); 4]);
+        let explained = policy.explain(&RouteContext {
+            now: 300 * 100_000_000,
+            ..context(&pool, &candidates, 1_030, &prompt)
+        });
+        let hot = explained.hot_prefix.unwrap();
+        assert_eq!(hot.owners, 1, "{hot:?}");
+        assert!(explained.candidates.iter().all(|s| !s.owner));
+    }
+
     #[test]
     fn a_winner_is_explained_by_its_biggest_lead() {
         let pool = Pool::new(2);
@@ -338,7 +527,7 @@ mod tests {
             let policy = CostModelPolicy::new(&Settings {
                 epsilon,
                 seed,
-                ..Settings::seeded(seed)
+                ..hot_settings(Duration::from_millis(100))
             });
             let prefixes: Vec<Vec<BlockHash>> = (0..4).map(|p| chain(p, 8)).collect();
             let mut loads = vec![0u32; n];
