@@ -1031,6 +1031,7 @@ dependencies = [
  "criterion",
  "futures",
  "inferrail-core",
+ "inferrail-tokenize",
  "proptest",
  "reqwest",
  "serde",
@@ -1046,6 +1047,13 @@ dependencies = [
 [[package]]
 name = "inferrail-tokenize"
 version = "0.1.5"
+dependencies = [
+ "inferrail-core",
+ "proptest",
+ "serde_json",
+ "thiserror",
+ "xxhash-rust",
+]
 
 [[package]]
 name = "insta"

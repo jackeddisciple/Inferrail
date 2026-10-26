@@ -5,4 +5,5 @@ pub mod engine;
 pub mod latency;
 pub mod metrics;
 pub mod server;
-pub mod tokenizer;
+
+pub use inferrail_tokenize::sim as tokenizer;

@@ -1,4 +1,6 @@
-//! A deterministic stand in for a real tokenizer and chat template.
+//! The simulator's deterministic stand in for a real tokenizer and chat
+//! template, shared so a gateway in front of simulators tokenizes exactly as
+//! they do.
 //!
 //! Token boundaries depend only on the text to their left, so a shared text
 //! prefix always yields a shared token prefix, which is what prefix caching

@@ -1,11 +1,13 @@
 //! Chat templates, tokenization and chained block hashing.
+//!
+//! The router must compute the same token ids the engine computes, or no
+//! block hash ever matches. For Hugging Face models that means rendering
+//! chat requests exactly as vLLM v0.31.0 does with transformers 5.17 and
+//! tokenizing the result with the same pipeline.
 
-pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
+mod error;
+pub mod sim;
+mod source;
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn crate_name_matches_package() {
-        assert_eq!(super::CRATE_NAME, "inferrail-tokenize");
-    }
-}
+pub use error::TokenizeError;
+pub use source::{SIM, Source, resolve};
