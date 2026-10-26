@@ -1292,6 +1292,7 @@ dependencies = [
  "criterion",
  "daachorse",
  "flate2",
+ "indexmap",
  "inferrail-core",
  "jiff",
  "minijinja",

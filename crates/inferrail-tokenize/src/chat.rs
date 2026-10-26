@@ -7,8 +7,10 @@ use std::sync::Arc;
 
 use minijinja::value::{Enumerator, Object, ObjectRepr, Value, ValueKind};
 use serde::Deserialize;
+use serde_json::value::RawValue;
 
 use crate::TokenizeError;
+use crate::json::{self, Failure};
 use crate::template::{ChatTemplate, ContentFormat};
 
 /// A map that keeps insertion order, as Python dicts do.
@@ -76,23 +78,26 @@ impl Object for Dict {
     }
 }
 
+/// Fields a template sees are kept raw and read with [`json::loads`], so
+/// their numbers are what Python makes of them.
 #[derive(Deserialize)]
-struct Body {
-    messages: Vec<Value>,
-    #[serde(default)]
-    tools: Option<Vec<Value>>,
+struct Body<'a> {
+    #[serde(borrow)]
+    messages: &'a RawValue,
+    #[serde(default, borrow)]
+    tools: Option<&'a RawValue>,
     #[serde(default)]
     add_generation_prompt: Option<bool>,
     #[serde(default)]
     continue_final_message: Option<bool>,
     #[serde(default)]
     add_special_tokens: Option<bool>,
-    #[serde(default)]
-    documents: Option<Value>,
+    #[serde(default, borrow)]
+    documents: Option<&'a RawValue>,
     #[serde(default)]
     chat_template: Option<Value>,
-    #[serde(default)]
-    chat_template_kwargs: Option<Value>,
+    #[serde(default, borrow)]
+    chat_template_kwargs: Option<&'a RawValue>,
     #[serde(default)]
     reasoning_effort: Option<Value>,
     #[serde(default)]
@@ -172,10 +177,35 @@ pub(crate) fn strip_bom(body: &[u8]) -> &[u8] {
     body.strip_prefix(b"\xef\xbb\xbf").unwrap_or(body)
 }
 
+fn read(raw: &RawValue) -> Result<Value, TokenizeError> {
+    json::loads(raw.get()).map_err(unreadable)
+}
+
+fn unreadable(failure: Failure) -> TokenizeError {
+    match failure {
+        Failure::Malformed => invalid("the request is not valid JSON"),
+        Failure::Unsupported => TokenizeError::Unsupported(
+            "JSON holding integers wider than 128 bits, lone surrogates or deep nesting",
+        ),
+    }
+}
+
+fn read_list(raw: &RawValue, what: &str) -> Result<Vec<Value>, TokenizeError> {
+    let value = read(raw)?;
+    if value.kind() != ValueKind::Seq {
+        return Err(invalid(format!("{what} must be a list")));
+    }
+    value
+        .try_iter()
+        .map(Iterator::collect)
+        .map_err(|e| invalid(e.to_string()))
+}
+
 impl Chat {
     pub(crate) fn parse(body: &[u8], defaults: &[(String, Value)]) -> Result<Self, TokenizeError> {
-        let body: Body = serde_json::from_slice(strip_bom(body))
+        let body: Body<'_> = serde_json::from_slice(strip_bom(body))
             .map_err(|e| invalid(format!("cannot read the request: {e}")))?;
+        let messages = read_list(body.messages, "messages")?;
         if body.chat_template.is_some() {
             return Err(TokenizeError::Unsupported("a chat template in the request"));
         }
@@ -189,19 +219,21 @@ impl Chat {
                 "continue_final_message needs add_generation_prompt to be false",
             ));
         }
-        if body.messages.is_empty() {
+        if messages.is_empty() {
             return Err(invalid("messages must not be empty"));
         }
-        let tools = match body.tools {
+        let tools = match body.tools.map(read).transpose()?.filter(|t| !t.is_none()) {
             None => None,
-            Some(tools) => Some(
+            Some(tools) if tools.kind() == ValueKind::Seq => Some(
                 tools
-                    .iter()
-                    .map(dump_tool)
+                    .try_iter()
+                    .map_err(|e| invalid(e.to_string()))?
+                    .map(|tool| dump_tool(&tool))
                     .collect::<Result<Vec<Value>, _>>()?
                     .into_iter()
                     .collect::<Value>(),
             ),
+            Some(_) => return Err(invalid("tools must be a list")),
         };
         let reasoning = match body.reasoning_effort.filter(|v| !v.is_none()) {
             None => None,
@@ -210,7 +242,12 @@ impl Chat {
                 _ => return Err(invalid("unknown reasoning_effort")),
             },
         };
-        let user = match body.chat_template_kwargs.filter(|v| !v.is_none()) {
+        let user = match body
+            .chat_template_kwargs
+            .map(read)
+            .transpose()?
+            .filter(|v| !v.is_none())
+        {
             None => Dict::default(),
             Some(v) if v.kind() == ValueKind::Map => Dict::from_map(&v),
             Some(_) => return Err(invalid("chat_template_kwargs must be an object")),
@@ -218,7 +255,13 @@ impl Chat {
         let mut extra = Dict::default();
         extra.insert("add_generation_prompt", Value::from(add_generation_prompt));
         extra.insert("continue_final_message", Value::from(continue_final));
-        extra.insert("documents", body.documents.unwrap_or_default_none());
+        extra.insert(
+            "documents",
+            body.documents
+                .map(read)
+                .transpose()?
+                .unwrap_or_default_none(),
+        );
         extra.insert(
             "reasoning_effort",
             reasoning.clone().unwrap_or_default_none(),
@@ -252,7 +295,7 @@ impl Chat {
         kwargs.remove("tokenize");
         kwargs.remove("chat_template");
         Ok(Self {
-            messages: body.messages,
+            messages,
             tools,
             kwargs,
             add_special_tokens: body.add_special_tokens.unwrap_or(false),
@@ -643,8 +686,9 @@ fn postprocess(conversation: &mut [Dict]) -> Result<(), TokenizeError> {
                 None => Value::from_object(Dict::default()),
                 Some(args) if args.kind() == ValueKind::Map => args,
                 Some(args) => match args.as_str() {
-                    Some(text) => match serde_json::from_str::<Value>(text) {
+                    Some(text) => match json::loads(text) {
                         Ok(parsed) if parsed.kind() == ValueKind::Map => parsed,
+                        Err(Failure::Unsupported) => return Err(unreadable(Failure::Unsupported)),
                         _ => Value::from_object(Dict::default()),
                     },
                     None => Value::from_object(Dict::default()),
@@ -820,6 +864,33 @@ mod tests {
             r#"{"messages": [{"role": "assistant", "content": "x", "tool_calls": []}]}"#,
         );
         assert_eq!(out, "False");
+    }
+
+    /// The expected text is what transformers renders, numbers parsed by
+    /// Python's `json.loads`.
+    #[test]
+    fn numbers_render_as_python_reads_them() {
+        let source = "{{ messages[0].tool_calls[0].function.arguments|tojson }}|{{ tools[0].function.parameters|tojson }}|{{ custom }}";
+        let out = render(
+            source,
+            r#"{"messages": [{"role": "assistant", "tool_calls": [{"id": "c", "type": "function", "function": {"name": "f",
+                "arguments": "{\"a\": -0, \"b\": 123456789012345678901234567890, \"c\": 1e400, \"d\": NaN}"}}]}],
+              "tools": [{"type": "function", "function": {"name": "f", "parameters": {"maximum": 99999999999999999999999, "minimum": -0, "step": 1E2}}}],
+              "chat_template_kwargs": {"custom": -18446744073709551616}}"#,
+        );
+        assert_eq!(
+            out,
+            r#"{"a": 0, "b": 123456789012345678901234567890, "c": Infinity, "d": NaN}|{"maximum": 99999999999999999999999, "minimum": 0, "step": 100.0}|-18446744073709551616"#
+        );
+        let template = ChatTemplate::compile(source, &Clock::default()).unwrap();
+        let wide = format!(
+            r#"{{"messages": [{{"role": "assistant", "tool_calls": [{{"type": "function", "function": {{"name": "f", "arguments": "{{\"a\": 1{}}}"}}}}]}}]}}"#,
+            "0".repeat(40)
+        );
+        assert!(matches!(
+            chat(&wide).render(&template, None, &[]),
+            Err(TokenizeError::Unsupported(_))
+        ));
     }
 
     #[test]

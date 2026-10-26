@@ -33,6 +33,10 @@ leading spaces tokenize.
     format detection vLLM runs on the template's syntax tree, developer
     role handling, `continue_final_message`, `reasoning_effort` and the
     filtering of template keywords;
+  * what a template sees of the request, tool call arguments included, is
+    read with the rules of Python's `json.loads`: integers keep every
+    digit, `-0` is the integer zero, floats out of range are infinities,
+    and `NaN` and `Infinity` are accepted;
   * tokenizer files are loaded as transformers loads them: generic classes
     as written, and `LlamaTokenizer`, `Qwen2Tokenizer` and `GPT2Tokenizer`
     rebuilt the way their constructors rebuild them. Other classes load as
@@ -71,6 +75,7 @@ leading spaces tokenize.
   With a shared system prompt or an earlier turn already seen, the same
   request takes 0.1 ms.
 * Requests nested deeper than 128 JSON levels are refused by the JSON
-  parser, which Python would accept; they get no prediction.
+  parser, which Python would accept; they get no prediction. Neither do
+  requests holding integers wider than 128 bits or lone surrogates.
 * Supporting another tokenizer class means porting its constructor and
   adding a family to the goldens.

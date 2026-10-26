@@ -9,6 +9,7 @@ mod chat;
 mod error;
 pub mod hash;
 mod hf;
+mod json;
 mod model;
 mod python;
 mod segments;
