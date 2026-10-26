@@ -22,6 +22,9 @@ pub struct Encoded {
     pub tokens: Vec<u32>,
     /// vLLM's per request `cache_salt`, which keeps prefixes apart.
     pub cache_salt: Option<String>,
+    /// Repeated prompt pieces this request found in the tokenization cache,
+    /// and ones it had to tokenize.
+    pub cache: CacheStats,
 }
 
 /// Token ids of repeated prompt pieces kept for reuse, per model.
@@ -162,16 +165,24 @@ impl HfModel {
         chat.render(template, self.format, &self.files.special)
     }
 
-    fn tokens(&self, text: &str, special: bool) -> Result<Vec<u32>, TokenizeError> {
-        self.segments.encode(&self.files.tokenizer, text, special)
+    fn tokens(
+        &self,
+        text: &str,
+        special: bool,
+        cache: &mut CacheStats,
+    ) -> Result<Vec<u32>, TokenizeError> {
+        self.segments
+            .encode(&self.files.tokenizer, text, special, cache)
     }
 
     fn encode_chat(&self, body: &[u8]) -> Result<Encoded, TokenizeError> {
         let chat = Chat::parse(body, &self.defaults)?;
         let text = self.render(&chat)?;
+        let mut cache = CacheStats::default();
         Ok(Encoded {
-            tokens: self.tokens(&text, chat.add_special_tokens)?,
+            tokens: self.tokens(&text, chat.add_special_tokens, &mut cache)?,
             cache_salt: chat.cache_salt,
+            cache,
         })
     }
 
@@ -187,13 +198,15 @@ impl HfModel {
             })
             .transpose()?
             .unwrap_or(true);
+        let mut cache = CacheStats::default();
         let tokens = match single_prompt(&request)? {
-            PromptRef::Text(text) => self.tokens(text, special)?,
+            PromptRef::Text(text) => self.tokens(text, special, &mut cache)?,
             PromptRef::Tokens(tokens) => tokens.to_vec(),
         };
         Ok(Encoded {
             tokens,
             cache_salt: cache_salt(&request.extra)?,
+            cache,
         })
     }
 }
@@ -245,6 +258,7 @@ fn sim_chat(body: &[u8]) -> Result<Encoded, TokenizeError> {
             add_generation_prompt,
         ),
         cache_salt: None,
+        cache: CacheStats::default(),
     })
 }
 
@@ -257,6 +271,7 @@ fn sim_completion(body: &[u8]) -> Result<Encoded, TokenizeError> {
     Ok(Encoded {
         tokens,
         cache_salt: None,
+        cache: CacheStats::default(),
     })
 }
 

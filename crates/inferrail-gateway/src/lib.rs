@@ -185,14 +185,11 @@ impl Gateway {
                 .map(|m| (m.name.clone(), config.policy_for(m)))
                 .collect(),
             index: index.clone(),
-            tokenizers: config
+            tokenized: config
                 .models
                 .iter()
-                .filter_map(|m| {
-                    tokenizers
-                        .get(&m.name)
-                        .map(|t| (m.name.clone(), Arc::clone(t)))
-                })
+                .filter(|m| tokenizers.contains_key(&m.name))
+                .map(|m| m.name.clone())
                 .collect(),
         }));
         let log = &config.observability.decision_log;

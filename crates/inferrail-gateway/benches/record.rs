@@ -27,7 +27,7 @@ fn bench(c: &mut Criterion) {
         max_age: Duration::from_millis(250),
         policies: Vec::new(),
         index: None,
-        tokenizers: Vec::new(),
+        tokenized: Vec::new(),
     });
     let routed: Vec<Routed> = fleet
         .load()

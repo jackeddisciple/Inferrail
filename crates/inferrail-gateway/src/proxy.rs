@@ -390,6 +390,7 @@ async fn prepare_prompt(
     match outcome {
         Ok(prompt) => {
             shared.metrics.tokenized(model, "ok", took);
+            shared.metrics.looked_up(model, prompt.cache);
             Some(prompt)
         }
         Err(Skip::Unconfigured) => None,

@@ -12,7 +12,7 @@ use inferrail_control::{Clock, Registry};
 use inferrail_core::config::PolicyKind;
 use inferrail_core::ids::{ModelId, ReplicaId};
 use inferrail_index::KvIndex;
-use inferrail_tokenize::ModelTokenizer;
+use inferrail_tokenize::CacheStats;
 use prometheus_client::collector::Collector;
 use prometheus_client::encoding::{
     DescriptorEncoder, EncodeLabelSet, EncodeLabelValue, EncodeMetric, LabelValueEncoder,
@@ -172,6 +172,7 @@ pub struct Metrics {
     decision_log: (Counter, Counter),
     tokenize: Family<TokenizeLabels, Counter>,
     tokenize_time: Histograms<ModelLabels>,
+    tokenize_cache: Family<TokenizeLabels, Counter>,
     prompt_tokens: Family<ModelLabels, Counter>,
     predicted_tokens: Family<ModelLabels, Counter>,
     index_resets: Family<ReplicaLabels, Counter>,
@@ -200,6 +201,7 @@ impl Metrics {
             decision_log: (Counter::default(), Counter::default()),
             tokenize: Family::default(),
             tokenize_time: histograms(|| Histogram::new(TOKENIZE_BUCKETS)),
+            tokenize_cache: Family::default(),
             prompt_tokens: Family::default(),
             predicted_tokens: Family::default(),
             index_resets: Family::default(),
@@ -277,6 +279,19 @@ impl Metrics {
             this.tokenize_time.clone(),
         );
         registry.register(
+            "inferrail_tokenize_cache_lookups",
+            "Repeated prompt pieces looked up in a model's tokenization cache, by result.",
+            this.tokenize_cache.clone(),
+        );
+        for model in &fleet.tokenized {
+            for result in ["hit", "miss"] {
+                let _ = this.tokenize_cache.get_or_create(&TokenizeLabels {
+                    model: Text::Model(model.clone()),
+                    result: Text::Fixed(result),
+                });
+            }
+        }
+        registry.register(
             "inferrail_prompt_tokens",
             "Prompt tokens of tokenized requests, counted at every routing decision.",
             this.prompt_tokens.clone(),
@@ -351,6 +366,20 @@ impl Metrics {
                 model: Text::Model(model.clone()),
             })
             .observe(took.as_secs_f64());
+    }
+
+    /// Counts one request's lookups in its model's tokenization cache.
+    pub fn looked_up(&self, model: &ModelId, cache: CacheStats) {
+        for (result, count) in [("hit", cache.hits), ("miss", cache.misses)] {
+            if count > 0 {
+                self.tokenize_cache
+                    .get_or_create(&TokenizeLabels {
+                        model: Text::Model(model.clone()),
+                        result: Text::Fixed(result),
+                    })
+                    .inc_by(count);
+            }
+        }
     }
 
     pub(crate) fn predicted(&self, model: &ModelId, prediction: Prediction) {
@@ -566,7 +595,8 @@ pub struct FleetGauges {
     pub max_age: Duration,
     pub policies: Vec<(ModelId, PolicyKind)>,
     pub index: Option<Arc<KvIndex>>,
-    pub tokenizers: Vec<(ModelId, Arc<ModelTokenizer>)>,
+    /// Models whose tokenizer loaded; their cache lookups count from zero.
+    pub tokenized: Vec<ModelId>,
 }
 
 struct Row {
@@ -689,7 +719,6 @@ impl Collector for FleetGauges {
             }
         }
         self.encode_index(&mut encoder, &rows)?;
-        self.encode_tokenizers(&mut encoder)?;
         let mut info = encoder.encode_descriptor(
             "inferrail_model_policy",
             "1 for the routing policy each model uses.",
@@ -763,29 +792,6 @@ impl FleetGauges {
         }
         Ok(())
     }
-
-    fn encode_tokenizers(&self, encoder: &mut DescriptorEncoder<'_>) -> fmt::Result {
-        if self.tokenizers.is_empty() {
-            return Ok(());
-        }
-        let mut metric = encoder.encode_descriptor(
-            "inferrail_tokenize_cache_lookups",
-            "Repeated prompt pieces looked up in a model's tokenization cache, by result.",
-            None,
-            MetricType::Counter,
-        )?;
-        for (model, tokenizer) in &self.tokenizers {
-            let stats = tokenizer.cache_stats();
-            for (result, count) in [("hit", stats.hits), ("miss", stats.misses)] {
-                let labels = [
-                    ("model", Text::Model(model.clone())),
-                    ("result", Text::Fixed(result)),
-                ];
-                ConstCounter::new(count).encode(metric.encode_family(&labels)?)?;
-            }
-        }
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -812,8 +818,36 @@ mod tests {
             max_age: Duration::from_millis(250),
             policies: vec![(ModelId::new("m").unwrap(), PolicyKind::P2c)],
             index: None,
-            tokenizers: Vec::new(),
+            tokenized: Vec::new(),
         })
+    }
+
+    #[test]
+    fn cache_lookups_count_for_the_model_that_made_them() {
+        let fleet = Arc::new(Registry::new(Vec::new()));
+        let (a, b) = (ModelId::new("a").unwrap(), ModelId::new("b").unwrap());
+        let m = Metrics::new(FleetGauges {
+            registry: Arc::clone(&fleet),
+            clock: Clock::default(),
+            max_age: Duration::from_millis(250),
+            policies: Vec::new(),
+            index: None,
+            tokenized: vec![a.clone(), b.clone()],
+        });
+        m.looked_up(&a, CacheStats { hits: 2, misses: 1 });
+        m.looked_up(&a, CacheStats { hits: 3, misses: 0 });
+        let page = m.render();
+        let lookups = |model: &str, result: &str| {
+            value(
+                &page,
+                "inferrail_tokenize_cache_lookups_total",
+                &[("model", model), ("result", result)],
+            )
+        };
+        assert_eq!(lookups("a", "hit"), Some(5.0));
+        assert_eq!(lookups("a", "miss"), Some(1.0));
+        assert_eq!(lookups("b", "hit"), Some(0.0));
+        assert_eq!(lookups("b", "miss"), Some(0.0));
     }
 
     fn routed(replica: &str) -> Routed {
@@ -1061,7 +1095,7 @@ mod tests {
             max_age: Duration::from_millis(250),
             policies: vec![(quoted.clone(), PolicyKind::P2c)],
             index: None,
-            tokenizers: Vec::new(),
+            tokenized: Vec::new(),
         });
         let routed = Routed {
             model: quoted.clone(),

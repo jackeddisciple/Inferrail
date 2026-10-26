@@ -303,6 +303,7 @@ mod tests {
             hashes: (1..=4).map(inferrail_core::ids::BlockHash::new).collect(),
             cacheable: 3,
             block_size: 16,
+            cache: inferrail_tokenize::CacheStats::default(),
         };
         index.record(
             index.slot(&ReplicaId::new("r1").unwrap()),

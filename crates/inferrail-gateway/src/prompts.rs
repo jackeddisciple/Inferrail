@@ -15,7 +15,7 @@ use inferrail_core::config::{Config, ContentFormat as FormatSetting, ModelConfig
 use inferrail_core::ids::{BlockHash, ModelId};
 use inferrail_tokenize::hash::{BlockHasher, Salt, cacheable_blocks};
 use inferrail_tokenize::{
-    ContentFormat, Endpoint, ModelTokenizer, Parity, TokenizeError, TokenizerOptions,
+    CacheStats, ContentFormat, Endpoint, ModelTokenizer, Parity, TokenizeError, TokenizerOptions,
 };
 use tokio::sync::oneshot;
 
@@ -30,6 +30,8 @@ pub(crate) struct Prompt {
     /// the last prompt token itself.
     pub(crate) cacheable: usize,
     pub(crate) block_size: usize,
+    /// How tokenizing it used the model's cache of repeated pieces.
+    pub(crate) cache: CacheStats,
 }
 
 impl Prompt {
@@ -305,6 +307,7 @@ fn encode(
         cacheable: cacheable_blocks(len, block_size).min(hashes.len()),
         hashes,
         block_size,
+        cache: encoded.cache,
     })
 }
 
@@ -419,6 +422,37 @@ mod tests {
         );
         assert!(took < Duration::from_millis(150), "{took:?}");
         assert!(busy.iter().all(Option::is_some));
+    }
+
+    #[tokio::test]
+    async fn cache_lookups_belong_to_the_request_that_made_them() {
+        let dir =
+            std::env::temp_dir().join(format!("inferrail-prompt-cache-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tokenizer = serde_json::json!({
+            "version": "1.0", "truncation": null, "padding": null, "added_tokens": [],
+            "normalizer": null, "pre_tokenizer": {"type": "Whitespace"}, "post_processor": null,
+            "decoder": null,
+            "model": {"type": "WordLevel", "vocab": {"<unk>": 0, "hello": 1, "world": 2}, "unk_token": "<unk>"}
+        });
+        std::fs::write(dir.join("tokenizer.json"), tokenizer.to_string()).unwrap();
+        let prompts = prompts(&format!(
+            "models:\n  - name: a\n    tokenizer: {d}\n  - name: b\n    tokenizer: {d}\nreplicas:\n  - id: r\n    url: http://127.0.0.1:1\n    models: [a, b]\n",
+            d = dir.display()
+        ));
+        let body = Bytes::from(
+            serde_json::json!({"prompt": "hello world ".repeat(40), "add_special_tokens": false})
+                .to_string(),
+        );
+        let mut seen = Vec::new();
+        for model in ["a", "b", "a"] {
+            let model = ModelId::new(model).unwrap();
+            let (prompt, _) = prompts.prepare(&model, Endpoint::Completion, &body).await;
+            let cache = prompt.unwrap().cache;
+            seen.push((cache.hits, cache.misses));
+        }
+        assert_eq!(seen, [(0, 1), (1, 0), (1, 0)]);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

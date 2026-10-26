@@ -151,11 +151,14 @@ impl Segmenter {
         }
     }
 
+    /// Tokenizes `text`, counting this call's cache hits and misses in
+    /// `stats` as well as in the totals.
     pub(crate) fn encode(
         &self,
         tokenizer: &Tokenizer,
         text: &str,
         add_special_tokens: bool,
+        stats: &mut CacheStats,
     ) -> Result<Vec<u32>, TokenizeError> {
         if add_special_tokens || !self.caching() {
             return direct(tokenizer, text, add_special_tokens);
@@ -165,14 +168,14 @@ impl Segmenter {
         if let Some(trie) = &self.trie {
             for found in trie.leftmost_find_iter(text) {
                 if start < found.start() {
-                    self.segment(tokenizer, &text[start..found.start()], &mut out)?;
+                    self.segment(tokenizer, &text[start..found.start()], &mut out, stats)?;
                 }
                 out.push(found.value());
                 start = found.end();
             }
         }
         if start < text.len() {
-            self.segment(tokenizer, &text[start..], &mut out)?;
+            self.segment(tokenizer, &text[start..], &mut out, stats)?;
         }
         Ok(out)
     }
@@ -182,6 +185,7 @@ impl Segmenter {
         tokenizer: &Tokenizer,
         piece: &str,
         out: &mut Vec<u32>,
+        stats: &mut CacheStats,
     ) -> Result<(), TokenizeError> {
         if piece.len() < MIN_CACHED_BYTES {
             out.extend(direct(tokenizer, piece, false)?);
@@ -191,10 +195,12 @@ impl Segmenter {
         let shard = &self.shards[(key >> 124) as usize % SHARDS];
         if let Some(ids) = lookup(shard, key) {
             self.hits.fetch_add(1, Ordering::Relaxed);
+            stats.hits += 1;
             out.extend_from_slice(&ids);
             return Ok(());
         }
         self.misses.fetch_add(1, Ordering::Relaxed);
+        stats.misses += 1;
         let ids: Arc<[u32]> = direct(tokenizer, piece, false)?.into();
         out.extend_from_slice(&ids);
         if ids.len() <= self.budget {
@@ -281,12 +287,25 @@ mod tests {
         let long = "a b ".repeat(100);
         let text = format!("<s>{long}</s>{long}<s>b a</s>");
         let want = direct(&tok, &text, false).unwrap();
-        assert_eq!(segmenter.encode(&tok, &text, false).unwrap(), want);
-        assert_eq!(segmenter.encode(&tok, &text, false).unwrap(), want);
+        let (mut first, mut second) = (CacheStats::default(), CacheStats::default());
+        assert_eq!(
+            segmenter.encode(&tok, &text, false, &mut first).unwrap(),
+            want
+        );
+        assert_eq!(
+            segmenter.encode(&tok, &text, false, &mut second).unwrap(),
+            want
+        );
+        assert_eq!(
+            (first.misses, first.hits, second.misses, second.hits),
+            (1, 1, 0, 2)
+        );
         let stats = segmenter.stats();
         assert_eq!((stats.misses, stats.hits), (1, 3));
         assert_eq!(
-            segmenter.encode(&tok, &text, true).unwrap(),
+            segmenter
+                .encode(&tok, &text, true, &mut CacheStats::default())
+                .unwrap(),
             direct(&tok, &text, true).unwrap()
         );
     }
@@ -298,7 +317,9 @@ mod tests {
         for i in 0..200 {
             let text = format!("{} {}", "a ".repeat(150), "b ".repeat(i % 50 + 1));
             assert_eq!(
-                segmenter.encode(&tok, &text, false).unwrap(),
+                segmenter
+                    .encode(&tok, &text, false, &mut CacheStats::default())
+                    .unwrap(),
                 direct(&tok, &text, false).unwrap()
             );
         }
