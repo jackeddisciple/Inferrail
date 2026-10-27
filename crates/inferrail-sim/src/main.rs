@@ -3,6 +3,7 @@ use std::net::{IpAddr, SocketAddr};
 use anyhow::Context;
 use clap::Parser;
 use inferrail_sim::engine::EngineConfig;
+use inferrail_sim::events::KvEventsConfig;
 use inferrail_sim::latency::LatencyModel;
 use inferrail_sim::server::{Sim, SimConfig};
 use tokio::net::TcpListener;
@@ -43,6 +44,10 @@ struct Args {
     /// Report cached prompt tokens in usage, like vLLM's flag of the same name.
     #[arg(long)]
     enable_prompt_tokens_details: bool,
+    /// Publish KV events over ZeroMQ, as vLLM's flag of the same name: a
+    /// JSON object such as {"enable_kv_cache_events": true}.
+    #[arg(long, value_parser = KvEventsConfig::from_json)]
+    kv_events_config: Option<KvEventsConfig>,
     #[arg(long, default_value_t = 0)]
     seed: u64,
     /// Output length when a request sets no max_tokens; ends with "stop".
@@ -98,6 +103,7 @@ impl Args {
                 enable_prefix_caching: !self.no_enable_prefix_caching,
                 latency,
             },
+            kv_events: self.kv_events_config.clone().unwrap_or_default(),
         }
     }
 }
@@ -145,6 +151,8 @@ async fn main() -> anyhow::Result<()> {
         max_num_batched_tokens = config.engine.max_num_batched_tokens,
         prefix_caching = config.engine.enable_prefix_caching,
         latency = ?config.engine.latency,
+        kv_events = ?sim.kv_events_addr(),
+        kv_replay = ?sim.kv_replay_addr(),
         "inferrail-sim listening"
     );
     sim.serve(listener, shutdown_signal()).await?;
@@ -195,6 +203,8 @@ mod tests {
             "--enable-prompt-tokens-details",
             "--no-enable-prefix-caching",
             "--zero-latency",
+            "--kv-events-config",
+            r#"{"enable_kv_cache_events": true, "endpoint": "tcp://*:7000"}"#,
         ]);
         let config = args.sim_config();
         assert!(config.validate().is_ok());
@@ -202,6 +212,8 @@ mod tests {
         assert_eq!(config.engine.num_gpu_blocks, 99);
         assert_eq!(config.engine.max_num_batched_tokens, 512);
         assert!(!config.engine.enable_prefix_caching);
+        let events = config.kv_events.publisher().expect("events on");
+        assert_eq!(events.endpoint, "tcp://*:7000");
         let on = Args::parse_from([
             "inferrail-sim",
             "--no-enable-prefix-caching",
@@ -221,6 +233,11 @@ mod tests {
             &["inferrail-sim", "--num-gpu-blocks-override", "99"],
             &["inferrail-sim", "--max-num-batched-tokens", "100"],
             &["inferrail-sim", "--decode-seq-us=-1"],
+            &[
+                "inferrail-sim",
+                "--kv-events-config",
+                "{\"enable_kv_cache_events\": true, \"endpoint\": \"ipc:///x\"}",
+            ],
             &["inferrail-sim", "--decode-token-ms=-1"],
             &["inferrail-sim", "--served-model-name", "has space"],
         ] {

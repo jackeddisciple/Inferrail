@@ -9,13 +9,16 @@
 //! Steps are planned on a virtual timeline: each starts when the previous
 //! one ends, so timer overshoot never accumulates into drift. A client that
 //! disconnects withdraws its request at once while it waits, and at the
-//! next step boundary once it runs, as vLLM aborts between steps.
+//! next step boundary once it runs, as vLLM aborts between steps. With a
+//! publisher, every step's stores, evictions and clears go out as one KV
+//! event batch when the step ends, as vLLM publishes them.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use inferrail_events::{BlockRemoved, BlockStored, EventBatch, KvEvent, MEDIUM_GPU, Publisher};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Instant, sleep_until};
 
@@ -181,12 +184,19 @@ pub struct Engine {
 impl Engine {
     /// Starts the scheduler on the current Tokio runtime.
     pub fn start(config: EngineConfig) -> Self {
+        Self::publishing(config, None)
+    }
+
+    /// Starts the scheduler, publishing its KV events when given a publisher.
+    pub fn publishing(config: EngineConfig, publisher: Option<Publisher>) -> Self {
         let shared = Arc::new(Shared {
             config,
             counters: Counters::default(),
         });
         let (messages, rx) = mpsc::unbounded_channel();
-        tokio::spawn(run(Scheduler::new(Arc::clone(&shared)), rx));
+        let mut scheduler = Scheduler::new(Arc::clone(&shared));
+        scheduler.events = publisher.map(|p| (p, Vec::new()));
+        tokio::spawn(run(scheduler, rx));
         Self { shared, messages }
     }
 
@@ -402,6 +412,7 @@ struct Scheduler {
     batch: Vec<Work>,
     hit: Vec<BlockId>,
     evicted: Vec<BlockHash>,
+    events: Option<(Publisher, Vec<KvEvent>)>,
 }
 
 /// How far behind the wall clock planned steps may fall before the
@@ -421,6 +432,7 @@ impl Scheduler {
             batch: Vec::new(),
             hit: Vec::new(),
             evicted: Vec::new(),
+            events: None,
             shared,
         }
     }
@@ -458,6 +470,8 @@ impl Scheduler {
                     request.cached_upto = request.blocks.len();
                 }
                 self.publish_pool();
+                self.note(|| KvEvent::AllBlocksCleared);
+                self.publish_events();
                 let _ = done.send(());
             }
         }
@@ -506,16 +520,68 @@ impl Scheduler {
         tokens.div_ceil(self.config().block_size)
     }
 
+    fn note(&mut self, event: impl FnOnce() -> KvEvent) {
+        if let Some((_, pending)) = &mut self.events {
+            pending.push(event());
+        }
+    }
+
+    /// Turns the hashes the last allocation evicted into events.
+    fn note_evictions(&mut self) {
+        if let Some((_, pending)) = &mut self.events {
+            pending.extend(self.evicted.iter().map(|&hash| {
+                KvEvent::BlockRemoved(BlockRemoved {
+                    block_hashes: vec![hash],
+                    medium: Some(MEDIUM_GPU.to_owned()),
+                    group_idx: Some(0),
+                })
+            }));
+        }
+        self.evicted.clear();
+    }
+
     /// Hashes the request's full blocks up to `tokens` into the pool, as
     /// vLLM caches blocks when it schedules their computation.
     fn cache_upto(&mut self, index: usize, tokens: usize) {
         let block_size = self.config().block_size;
         let request = &mut self.running[index];
         let full = tokens.min(request.len()) / block_size;
-        for i in request.cached_upto..full {
-            self.pool.cache(request.blocks[i], request.hashes[i]);
+        let from = request.cached_upto;
+        let mut stored = false;
+        for i in from..full {
+            stored |= self.pool.cache(request.blocks[i], request.hashes[i]);
         }
-        request.cached_upto = request.cached_upto.max(full);
+        request.cached_upto = from.max(full);
+        if stored && let Some((_, pending)) = &mut self.events {
+            pending.push(KvEvent::BlockStored(BlockStored {
+                block_hashes: request.hashes[from..full].to_vec(),
+                parent_block_hash: from.checked_sub(1).map(|i| request.hashes[i]),
+                token_ids: request.tokens[from * block_size..full * block_size].to_vec(),
+                block_size: u32::try_from(block_size).unwrap_or(u32::MAX),
+                lora_id: None,
+                medium: Some(MEDIUM_GPU.to_owned()),
+                lora_name: None,
+                group_idx: Some(0),
+            }));
+        }
+    }
+
+    /// Sends what this step stored, evicted and cleared as one batch.
+    fn publish_events(&mut self) {
+        let Some((publisher, pending)) = &mut self.events else {
+            return;
+        };
+        if pending.is_empty() {
+            return;
+        }
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0.0, |d| d.as_secs_f64());
+        publisher.publish(&EventBatch {
+            ts,
+            events: std::mem::take(pending),
+            data_parallel_rank: Some(0),
+        });
     }
 
     /// Puts the newest running request back at the front of the queue.
@@ -563,6 +629,7 @@ impl Scheduler {
             let request = &mut self.running[i];
             self.pool
                 .allocate(need, &mut request.blocks, &mut self.evicted);
+            self.note_evictions();
             self.cache_upto(i, context + tokens);
             self.batch.push(Work {
                 index: i,
@@ -576,7 +643,6 @@ impl Scheduler {
         if !preempted {
             self.admit(start, &mut budget);
         }
-        self.evicted.clear();
         self.publish_pool();
         !self.batch.is_empty()
     }
@@ -613,6 +679,7 @@ impl Scheduler {
             request.blocks.extend_from_slice(&self.hit);
             self.pool
                 .allocate(need, &mut request.blocks, &mut self.evicted);
+            self.note_evictions();
             request.computed = context;
             request.cached_upto = self.hit.len();
             if request.first_admission {
@@ -695,6 +762,7 @@ impl Scheduler {
                 .retain(|r| r.status.0.load(Ordering::Acquire) & DONE == 0);
         }
         self.publish_pool();
+        self.publish_events();
     }
 
     fn publish_pool(&self) {

@@ -24,6 +24,7 @@ use tokio::net::TcpListener;
 use xxhash_rust::xxh3::xxh3_128;
 
 use crate::engine::{Engine, EngineConfig, EngineError, Sequence};
+use crate::events::KvEventsConfig;
 use crate::metrics::{self, Metrics};
 use crate::tokenizer;
 use wire::Meta;
@@ -41,6 +42,7 @@ pub struct SimConfig {
     pub enable_prompt_tokens_details: bool,
     pub seed: u64,
     pub engine: EngineConfig,
+    pub kv_events: KvEventsConfig,
 }
 
 impl Default for SimConfig {
@@ -53,6 +55,7 @@ impl Default for SimConfig {
             enable_prompt_tokens_details: false,
             seed: 0,
             engine: EngineConfig::default(),
+            kv_events: KvEventsConfig::default(),
         }
     }
 }
@@ -84,6 +87,12 @@ impl SimConfig {
                 "served model name {bad:?} is not usable"
             )));
         }
+        if let Some(events) = self.kv_events.publisher() {
+            for endpoint in std::iter::once(&events.endpoint).chain(&events.replay_endpoint) {
+                inferrail_events::zmtp::endpoint(endpoint)
+                    .map_err(|e| InvalidConfig(format!("KV events endpoint: {e}")))?;
+            }
+        }
         self.engine.validate().map_err(InvalidConfig)
     }
 
@@ -102,6 +111,7 @@ struct AppState {
     names: Vec<String>,
     engine: Engine,
     metrics: Arc<Metrics>,
+    publisher: Option<inferrail_events::Publisher>,
     started_unix: u64,
     requests: AtomicU64,
 }
@@ -124,7 +134,19 @@ impl Sim {
     /// Starts the engine; must be called inside a Tokio runtime.
     pub fn new(config: SimConfig) -> Result<Self, InvalidConfig> {
         config.validate()?;
-        let engine = Engine::start(config.engine.clone());
+        let publisher = config
+            .kv_events
+            .publisher()
+            .map(|events| {
+                inferrail_events::Publisher::bind(&events).map_err(|e| {
+                    InvalidConfig(format!(
+                        "cannot publish KV events on {}: {e}",
+                        events.endpoint
+                    ))
+                })
+            })
+            .transpose()?;
+        let engine = Engine::publishing(config.engine.clone(), publisher.clone());
         let names = config.served_names();
         let metrics = Arc::new(Metrics::new(
             names[0].clone(),
@@ -136,6 +158,7 @@ impl Sim {
                 names,
                 engine,
                 metrics,
+                publisher,
                 started_unix: unix_now(),
                 requests: AtomicU64::new(0),
                 config,
@@ -153,6 +176,15 @@ impl Sim {
 
     pub fn metrics(&self) -> &Metrics {
         &self.state.metrics
+    }
+
+    /// Where KV events are published, when they are.
+    pub fn kv_events_addr(&self) -> Option<std::net::SocketAddr> {
+        self.state.publisher.as_ref().map(|p| p.local_addr())
+    }
+
+    pub fn kv_replay_addr(&self) -> Option<std::net::SocketAddr> {
+        self.state.publisher.as_ref().and_then(|p| p.replay_addr())
     }
 
     pub fn router(&self) -> Router {

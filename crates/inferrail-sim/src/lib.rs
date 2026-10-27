@@ -2,6 +2,7 @@
 
 pub mod cache;
 pub mod engine;
+pub mod events;
 pub mod latency;
 pub mod metrics;
 pub mod pool;

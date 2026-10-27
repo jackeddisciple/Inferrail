@@ -1296,6 +1296,7 @@ dependencies = [
  "criterion",
  "futures",
  "inferrail-core",
+ "inferrail-events",
  "inferrail-tokenize",
  "proptest",
  "reqwest",
