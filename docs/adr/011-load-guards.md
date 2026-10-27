@@ -48,7 +48,9 @@ estimates say.
   and the conversation follows the new replica. A table of 65,536 slots
   holds a session tag and a replica tag per word, so lookups and updates
   are single atomic operations and a session whose slot was taken over is
-  routed afresh, never to another session's replica.
+  routed afresh. Keys are mixed before they pick a slot, and a lookup
+  checks 48 bits of the mixed key, so a session gets another's replica
+  only when those 48 bits of their keys agree.
 * Every decision reports what the guards set aside and what steered it, in
   `inferrail_routing_guards_total` and `inferrail_routing_steered_total`,
   the decision log and the route span.
