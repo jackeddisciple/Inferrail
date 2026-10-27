@@ -1,8 +1,9 @@
 CARGO ?= cargo
 UV ?= uv
 NEXTEST := $(shell $(CARGO) nextest --version >/dev/null 2>&1 && echo "nextest run" || echo "test")
+JOBS ?= 2
 
-.PHONY: check fmt lint audit test test-rust test-python bench e2e stress goldens baselines routing report stack stack-down
+.PHONY: check fmt lint audit test test-rust test-python bench e2e stress goldens baselines routing sweep report stack stack-down
 
 check: fmt lint test
 
@@ -64,9 +65,15 @@ routing:
 	cd bench && $(UV) run --frozen inferrail-bench compare --workloads w2 \
 		--policies cost_model+sessions --out results/routing
 
+sweep:
+	$(CARGO) build --release -p inferrail-sim -p inferrail-gateway
+	cd bench && $(UV) run --frozen inferrail-bench sweep sweeps/sim.toml --out results/sweep --jobs $(JOBS)
+	cd bench && $(UV) run --frozen inferrail-bench report results/sweep --out report/sweep
+
 report:
 	cd bench && $(UV) run --frozen inferrail-bench plot results/baselines/*/*.json.gz --out report/baselines
 	cd bench && $(UV) run --frozen inferrail-bench plot results/routing/*/*.json.gz --out report/routing
+	cd bench && test ! -d results/sweep || $(UV) run --frozen inferrail-bench report results/sweep --out report/sweep
 
 COMPOSE := docker compose -f deploy/compose/docker-compose.yaml
 

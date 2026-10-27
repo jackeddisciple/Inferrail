@@ -1,12 +1,12 @@
 """A sweep point run twice with the same seed on fresh fleets reproduces its
-numbers within 3%. With most prompts cached, the TTFT median and tail sit
-where hits meet misses, so one request routed differently by a millisecond
-of jitter moves them; the run is held to means, the end to end median and
-what timing cannot change."""
+numbers within 3%, and the report builds from what it wrote. With most
+prompts cached, the TTFT median and tail sit where hits meet misses, so one
+request routed differently by a millisecond of jitter moves them; the run
+is held to means, the end to end median and what timing cannot change."""
 
 import pytest
 
-from inferrail_bench import results, sweep
+from inferrail_bench import report, results, sweep
 
 pytestmark = pytest.mark.e2e
 
@@ -54,3 +54,6 @@ def test_the_same_seed_reproduces_within_three_percent(tmp_path):
         for key in KEYS:
             a, b = value(first, key), value(second, key)
             assert abs(a - b) <= 0.03 * max(abs(a), abs(b), 1e-9), f"{policy} {key}: {a} vs {b}"
+    docs = [d for by in runs for d in by.values()]
+    text = report.build(docs, tmp_path / "report").read_text()
+    assert "## w1: Shared system prompt" in text

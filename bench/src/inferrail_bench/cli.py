@@ -141,6 +141,16 @@ def cmd_run(args: argparse.Namespace) -> int:
     return 0 if summary.get("ok") else 1
 
 
+def cmd_report(args: argparse.Namespace) -> int:
+    from inferrail_bench import report
+
+    paths = sorted(p for root in args.results for p in Path(root).rglob("*.json.gz"))
+    if not paths:
+        raise SystemExit(f"no result files under {', '.join(map(str, args.results))}")
+    print(report.build([results.read(p) for p in paths], args.out, args.title))
+    return 0
+
+
 def cmd_plot(args: argparse.Namespace) -> int:
     docs = [results.read(p) for p in args.results]
     print(plot.report(docs, args.out))
@@ -276,6 +286,12 @@ def parser() -> argparse.ArgumentParser:
     swp.add_argument("--dry-run", action="store_true", help="list the runs and the time needed")
     swp.add_argument("--debug", action="store_true", help="use debug builds")
     swp.set_defaults(handler=cmd_sweep)
+
+    rep = sub.add_parser("report", help="the sweep report from every result file under a directory")
+    rep.add_argument("results", nargs="+", type=Path, help="directories of result files")
+    rep.add_argument("--out", type=Path, required=True)
+    rep.add_argument("--title", default="Simulator sweep")
+    rep.set_defaults(handler=cmd_report)
 
     report = sub.add_parser("plot", help="charts and report.md from result files")
     report.add_argument("results", nargs="+", type=Path)
