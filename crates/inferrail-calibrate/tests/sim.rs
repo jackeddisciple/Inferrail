@@ -4,10 +4,15 @@ use inferrail_sim::server::{Sim, SimConfig};
 use tokio::net::TcpListener;
 
 async fn sim(latency: LatencyModel) -> String {
+    serve(latency, SimConfig::default().engine.num_gpu_blocks).await
+}
+
+async fn serve(latency: LatencyModel, blocks: usize) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let url = format!("http://{}", listener.local_addr().expect("addr"));
     let mut config = SimConfig::default();
     config.engine.latency = latency;
+    config.engine.num_gpu_blocks = blocks;
     let sim = Sim::new(config).expect("sim config");
     tokio::spawn(sim.serve(listener, std::future::pending()));
     url
@@ -45,6 +50,7 @@ async fn recovers(latency: LatencyModel, max_context: u32) {
     assert!(calibration.worst_error < 0.05, "{calibration:?}");
     assert!(calibration.overhead_secs.is_some_and(|o| o >= 0.0));
     for probe in &calibration.probes {
+        assert_eq!(probe.engine_cached, Some(probe.cached), "{probe:?}");
         let engine = probe.engine_ttft_secs.expect("engine timing");
         let want = latency.prefill_secs(u64::from(probe.uncached), u64::from(probe.cached));
         assert!((engine - want).abs() < 1e-6, "{probe:?} wanted {want}");
@@ -91,6 +97,32 @@ async fn a_second_run_on_the_same_engine_measures_it_again() {
             "{fitted:?}"
         );
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_engine_that_caches_nothing_is_fitted_on_what_it_computed() {
+    let latency = LatencyModel::GPU_24GB_8B;
+    let plan = Plan {
+        url: serve(latency, 0).await,
+        max_context: 6_000,
+        repeats: 1,
+        ..Plan::default()
+    };
+    let calibration = calibrate(&plan, |_| {}).await.expect("calibration");
+    let fitted = calibration.cost_model;
+    assert!(
+        within(fitted.prefill_token_secs, latency.prefill_token_secs)
+            && within(fitted.prefill_pair_secs, latency.prefill_pair_secs)
+            && within(fitted.prefill_fixed_secs, latency.prefill_fixed_secs),
+        "{fitted:?}"
+    );
+    assert!(calibration.probes.iter().any(|p| p.cached > 0));
+    assert!(
+        calibration
+            .probes
+            .iter()
+            .all(|p| p.engine_cached == Some(0))
+    );
 }
 
 #[tokio::test]

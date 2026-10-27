@@ -4,7 +4,8 @@
 //! a time. A cached prefix is sent alone first, so the probe that follows
 //! finds it in the prefix cache. Each probe's time to first token is read
 //! from the engine's own histogram where it exports one, so network and
-//! HTTP time stay out of the fit, and from the stream otherwise.
+//! HTTP time stay out of the fit, and from the stream otherwise; what the
+//! engine served from its cache is read from its own count likewise.
 
 use std::hash::{BuildHasher, RandomState};
 use std::time::{Duration, Instant};
@@ -75,6 +76,9 @@ impl Default for Plan {
 pub struct Probe {
     pub uncached: u32,
     pub cached: u32,
+    /// Prompt tokens the engine served from its prefix cache, when it
+    /// counts them.
+    pub engine_cached: Option<u32>,
     /// Time to first token as the engine measured it, when it exports it.
     pub engine_ttft_secs: Option<f64>,
     /// Time to first byte of the stream as the client saw it.
@@ -82,8 +86,16 @@ pub struct Probe {
 }
 
 impl Probe {
-    fn ttft(&self) -> f64 {
-        self.engine_ttft_secs.unwrap_or(self.client_ttft_secs)
+    /// The probe as the engine ran it: its own count of cached tokens and
+    /// its own time, where it reports them, over what was planned.
+    pub fn point(&self) -> Point {
+        let total = self.uncached + self.cached;
+        let cached = self.engine_cached.map_or(self.cached, |c| c.min(total));
+        Point {
+            uncached: f64::from(total - cached),
+            cached: f64::from(cached),
+            ttft: self.engine_ttft_secs.unwrap_or(self.client_ttft_secs),
+        }
     }
 }
 
@@ -181,6 +193,14 @@ struct Engine {
     url: String,
     model: String,
     ttft_family: Option<String>,
+    counts_hits: bool,
+}
+
+/// The engine's own counts at one moment.
+#[derive(Debug, Clone, Copy, Default)]
+struct Reading {
+    ttft: Option<(f64, f64)>,
+    hits: Option<u64>,
 }
 
 /// A histogram's sum and count on a metrics page.
@@ -195,6 +215,13 @@ fn histogram(page: &str, family: &str) -> Option<(f64, f64)> {
         }
     }
     Some((sum?, count?))
+}
+
+/// Prompt tokens the engine has served from its prefix cache.
+fn cache_hits(page: &str) -> Option<u64> {
+    inferrail_load::parse(page)
+        .ok()
+        .map(|load| load.prefix_hits)
 }
 
 /// The engine's TTFT histogram and its block size, from its metrics page.
@@ -235,11 +262,18 @@ impl Engine {
         Ok(body)
     }
 
-    async fn ttft_histogram(&self) -> Result<Option<(f64, f64)>, CalibrateError> {
-        let Some(family) = &self.ttft_family else {
-            return Ok(None);
-        };
-        Ok(histogram(&self.get("/metrics").await?, family))
+    async fn reading(&self) -> Result<Reading, CalibrateError> {
+        if self.ttft_family.is_none() && !self.counts_hits {
+            return Ok(Reading::default());
+        }
+        let page = self.get("/metrics").await?;
+        Ok(Reading {
+            ttft: self
+                .ttft_family
+                .as_deref()
+                .and_then(|family| histogram(&page, family)),
+            hits: cache_hits(&page),
+        })
     }
 
     /// Sends `prompt` for one token and waits for the whole answer; returns
@@ -296,10 +330,10 @@ impl Engine {
             self.complete(&prompt).await?;
         }
         prompt.extend(tokens.take(uncached));
-        let before = self.ttft_histogram().await?;
+        let before = self.reading().await?;
         let client = self.complete(&prompt).await?;
-        let after = self.ttft_histogram().await?;
-        let engine = match (before, after) {
+        let after = self.reading().await?;
+        let engine = match (before.ttft, after.ttft) {
             (Some((sum0, count0)), Some((sum1, count1))) => {
                 if (count1 - count0 - 1.0).abs() > 0.5 {
                     return Err(CalibrateError::Busy);
@@ -308,9 +342,14 @@ impl Engine {
             }
             _ => None,
         };
+        let hits = before
+            .hits
+            .zip(after.hits)
+            .map(|(before, after)| u32::try_from(after.saturating_sub(before)).unwrap_or(u32::MAX));
         Ok(Probe {
             uncached,
             cached,
+            engine_cached: hits,
             engine_ttft_secs: engine,
             client_ttft_secs: client.as_secs_f64(),
         })
@@ -348,13 +387,16 @@ pub async fn calibrate(plan: &Plan, log: impl Fn(&Probe)) -> Result<Calibration,
         url,
         model: String::new(),
         ttft_family: None,
+        counts_hits: false,
     };
     engine.model = match &plan.model {
         Some(model) => model.clone(),
         None => first_model(&engine.get("/v1/models").await?).ok_or(CalibrateError::NoModel)?,
     };
-    let (family, block) = read_metrics(&engine.get("/metrics").await.unwrap_or_default());
+    let page = engine.get("/metrics").await.unwrap_or_default();
+    let (family, block) = read_metrics(&page);
     engine.ttft_family = family;
+    engine.counts_hits = cache_hits(&page).is_some();
     let block_size = plan.block_size.or(block).unwrap_or(16);
     let seed = plan
         .seed
@@ -368,14 +410,7 @@ pub async fn calibrate(plan: &Plan, log: impl Fn(&Probe)) -> Result<Calibration,
             probes.push(probe);
         }
     }
-    let points: Vec<Point> = probes
-        .iter()
-        .map(|p| Point {
-            uncached: f64::from(p.uncached),
-            cached: f64::from(p.cached),
-            ttft: p.ttft(),
-        })
-        .collect();
+    let points: Vec<Point> = probes.iter().map(Probe::point).collect();
     if points.len() < 6 {
         return Err(CalibrateError::TooFew(points.len()));
     }

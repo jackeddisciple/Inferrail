@@ -470,7 +470,10 @@ same timeout and size limit.
 prompts of known cached and uncached length, one at a time, the cached part
 sent alone first so the probe finds it cached. Each probe's TTFT comes from
 the engine's own histogram (vLLM and SGLang export one), so network and
-HTTP time stay out of the fit and are reported apart. A least squares fit
+HTTP time stay out of the fit and are reported apart, and its cached tokens
+from the engine's own prefix cache count, so an engine that cached less
+than planned is fitted on what it computed. Every run sends fresh prompts
+from its own seed, recorded in the output. A least squares fit
 that keeps every term non negative gives `a`, `b` and `d`, printed or
 written with `--out` as a `cost_model` fragment. Against the simulator it
 recovers all three to nine significant digits.

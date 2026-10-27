@@ -52,12 +52,13 @@ async fn main() -> anyhow::Result<()> {
         timeout: Duration::from_secs(args.timeout),
     };
     let calibration = calibrate(&plan, |probe| {
+        let point = probe.point();
         let _ = writeln!(
             std::io::stderr(),
             "{:>6} cached {:>6} new: {:8.2} ms",
-            probe.cached,
-            probe.uncached,
-            probe.engine_ttft_secs.unwrap_or(probe.client_ttft_secs) * 1e3
+            point.cached,
+            point.uncached,
+            point.ttft * 1e3
         );
     })
     .await?;
