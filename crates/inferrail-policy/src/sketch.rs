@@ -48,11 +48,12 @@ impl Sketch {
         }
     }
 
-    /// The amount added under `key` per second around `now`. Never below
+    /// The amount added under `key` per second around `now`, counting
+    /// `extra` as if it had just been added, without adding it. Never below
     /// the true rate over the windows it covers, as count-min sketches go.
-    pub(crate) fn rate(&self, key: u64, now: u64) -> f64 {
+    pub(crate) fn rate(&self, key: u64, extra: u64, now: u64) -> f64 {
         let started = self.started.load(Ordering::Acquire);
-        let age = now.saturating_sub(started);
+        let elapsed = now.saturating_sub(started);
         let min = |cells: &[AtomicU64]| {
             slots(key)
                 .into_iter()
@@ -60,14 +61,16 @@ impl Sketch {
                 .min()
                 .unwrap_or(0) as f64
         };
-        let window = self.window as f64;
-        let summed = if age >= 2 * self.window {
-            0.0
-        } else if age >= self.window {
-            min(&self.current) * (1.0 - (age - self.window) as f64 / window)
+        let (current, previous) = if elapsed < self.window {
+            (min(&self.current), min(&self.previous))
+        } else if elapsed < 2 * self.window {
+            (0.0, min(&self.current))
         } else {
-            min(&self.current) + min(&self.previous) * (1.0 - age as f64 / window)
+            (0.0, 0.0)
         };
+        let window = self.window as f64;
+        let age = (elapsed % self.window) as f64;
+        let summed = current + extra as f64 + previous * (1.0 - age / window);
         summed / (window / 1e9)
     }
 
@@ -98,6 +101,7 @@ impl Sketch {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use std::sync::Arc;
 
     const SECOND: u64 = 1_000_000_000;
@@ -114,11 +118,11 @@ mod tests {
         }
         let now = 400 * SECOND / 10;
         assert!(
-            close(sketch.rate(42, now), 500.0, 0.06),
+            close(sketch.rate(42, 0, now), 500.0, 0.06),
             "{}",
-            sketch.rate(42, now)
+            sketch.rate(42, 0, now)
         );
-        assert_eq!(sketch.rate(43, now), 0.0);
+        assert_eq!(sketch.rate(43, 0, now), 0.0);
     }
 
     #[test]
@@ -128,12 +132,12 @@ mod tests {
             sketch.add(7, 10, tick * SECOND / 10);
         }
         let end = 10 * SECOND;
-        let fresh = sketch.rate(7, end);
+        let fresh = sketch.rate(7, 0, end);
         assert!(fresh > 50.0, "{fresh}");
-        assert!(sketch.rate(7, end + 5 * SECOND) < fresh);
-        assert_eq!(sketch.rate(7, end + 21 * SECOND), 0.0);
+        assert!(sketch.rate(7, 0, end + 5 * SECOND) < fresh);
+        assert_eq!(sketch.rate(7, 0, end + 21 * SECOND), 0.0);
         sketch.add(9, 1, end + 30 * SECOND);
-        assert_eq!(sketch.rate(7, end + 30 * SECOND), 0.0);
+        assert_eq!(sketch.rate(7, 0, end + 30 * SECOND), 0.0);
     }
 
     #[test]
@@ -143,7 +147,7 @@ mod tests {
             sketch.add(key, 1 + key % 3, 0);
         }
         for key in 0..20_000u64 {
-            assert!(sketch.rate(key, 0) >= (1 + key % 3) as f64);
+            assert!(sketch.rate(key, 0, 0) >= (1 + key % 3) as f64);
         }
     }
 
@@ -163,6 +167,30 @@ mod tests {
         for thread in threads {
             thread.join().unwrap();
         }
-        assert!(close(sketch.rate(5, 0) * 3600.0, 80_000.0, 1e-9));
+        assert!(close(sketch.rate(5, 0, 0) * 3600.0, 80_000.0, 1e-9));
+    }
+
+    proptest! {
+        #[test]
+        fn an_amount_counted_ahead_reads_as_if_it_were_added(
+            adds in prop::collection::vec((0u64..4, 1u64..1_000, 0u64..700_000_000), 0..40),
+            key in 0u64..4,
+            extra in 0u64..1_000,
+            gap in 0u64..2_500_000_000,
+        ) {
+            let window = Duration::from_secs(1);
+            let (ahead, added) = (Sketch::new(window), Sketch::new(window));
+            let mut now = 0;
+            for (k, amount, step) in adds {
+                now += step;
+                ahead.add(k, amount, now);
+                added.add(k, amount, now);
+            }
+            now += gap;
+            let counted = ahead.rate(key, extra, now);
+            added.add(key, extra, now);
+            prop_assert!(close(counted, added.rate(key, 0, now), 1e-12), "{counted} vs {}", added.rate(key, 0, now));
+            prop_assert!(close(ahead.rate(key, 0, now) + extra as f64, counted, 1e-12));
+        }
     }
 }

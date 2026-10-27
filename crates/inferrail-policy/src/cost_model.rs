@@ -74,8 +74,9 @@ impl CostModelPolicy {
         }
     }
 
-    /// Estimates every candidate and applies the guards. With `observe`,
-    /// the request's prefill work counts toward its root prefix's demand.
+    /// Estimates every candidate and applies the guards. The request's own
+    /// prefill work counts toward its root prefix's demand; with `observe`
+    /// it is recorded for the requests that follow.
     fn plan(&self, ctx: &RouteContext<'_>, observe: bool) -> Plan {
         let candidates = ctx.candidates;
         let n = candidates.len();
@@ -133,15 +134,16 @@ impl CostModelPolicy {
         };
         let candidates = ctx.candidates;
         let n = candidates.len();
-        if observe {
-            let work = plan
-                .estimates
+        let work = micros(
+            plan.estimates
                 .iter()
                 .map(|e| e.prefill_secs + e.tier_secs)
-                .fold(f64::INFINITY, f64::min);
-            hot.sketch.add(root, micros(work), ctx.now);
+                .fold(f64::INFINITY, f64::min),
+        );
+        let demand = hot.sketch.rate(root, work, ctx.now) / 1e6;
+        if observe {
+            hot.sketch.add(root, work, ctx.now);
         }
-        let demand = hot.sketch.rate(root, ctx.now) / 1e6;
         let owners = ((demand / hot.utilization).ceil() as usize).clamp(1, n.max(1));
         plan.hot = Some(HotPrefix { demand, owners });
         if owners < 2 {
@@ -675,6 +677,48 @@ mod tests {
             for _ in 0..3 {
                 let _ = explained.explain(&ctx);
                 prop_assert_eq!(plain.choose(&ctx), explained.choose(&ctx));
+            }
+        }
+
+        #[test]
+        fn explain_names_the_replica_choose_picks(
+            seed: u64,
+            steps in prop::collection::vec(
+                (
+                    prop::collection::vec(
+                        (0u32..6, 0u32..1_100, 0.0f64..0.3, prop::option::of(0.8f64..1.0)),
+                        1..6,
+                    ),
+                    0u64..3,
+                    prop::option::of(0u64..4),
+                    0u64..50_000_000,
+                ),
+                1..40,
+            ),
+        ) {
+            let pool = Pool::new(6);
+            let policy = CostModelPolicy::new(&Settings {
+                seed,
+                session_affinity: true,
+                ..hot_settings(Duration::from_millis(100))
+            });
+            let prefixes: Vec<Vec<BlockHash>> = (0..3).map(|p| chain(p, 64)).collect();
+            let mut now = 0;
+            for (rows, prefix, session, gap) in steps {
+                now += gap;
+                let candidates = fleet(&pool.ids, &rows);
+                let ctx = RouteContext {
+                    session,
+                    now,
+                    ..context(&pool, &candidates, 1_100, &prefixes[prefix as usize])
+                };
+                let explained = policy.explain(&ctx);
+                let chosen = policy.choose(&ctx).unwrap();
+                if let Some(winner) = explained.winner {
+                    prop_assert_eq!(winner, chosen.index, "{:?}", explained);
+                    prop_assert_eq!(explained.steer, chosen.steer);
+                }
+                prop_assert_eq!(explained.guarded, chosen.guarded);
             }
         }
     }
