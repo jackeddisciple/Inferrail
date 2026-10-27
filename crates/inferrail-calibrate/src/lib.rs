@@ -6,6 +6,7 @@
 //! from the engine's own histogram where it exports one, so network and
 //! HTTP time stay out of the fit, and from the stream otherwise.
 
+use std::hash::{BuildHasher, RandomState};
 use std::time::{Duration, Instant};
 
 use inferrail_core::config::CostModelConfig;
@@ -49,7 +50,9 @@ pub struct Plan {
     pub max_context: u32,
     /// Measurements per point of the grid.
     pub repeats: u32,
-    pub seed: u64,
+    /// Seeds the prompts; drawn afresh for every run when `None`, so a run
+    /// never finds an earlier run's prompts in the engine's cache.
+    pub seed: Option<u64>,
     pub timeout: Duration,
 }
 
@@ -61,7 +64,7 @@ impl Default for Plan {
             block_size: None,
             max_context: 16_384,
             repeats: 2,
-            seed: 0,
+            seed: None,
             timeout: Duration::from_secs(120),
         }
     }
@@ -90,6 +93,8 @@ pub struct Calibration {
     pub url: String,
     pub model: String,
     pub block_size: u32,
+    /// What seeded the prompts, to send the same ones again.
+    pub seed: u64,
     /// Whether times came from the engine's histogram or the stream.
     pub engine_timed: bool,
     pub cost_model: CostModelConfig,
@@ -108,10 +113,11 @@ impl Calibration {
     pub fn to_yaml(&self) -> String {
         let c = &self.cost_model;
         let mut out = format!(
-            "# inferrail-calibrate {}: {} at {}\n# {} probes timed by the {}; R squared {:.5}, median error {:.2}%, worst {:.2}%\n",
+            "# inferrail-calibrate {}: {} at {}, seed {}\n# {} probes timed by the {}; R squared {:.5}, median error {:.2}%, worst {:.2}%\n",
             env!("CARGO_PKG_VERSION"),
             self.model,
             self.url,
+            self.seed,
             self.probes.len(),
             if self.engine_timed {
                 "engine"
@@ -350,7 +356,10 @@ pub async fn calibrate(plan: &Plan, log: impl Fn(&Probe)) -> Result<Calibration,
     let (family, block) = read_metrics(&engine.get("/metrics").await.unwrap_or_default());
     engine.ttft_family = family;
     let block_size = plan.block_size.or(block).unwrap_or(16);
-    let mut tokens = Tokens(plan.seed);
+    let seed = plan
+        .seed
+        .unwrap_or_else(|| RandomState::new().hash_one(Instant::now()));
+    let mut tokens = Tokens(seed);
     let mut probes = Vec::new();
     for _ in 0..plan.repeats.max(1) {
         for (uncached, cached) in grid(plan.max_context, block_size) {
@@ -386,6 +395,7 @@ pub async fn calibrate(plan: &Plan, log: impl Fn(&Probe)) -> Result<Calibration,
         url: engine.url,
         model: engine.model,
         block_size,
+        seed,
         engine_timed,
         cost_model: CostModelConfig {
             prefill_token_secs: fitted.token,
@@ -451,6 +461,7 @@ mod tests {
             url: "http://e:8000".to_owned(),
             model: "m".to_owned(),
             block_size: 16,
+            seed: 7,
             engine_timed: true,
             cost_model: CostModelConfig {
                 prefill_token_secs: 1.234_567e-4,

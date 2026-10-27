@@ -25,8 +25,9 @@ struct Args {
     /// Measurements per point of the grid.
     #[arg(long, default_value_t = 2)]
     repeats: u32,
-    #[arg(long, default_value_t = 0)]
-    seed: u64,
+    /// Seeds the prompts sent; a fresh seed every run by default.
+    #[arg(long)]
+    seed: Option<u64>,
     /// Seconds to wait for one request.
     #[arg(long, default_value_t = 120)]
     timeout: u64,
@@ -91,6 +92,7 @@ mod tests {
         assert_eq!(args.url, "http://gpu-0:8000");
         assert_eq!(args.max_context, 4_096);
         assert_eq!(args.repeats, 2);
+        assert_eq!(args.seed, None);
         assert_eq!(args.out, Some(PathBuf::from("cost.yaml")));
     }
 }

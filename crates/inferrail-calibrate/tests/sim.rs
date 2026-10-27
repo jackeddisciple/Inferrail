@@ -71,6 +71,28 @@ async fn the_fit_recovers_other_parameters_within_five_percent() {
     .await;
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_run_on_the_same_engine_measures_it_again() {
+    let latency = LatencyModel::GPU_24GB_8B;
+    let plan = Plan {
+        url: sim(latency).await,
+        max_context: 6_000,
+        repeats: 1,
+        ..Plan::default()
+    };
+    let first = calibrate(&plan, |_| {}).await.expect("a first run");
+    let second = calibrate(&plan, |_| {}).await.expect("a second run");
+    assert_ne!(first.seed, second.seed);
+    for fitted in [first.cost_model, second.cost_model] {
+        assert!(
+            within(fitted.prefill_token_secs, latency.prefill_token_secs)
+                && within(fitted.prefill_pair_secs, latency.prefill_pair_secs)
+                && within(fitted.prefill_fixed_secs, latency.prefill_fixed_secs),
+            "{fitted:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn an_engine_without_models_or_answers_is_an_error() {
     let plan = Plan {
