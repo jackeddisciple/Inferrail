@@ -42,13 +42,47 @@ class Plan:
     arrivals: dict = field(default_factory=dict)
 
 
+def versions(profile: str) -> dict:
+    return {
+        "gateway": fleet.version("inferrail-gateway", profile),
+        "sim": fleet.version("inferrail-sim", profile),
+    }
+
+
+def one_run(
+    work: Path,
+    run_info: dict,
+    *,
+    sims: int,
+    sim_flags: tuple[str, ...],
+    profile: str,
+    built: dict,
+    arrivals,
+) -> dict:
+    """One run on a fresh gateway and simulators; returns its result document."""
+    with fleet.fleet(work, sims, run_info["policy"], list(sim_flags), profile) as f:
+        records, summary = asyncio.run(
+            measure(
+                f.gateway,
+                fleet.MODEL,
+                run_info["workload"],
+                run_info["rate"],
+                run_info["requests"],
+                run_info["seed"],
+                run_info["warmup_s"],
+                f.sims,
+                run_info["params"],
+                arrivals,
+            )
+        )
+    env = results.environment(config_sha256=results.config_hash(f.config), **built)
+    return results.document(run_info, env, summary, records)
+
+
 def run(plan: Plan, out: Path, log=print) -> list[Path]:
     """Runs every workload, repetition and policy, each on a fresh fleet, and
     writes one result file per run under `out/<workload>/`."""
-    versions = {
-        "gateway": fleet.version("inferrail-gateway", plan.profile),
-        "sim": fleet.version("inferrail-sim", plan.profile),
-    }
+    built = versions(plan.profile)
     written = []
     with tempfile.TemporaryDirectory(prefix="inferrail-bench-") as tmp:
         for workload in plan.workloads:
@@ -59,23 +93,6 @@ def run(plan: Plan, out: Path, log=print) -> list[Path]:
                 seed = plan.seed + rep
                 for policy in plan.policies:
                     work = Path(tmp) / f"{workload}-{policy}-{rep}"
-                    with fleet.fleet(
-                        work, plan.sims, policy, list(plan.sim_flags), plan.profile
-                    ) as f:
-                        records, summary = asyncio.run(
-                            measure(
-                                f.gateway,
-                                fleet.MODEL,
-                                workload,
-                                rate,
-                                count,
-                                seed,
-                                plan.warmup,
-                                f.sims,
-                                plan.params.get(workload),
-                                arrivals,
-                            )
-                        )
                     run_info = {
                         "workload": workload,
                         "policy": policy,
@@ -89,11 +106,16 @@ def run(plan: Plan, out: Path, log=print) -> list[Path]:
                         "sims": plan.sims,
                         "sim_flags": list(plan.sim_flags),
                     }
-                    env = results.environment(
-                        config_sha256=results.config_hash(f.config), **versions
+                    doc = one_run(
+                        work,
+                        run_info,
+                        sims=plan.sims,
+                        sim_flags=plan.sim_flags,
+                        profile=plan.profile,
+                        built=built,
+                        arrivals=arrivals,
                     )
-                    doc = results.document(run_info, env, summary, records)
                     path = results.write(out / workload / f"{policy}-r{rep}.json.gz", doc)
                     written.append(path)
-                    log(f"{workload} {policy} rep {rep}: {describe(summary)}")
+                    log(f"{workload} {policy} rep {rep}: {describe(doc['summary'])}")
     return written

@@ -197,6 +197,28 @@ def cmd_compare(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_sweep(args: argparse.Namespace) -> int:
+    from inferrail_bench import sweep
+
+    plan = sweep.load(args.file)
+    only = tuple(args.only.split(",")) if args.only else ()
+    if args.dry_run:
+        runs = plan.runs(only)
+        for point in plan.points:
+            if not only or point.name in only:
+                count = sum(r.point is point for r in runs)
+                print(f"{point.name}: {point.workload}, {count} runs")
+        hours = sweep.estimate(plan, only) / 3600 / max(args.jobs, 1)
+        print(f"{len(runs)} runs, about {hours:.1f} h")
+        return 0
+    execute = sweep.execute("debug" if args.debug else "release")
+    written = sweep.run(plan, args.out, execute, jobs=args.jobs, only=only)
+    docs = [results.read(p) for p in written]
+    failed = sum(d["summary"].get("errors", 0) for d in docs)
+    print(f"{len(written)} runs in {args.out}; {failed} failed requests")
+    return 0
+
+
 def add_arrivals(command: argparse.ArgumentParser) -> None:
     command.add_argument(
         "--arrivals", choices=["poisson", "gamma"], help="arrival process; the workload's default"
@@ -245,6 +267,15 @@ def parser() -> argparse.ArgumentParser:
     add_arrivals(cmp)
     cmp.add_argument("--out", type=Path, required=True)
     cmp.set_defaults(handler=cmd_compare)
+
+    swp = sub.add_parser("sweep", help="run a benchmark matrix from a sweep file, resuming")
+    swp.add_argument("file", type=Path, help="sweep file, as bench/sweeps/sim.toml")
+    swp.add_argument("--out", type=Path, required=True)
+    swp.add_argument("--jobs", type=int, default=1, help="runs at once, each on its own fleet")
+    swp.add_argument("--only", help="comma separated point names")
+    swp.add_argument("--dry-run", action="store_true", help="list the runs and the time needed")
+    swp.add_argument("--debug", action="store_true", help="use debug builds")
+    swp.set_defaults(handler=cmd_sweep)
 
     report = sub.add_parser("plot", help="charts and report.md from result files")
     report.add_argument("results", nargs="+", type=Path)

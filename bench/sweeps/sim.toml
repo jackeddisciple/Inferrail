@@ -1,0 +1,76 @@
+# The full simulator sweep behind `make sweep`: every workload on three
+# simulators with the default latency model of an 8B model on one 24 GB GPU,
+# each policy on the same requests and arrival times, 3 repetitions. Main
+# rates sit near 70% of what a cache blind fleet sustains; the knee points
+# step through and past it. Results land in bench/results/sweep.
+
+name = "sim"
+policies = ["round_robin", "random", "least_request", "p2c", "prefix_hash", "kv_aware", "cost_model"]
+reps = 3
+duration = 60
+warmup = 10
+sims = 3
+sim_flags = ["--enable-prompt-tokens-details"]
+
+[[point]]
+workload = "w1"
+rates = [6]
+params = { prompts = 32 }
+
+[[point]]
+workload = "w2"
+rates = [25]
+
+[[point]]
+workload = "w3"
+rates = [3]
+
+[[point]]
+workload = "w4"
+rates = [9]
+
+[[point]]
+workload = "w5"
+rates = [12]
+
+[[point]]
+workload = "w6"
+rates = [9]
+
+[[point]]
+workload = "mix"
+rates = [7]
+
+[[point]]
+workload = "hot"
+rates = [10]
+
+[[point]]
+name = "w8-poisson"
+workload = "w8"
+rates = [5]
+arrivals = { kind = "poisson" }
+
+[[point]]
+name = "w8-cv2"
+workload = "w8"
+rates = [5]
+
+[[point]]
+name = "w8-cv4"
+workload = "w8"
+rates = [5]
+arrivals = { cv = 4.0 }
+
+[[point]]
+name = "w1-knee"
+workload = "w1"
+rates = [2, 4, 6, 8, 10]
+policies = ["round_robin", "least_request", "kv_aware", "cost_model"]
+params = { prompts = 32 }
+
+[[point]]
+name = "w3-knee"
+workload = "w3"
+rates = [1, 2, 3, 4, 5]
+policies = ["round_robin", "least_request", "kv_aware", "cost_model"]
