@@ -432,14 +432,16 @@ index tracks tiers. Ties go to fewer requests in flight, then to chance.
   every replica does.
 
 A root prefix (its first `hot_prefix.blocks` blocks) whose prefill demand,
-counted in a decaying count min sketch over `hot_prefix.window`, needs more
-than `hot_prefix.utilization` of a replica gets `ceil(demand /
-utilization)` owners, priced as if they held it, so the cost model shares
-it among them by their queues. With `session_affinity`, a request naming its
-conversation in `x-session-id` or the `user` field goes back to the
-conversation's last replica while the guards allow it. Why `epsilon` is 1.0
-rather than the 0.25 the design started from is in
-[ADR 011](docs/adr/011-load-guards.md), with the measurements.
+counted in a decaying count min sketch over `hot_prefix.window`, needs
+more than `hot_prefix.utilization` of a replica gets `ceil(demand /
+utilization)` owners, priced as if they held the longest prefix an owner
+holds that is that hot itself, so the cost model shares it among them by
+their queues and a conversation's history counts only where it is. With
+`session_affinity`, a request naming its conversation in `x-session-id` or
+the `user` field goes back to the conversation's last replica while the
+guards allow it. Why `epsilon` is 1.0 rather than the 0.25 the design
+started from is in [ADR 011](docs/adr/011-load-guards.md), with the
+measurements.
 
 **Explaining a decision.** `POST /admin/explain/v1/chat/completions` (or
 `/v1/completions`) on the admin port takes a request as a client would send

@@ -123,12 +123,12 @@ impl CostModelPolicy {
 
     /// A root prefix that needs more than `utilization` of one replica's
     /// prefill gets `ceil(demand / utilization)` owners: the candidates
-    /// holding most of it, then those its key hashes to. Every owner is
-    /// priced as if it held what all the owners holding the whole root
-    /// share, so the cost model shares the prefix among them by their
-    /// queues, while what only one of them holds, such as a conversation's
-    /// history, counts only there; the first request an owner takes warms
-    /// it.
+    /// holding most of it, then those its key hashes to. An owner is priced
+    /// as if it held the longest prefix the owners hold that is hot in its
+    /// own right, its demand tracked like the root's, so the cost model
+    /// shares that prefix among them by their queues while a conversation's
+    /// history, which only its own turns bring, counts only where it is;
+    /// the first request an owner takes warms it.
     fn spread_hot_prefix(&self, ctx: &RouteContext<'_>, plan: &mut Plan, observe: bool) {
         let Some(hot) = &self.hot else { return };
         let Some(root) = prefix_key(ctx.blocks, hot.blocks) else {
@@ -143,30 +143,60 @@ impl CostModelPolicy {
                 .fold(f64::INFINITY, f64::min),
         );
         let demand = hot.sketch.rate(root, work, ctx.now) / 1e6;
-        if observe {
-            hot.sketch.add(root, work, ctx.now);
-        }
         let owners = ((demand / hot.utilization).ceil() as usize).clamp(1, n.max(1));
         plan.hot = Some(HotPrefix { demand, owners });
-        if owners < 2 {
-            return;
+        let mut order: Vec<usize> = Vec::new();
+        if owners > 1 {
+            order.extend(0..n);
+            order.sort_by_key(|&i| {
+                let c = &candidates[i];
+                Reverse((c.cached_tokens, weight(root, c.id)))
+            });
         }
-        let mut order: Vec<usize> = (0..n).collect();
-        order.sort_by_key(|&i| {
-            let c = &candidates[i];
-            Reverse((c.cached_tokens, weight(root, c.id)))
-        });
-        let owned = &order[..owners];
         let root_tokens = (ctx.blocks.len().min(hot.blocks as usize) as u32)
             .saturating_mul(ctx.block_size)
             .max(1);
-        let shared = owned
+        let holdings: Vec<u32> = match order.get(..owners) {
+            Some(owned) => owned.iter().map(|&i| candidates[i].cached_tokens).collect(),
+            None => candidates
+                .iter()
+                .map(|c| c.cached_tokens)
+                .max()
+                .into_iter()
+                .collect(),
+        };
+        let holdings = holdings.into_iter().filter(|&held| held >= root_tokens);
+        let held: Vec<(u32, u64)> = [holdings.clone().max(), holdings.min()]
+            .into_iter()
+            .flatten()
+            .filter(|_| ctx.block_size > 0)
+            .filter_map(|tokens| {
+                prefix_key(ctx.blocks, tokens / ctx.block_size).map(|key| (tokens, key))
+            })
+            .collect();
+        let shared = held
             .iter()
-            .map(|&i| candidates[i].cached_tokens)
-            .filter(|&held| held >= root_tokens)
-            .min()
-            .unwrap_or(0);
-        for &i in owned {
+            .find(|&&(_, key)| {
+                let rate = if key == root {
+                    demand
+                } else {
+                    hot.sketch.rate(key, work, ctx.now) / 1e6
+                };
+                rate > hot.utilization
+            })
+            .map_or(0, |&(tokens, _)| tokens);
+        if observe {
+            hot.sketch.add(root, work, ctx.now);
+            for (i, &(_, key)) in held.iter().enumerate() {
+                if key != root && held[..i].iter().all(|&(_, seen)| seen != key) {
+                    hot.sketch.add(key, work, ctx.now);
+                }
+            }
+        }
+        if owners < 2 {
+            return;
+        }
+        for &i in &order[..owners] {
             plan.owner[i] = true;
             if candidates[i].cached_tokens < shared {
                 plan.estimates[i] =
@@ -538,48 +568,110 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_conversation_keeps_its_history_when_its_prefix_turns_hot() {
-        let pool = Pool::new(3);
-        let policy = CostModelPolicy::new(&hot_settings(Duration::from_millis(100)));
-        let cost = CostModel::default();
-        let prompt = chain(8, 198);
-        let candidates = fleet(
-            &pool.ids,
-            &[
-                (1, 3_072, 0.05, None),
-                (1, 1_024, 0.0, None),
-                (1, 0, 0.0, None),
-            ],
-        );
-        let ctx = |step: u64| RouteContext {
-            now: step,
-            ..context(&pool, &candidates, 3_172, &prompt)
-        };
-        for step in 0..12 {
-            assert_eq!(policy.choose(&ctx(step)).unwrap().index, 0, "step {step}");
+    /// Routes `count` first turns of new conversations that open with
+    /// `system`, over a fleet whose replicas hold and have queued `held`,
+    /// one a nanosecond from `start`; returns the last choice and how
+    /// explain priced it.
+    fn first_turns(
+        policy: &CostModelPolicy,
+        pool: &Pool,
+        system: &[BlockHash],
+        held: &[(u32, f64)],
+        count: u64,
+        start: u64,
+    ) -> (Choice, Vec<Estimate>) {
+        let rows: Vec<(u32, u32, f64, Option<f64>)> = held
+            .iter()
+            .map(|&(tokens, queued)| (1, tokens, queued, None))
+            .collect();
+        let candidates = fleet(&pool.ids, &rows);
+        let mut last = None;
+        for i in 0..count {
+            let prompt: Vec<BlockHash> = system.iter().copied().chain(chain(100 + i, 2)).collect();
+            let ctx = RouteContext {
+                now: start + i,
+                ..context(pool, &candidates, 1_060, &prompt)
+            };
+            let explained = policy.explain(&ctx);
+            let choice = policy.choose(&ctx).unwrap();
+            let estimates = explained
+                .candidates
+                .iter()
+                .map(|s| s.estimate.unwrap())
+                .collect();
+            last = Some((choice, estimates));
         }
-        let explained = policy.explain(&ctx(12));
-        assert_eq!(explained.hot_prefix.unwrap().owners, 3);
-        let system = cost.estimate(3_172, &candidates[2], Hits::gpu(1_024));
-        assert_eq!(explained.candidates[2].estimate, Some(system));
-        assert_eq!(explained.winner, Some(0));
+        last.unwrap()
+    }
 
-        let preamble = fleet(
-            &pool.ids,
-            &[
-                (1, 1_024, 0.3, None),
-                (1, 16, 0.0, None),
-                (1, 0, 0.01, None),
-            ],
+    #[test]
+    fn a_conversation_keeps_its_history_when_its_system_prompt_turns_hot() {
+        let pool = Pool::new(3);
+        let cost = CostModel::default();
+        let system = chain(8, 64);
+        let turn: Vec<BlockHash> = system.iter().copied().chain(chain(9, 134)).collect();
+        let conversation = |policy: &CostModelPolicy, held: [u32; 3], now: u64| {
+            let candidates = fleet(
+                &pool.ids,
+                &[
+                    (1, held[0], 0.05, None),
+                    (1, held[1], 0.0, None),
+                    (1, held[2], 0.0, None),
+                ],
+            );
+            let ctx = RouteContext {
+                now,
+                ..context(&pool, &candidates, 3_172, &turn)
+            };
+            let explained = policy.explain(&ctx);
+            let estimates: Vec<Estimate> = explained
+                .candidates
+                .iter()
+                .map(|s| s.estimate.unwrap())
+                .collect();
+            let truth: Vec<Estimate> = candidates
+                .iter()
+                .map(|c| cost.estimate(3_172, c, Hits::gpu(c.cached_tokens)))
+                .collect();
+            (policy.choose(&ctx).unwrap(), estimates, truth)
+        };
+
+        let shared = CostModelPolicy::new(&hot_settings(Duration::from_millis(100)));
+        first_turns(
+            &shared,
+            &pool,
+            &system,
+            &[(1_024, 0.0), (1_024, 0.0), (0, 0.0)],
+            30,
+            0,
         );
-        let spread = policy.explain(&RouteContext {
-            now: 12,
-            ..context(&pool, &preamble, 1_100, &prompt[..68])
-        });
-        let warm = cost.estimate(1_100, &preamble[1], Hits::gpu(1_024));
-        assert_eq!(spread.candidates[1].estimate, Some(warm));
-        assert_eq!(spread.winner, Some(1));
+        let (choice, estimates, truth) = conversation(&shared, [3_072, 1_024, 0], 30);
+        assert_eq!(choice.index, 0);
+        assert_eq!(estimates[..2], truth[..2]);
+        let system_only = fleet(&pool.ids, &[(1, 0, 0.0, None); 3]);
+        let warm = cost.estimate(3_172, &system_only[2], Hits::gpu(1_024));
+        assert_eq!(
+            estimates[2], warm,
+            "a cold owner is credited with the system prompt"
+        );
+
+        let single = CostModelPolicy::new(&hot_settings(Duration::from_millis(100)));
+        let (spread, estimates) = first_turns(
+            &single,
+            &pool,
+            &system,
+            &[(1_024, 0.3), (0, 0.0), (0, 0.01)],
+            30,
+            0,
+        );
+        assert_eq!(spread.index, 1, "first turns spread to a cold owner");
+        assert_eq!(
+            estimates[1],
+            cost.estimate(1_060, &system_only[1], Hits::gpu(1_024))
+        );
+        let (choice, estimates, truth) = conversation(&single, [3_072, 0, 0], 30);
+        assert_eq!(choice.index, 0, "{estimates:?}");
+        assert_eq!(estimates, truth, "no owner is credited with the history");
     }
 
     #[test]

@@ -33,10 +33,13 @@ estimates say.
   window by how much of the current one has passed. Lock free, 64 KiB per
   model. A prefix whose demand needs more than `hot_prefix.utilization`
   (0.5) of a replica gets `ceil(demand / utilization)` owners: the
-  candidates holding most of it, then those its key hashes to. Owners are
-  priced as if they held what all the owners holding the whole root share,
-  so the cost model shares the prefix among them by their queues, while a
-  conversation's history counts only on the replica that holds it; the
+  candidates holding most of it, then those its key hashes to. An owner
+  is priced as if it held the longest prefix the owners hold that is hot
+  in its own right: the sketch counts the demand of the prefixes owners
+  hold as it counts the root's, and a held prefix qualifies once it needs
+  more than `utilization` of a replica itself. The cost model then shares
+  that prefix among the owners by their queues, while a conversation's
+  history, which only its own turns bring, counts only where it is; the
   first request an owner takes warms it. Other replicas stay eligible at
   their real cost, so a congested set of owners still spills.
 * **Session affinity**, off by default. A request names its conversation

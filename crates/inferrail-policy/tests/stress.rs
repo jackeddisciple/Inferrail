@@ -63,6 +63,7 @@ fn a5_full_decision_stays_under_200_microseconds_at_64_replicas() {
             let ctx = RouteContext {
                 prompt_tokens: (BLOCKS * 16) as u32,
                 blocks: &prompt,
+                block_size: 16,
                 session: Some(round % 64),
                 now: round * 1_000_000,
                 ..RouteContext::new(&model, &candidates)
@@ -129,6 +130,7 @@ fn every_policy_is_safe_to_share_between_threads() {
                         let ctx = RouteContext {
                             prompt_tokens: 1_030,
                             blocks: &prompts[rng.below(8)],
+                            block_size: 16,
                             session: Some(rng.below(1_000) as u64),
                             now: round * 100_000,
                             ..RouteContext::new(&model, &candidates)

@@ -76,6 +76,7 @@ fn decide(c: &mut Criterion) {
                 let ctx = RouteContext {
                     prompt_tokens: (BLOCKS * 16) as u32,
                     blocks: &prompt,
+                    block_size: 16,
                     now,
                     ..RouteContext::new(&model, &candidates)
                 };
