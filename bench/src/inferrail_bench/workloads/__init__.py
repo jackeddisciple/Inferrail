@@ -20,6 +20,7 @@ class Spec:
     title: str
     build: type
     defaults: dict = field(default_factory=dict)
+    arrivals: dict = field(default_factory=dict)
 
 
 WORKLOADS: dict[str, Spec] = {
@@ -31,6 +32,13 @@ WORKLOADS: dict[str, Spec] = {
     "w6": Spec("w6", "Unique prompts", Unique),
     "mix": Spec("mix", "Shared and unique prompts", Mixed),
     "hot": Spec("hot", "Hot system prompts", SharedPrompt, {"prompts": 32, "skew": 1.1}),
+    "w8": Spec(
+        "w8",
+        "Bursty arrivals",
+        SharedPrompt,
+        {"prompts": 32},
+        {"kind": "gamma", "cv": 2.0, "ramp": "diurnal"},
+    ),
 }
 
 

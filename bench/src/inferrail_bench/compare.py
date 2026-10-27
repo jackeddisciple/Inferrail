@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from inferrail_bench import fleet, results
-from inferrail_bench.cli import describe, measure
+from inferrail_bench.cli import arrivals_for, describe, measure
 
 BASELINES = ("round_robin", "random", "least_request", "p2c")
 POLICIES = (*BASELINES, "prefix_hash", "kv_aware", "cost_model")
@@ -39,6 +39,7 @@ class Plan:
     sims: int = 3
     sim_flags: tuple[str, ...] = SIM_FLAGS
     profile: str = "release"
+    arrivals: dict = field(default_factory=dict)
 
 
 def run(plan: Plan, out: Path, log=print) -> list[Path]:
@@ -53,6 +54,7 @@ def run(plan: Plan, out: Path, log=print) -> list[Path]:
         for workload in plan.workloads:
             rate = plan.rates[workload]
             count = plan.requests or round(rate * plan.duration)
+            arrivals = arrivals_for(workload, plan.arrivals)
             for rep in range(plan.reps):
                 seed = plan.seed + rep
                 for policy in plan.policies:
@@ -71,6 +73,7 @@ def run(plan: Plan, out: Path, log=print) -> list[Path]:
                                 plan.warmup,
                                 f.sims,
                                 plan.params.get(workload),
+                                arrivals,
                             )
                         )
                     run_info = {
@@ -78,6 +81,7 @@ def run(plan: Plan, out: Path, log=print) -> list[Path]:
                         "policy": policy,
                         "rep": rep,
                         "rate": rate,
+                        "arrivals": arrivals.to_dict(),
                         "requests": count,
                         "seed": seed,
                         "warmup_s": plan.warmup,

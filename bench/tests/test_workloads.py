@@ -253,3 +253,75 @@ def test_w5_batches_share_a_long_block_of_examples():
     for block in blocks:
         assert 2_900 <= text.tokens(block) <= 3_200
     assert len({r.messages[0].content for r in requests}) == len(requests)
+
+
+def gaps_of(offsets):
+    return [b - a for a, b in zip([0.0, *offsets], offsets, strict=False)]
+
+
+@pytest.mark.parametrize("cv", [2.0, 4.0])
+def test_gamma_arrivals_keep_the_rate_and_burst_at_their_cv(cv):
+    arrivals = schedule.Arrivals("gamma", cv)
+    offsets = arrivals.offsets(10.0, 40_000, seed=3)
+    assert offsets == arrivals.offsets(10.0, 40_000, seed=3)
+    assert offsets != arrivals.offsets(10.0, 40_000, seed=4)
+    gaps = gaps_of(offsets)
+    mean = sum(gaps) / len(gaps)
+    spread = math.sqrt(sum((g - mean) ** 2 for g in gaps) / len(gaps))
+    assert abs(mean - 0.1) < 0.004
+    assert abs(spread / mean - cv) < 0.15 * cv
+    assert all(b >= a for a, b in itertools.pairwise(offsets))
+    assert arrivals.label() == f"gamma_cv{cv:g}"
+
+
+def test_the_diurnal_ramp_peaks_midway_and_keeps_the_mean_rate():
+    arrivals = schedule.Arrivals(ramp="diurnal")
+    offsets = arrivals.offsets(10.0, 30_000, seed=1)
+    span = offsets[-1]
+    assert abs(span - 3_000) < 60
+
+    def count(lo, hi):
+        return sum(lo * span <= t < hi * span for t in offsets)
+
+    edges = count(0.0, 0.1) + count(0.9, 1.0)
+    middle = count(0.4, 0.6)
+    assert middle > 3 * edges
+    swing = (math.sin(2 * math.pi * 0.6) - math.sin(2 * math.pi * 0.4)) / (2 * math.pi * 0.2)
+    want = 10.0 * (1 - 0.6 * swing) * 0.2 * span
+    assert abs(middle - want) < 0.03 * want
+    bursty = schedule.Arrivals("gamma", 4.0, "diurnal").offsets(10.0, 30_000, seed=1)
+    assert abs(bursty[-1] - 3_000) < 300
+    assert schedule.Arrivals("gamma", 4.0, "diurnal").label() == "gamma_cv4_diurnal"
+
+
+def test_poisson_schedules_are_the_same_as_before_arrivals_were_configurable():
+    assert schedule.poisson(5.0, 100, 7) == schedule.Arrivals().offsets(5.0, 100, 7)
+    rng = random.Random(7)
+    at, old = 0.0, []
+    for _ in range(100):
+        at += rng.expovariate(5.0)
+        old.append(at)
+    assert all(abs(a - b) < 1e-9 for a, b in zip(old, schedule.poisson(5.0, 100, 7), strict=True))
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [{"kind": "weibull"}, {"cv": 0}, {"ramp": "weekly"}, {"amplitude": 1.0}],
+)
+def test_bad_arrival_specs_are_refused(spec):
+    with pytest.raises(ValueError, match=r"\w"):
+        schedule.Arrivals.from_dict(spec)
+
+
+def test_w8_is_shared_prompts_arriving_in_bursts_over_a_ramp():
+    from inferrail_bench.cli import arrival_overrides, arrivals_for, parser
+
+    assert arrivals_for("w8") == schedule.Arrivals("gamma", 2.0, "diurnal")
+    assert arrivals_for("w1") == schedule.Arrivals()
+    run = ["run", "--base-url", "u", "--model", "m", "--workload", "w8", "--rate", "1"]
+    args = parser().parse_args([*run, "--out", "o", "--cv", "4"])
+    assert arrivals_for("w8", arrival_overrides(args)).cv == 4.0
+    args = parser().parse_args(["compare", "--out", "o", "--arrivals", "poisson", "--ramp", "none"])
+    assert arrivals_for("w8", arrival_overrides(args)) == schedule.Arrivals()
+    requests = generate("w8", 50, seed=1)
+    assert len({r.messages[0].content for r in requests}) <= 32

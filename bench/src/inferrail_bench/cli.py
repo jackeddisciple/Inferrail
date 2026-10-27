@@ -6,7 +6,8 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
-from inferrail_bench import engine, plot, results, runner, schedule
+from inferrail_bench import engine, plot, results, runner
+from inferrail_bench.schedule import Arrivals
 from inferrail_bench.summary import summarize
 from inferrail_bench.workloads import WORKLOADS, generate
 from inferrail_bench.workloads.multi_turn import load_sharegpt
@@ -34,6 +35,22 @@ def parse_params(items: Sequence[str]) -> dict:
     return params
 
 
+def arrivals_for(workload: str, overrides: dict | None = None) -> Arrivals:
+    """The workload's own arrival process with `overrides` on top."""
+    return Arrivals.from_dict({**WORKLOADS[workload].arrivals, **(overrides or {})})
+
+
+def arrival_overrides(args: argparse.Namespace) -> dict:
+    out: dict = {}
+    if args.arrivals:
+        out["kind"] = args.arrivals
+    if args.cv is not None:
+        out["cv"] = args.cv
+    if args.ramp:
+        out["ramp"] = None if args.ramp == "none" else args.ramp
+    return out
+
+
 def workload_params(name: str, sharegpt: str | None, items: Sequence[str] = ()) -> dict:
     params: dict = parse_params(items)
     if sharegpt and name == "w2":
@@ -51,11 +68,12 @@ async def measure(
     warmup: float = 0.0,
     engines: Sequence[str] = (),
     params: dict | None = None,
+    arrivals: Arrivals | None = None,
 ) -> tuple[list, dict]:
     """One open loop run: the same workload and schedule for the same seed.
     The engines' counters are read when the warmup ends and after the run,
     so the engine hit rate covers the same requests as the summary."""
-    offsets = schedule.poisson(rate, count, seed)
+    offsets = (arrivals or arrivals_for(workload)).offsets(rate, count, seed)
     requests = generate(workload, count, seed, offsets, **(params or {}))
     urls = list(engines)
 
@@ -92,6 +110,7 @@ def describe(summary: dict) -> str:
 
 def cmd_run(args: argparse.Namespace) -> int:
     params = workload_params(args.workload, args.sharegpt, args.param)
+    arrivals = arrivals_for(args.workload, arrival_overrides(args))
     records, summary = asyncio.run(
         measure(
             args.base_url,
@@ -103,12 +122,14 @@ def cmd_run(args: argparse.Namespace) -> int:
             args.warmup,
             args.engine,
             params,
+            arrivals,
         )
     )
     run = {
         "workload": args.workload,
         "policy": args.label,
         "rate": args.rate,
+        "arrivals": arrivals.to_dict(),
         "requests": args.requests,
         "seed": args.seed,
         "warmup_s": args.warmup,
@@ -167,12 +188,21 @@ def cmd_compare(args: argparse.Namespace) -> int:
         sim_flags=tuple(args.sim_flag) if args.sim_flag else compare.SIM_FLAGS,
         params=_compare_params(args.param) if args.param else compare.Plan().params,
         profile="debug" if args.debug else "release",
+        arrivals=arrival_overrides(args),
     )
     written = compare.run(plan, args.out)
     docs = [results.read(p) for p in written]
     failed = sum(d["summary"].get("errors", 0) for d in docs)
     print(f"{len(written)} runs written to {args.out}; {failed} failed requests")
     return 0
+
+
+def add_arrivals(command: argparse.ArgumentParser) -> None:
+    command.add_argument(
+        "--arrivals", choices=["poisson", "gamma"], help="arrival process; the workload's default"
+    )
+    command.add_argument("--cv", type=float, help="coefficient of variation of Gamma gaps")
+    command.add_argument("--ramp", choices=["diurnal", "none"], help="vary the rate over the run")
 
 
 def parser() -> argparse.ArgumentParser:
@@ -193,6 +223,7 @@ def parser() -> argparse.ArgumentParser:
     run.add_argument("--label", default="", help="policy name to file the result under")
     run.add_argument("--sharegpt", help="ShareGPT JSON to replay as w2 conversations")
     run.add_argument("--param", action="append", default=[], help="workload parameter, k=v")
+    add_arrivals(run)
     run.add_argument("--out", type=Path, required=True)
     run.set_defaults(handler=cmd_run)
 
@@ -211,6 +242,7 @@ def parser() -> argparse.ArgumentParser:
         "--param", action="append", help="workload parameter, as w1.prompts=32; replaces defaults"
     )
     cmp.add_argument("--debug", action="store_true", help="use debug builds")
+    add_arrivals(cmp)
     cmp.add_argument("--out", type=Path, required=True)
     cmp.set_defaults(handler=cmd_compare)
 
