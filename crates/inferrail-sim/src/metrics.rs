@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use inferrail_core::openai::FinishReason;
 use tokio::time::Instant;
 
-use crate::engine::{EngineSnapshot, Sequence};
+use crate::engine::{EngineConfig, EngineSnapshot, Sequence};
 
 pub const CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 
@@ -88,6 +88,7 @@ pub struct Metrics {
     created: f64,
     block_size: usize,
     num_gpu_blocks: usize,
+    prefix_caching: bool,
     prompt_tokens: AtomicU64,
     generation_tokens: AtomicU64,
     prompt_tokens_cached: AtomicU64,
@@ -111,12 +112,7 @@ pub struct Metrics {
 }
 
 impl Metrics {
-    pub fn new(
-        model_name: impl Into<String>,
-        max_model_len: usize,
-        block_size: usize,
-        num_gpu_blocks: usize,
-    ) -> Self {
+    pub fn new(model_name: impl Into<String>, max_model_len: usize, engine: &EngineConfig) -> Self {
         let tokens = token_buckets(max_model_len);
         let created = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -124,8 +120,9 @@ impl Metrics {
         Self {
             model_name: model_name.into(),
             created,
-            block_size,
-            num_gpu_blocks,
+            block_size: engine.block_size,
+            num_gpu_blocks: engine.num_gpu_blocks,
+            prefix_caching: engine.enable_prefix_caching,
             prompt_tokens: AtomicU64::new(0),
             generation_tokens: AtomicU64::new(0),
             prompt_tokens_cached: AtomicU64::new(0),
@@ -157,6 +154,7 @@ impl Metrics {
             first: None,
             last: None,
             generated: 0,
+            preemptions: 0,
             finished: false,
         }
     }
@@ -240,7 +238,7 @@ impl Metrics {
         w.counter(
             "vllm:num_preemptions",
             "Cumulative number of preemption from the engine.",
-            &[(None, 0.0)],
+            &[(None, snap.preemptions as f64)],
         );
         w.counter(
             "vllm:prompt_tokens",
@@ -365,7 +363,10 @@ impl Metrics {
             &[
                 ("block_size", &block_size),
                 ("cache_dtype", "auto"),
-                ("enable_prefix_caching", "True"),
+                (
+                    "enable_prefix_caching",
+                    if self.prefix_caching { "True" } else { "False" },
+                ),
                 ("engine", "0"),
                 ("gpu_memory_utilization", "0.92"),
                 ("num_gpu_blocks", &blocks),
@@ -545,14 +546,13 @@ pub fn go_float(value: f64) -> String {
     repr
 }
 
-/// A request's engine side timeline. The first token counts from when the
-/// simulated GPU produced it, as vLLM stamps it in its engine core, not
-/// from when the timer woke the stream that sends it.
+/// A request's engine side timeline. Tokens count from when the simulated
+/// GPU produced them, as vLLM stamps them in its engine core, not from
+/// when the timer woke the stream that sends them.
 #[derive(Debug, Clone, Copy)]
 struct Admitted {
     arrival: Instant,
     scheduled: Instant,
-    first_token_at: Instant,
     prompt: usize,
     cached: usize,
 }
@@ -566,6 +566,7 @@ pub struct RequestTracker {
     first: Option<Instant>,
     last: Option<Instant>,
     generated: usize,
+    preemptions: u32,
     finished: bool,
 }
 
@@ -581,25 +582,26 @@ impl RequestTracker {
         self.admitted = Some(Admitted {
             arrival: seq.arrival,
             scheduled: seq.scheduled,
-            first_token_at: seq.first_token_at,
             prompt: seq.prompt_tokens,
             cached: seq.cached_tokens,
         });
     }
 
-    pub fn token(&mut self) {
-        let now = Instant::now();
+    /// Counts a token the engine produced at `at`, after `preemptions`
+    /// preemptions so far.
+    pub fn token(&mut self, at: Instant, preemptions: u32) {
         let m = &self.metrics;
         match (self.last, self.admitted) {
-            (Some(last), _) => m.inter_token_latency.observe_duration(now - last),
+            (Some(last), _) => m.inter_token_latency.observe_duration(at - last),
             (None, Some(admitted)) => m
                 .time_to_first_token
-                .observe_duration(admitted.first_token_at - admitted.arrival),
+                .observe_duration(at - admitted.arrival),
             (None, None) => {}
         }
-        self.first.get_or_insert(now);
-        self.last = Some(now);
+        self.first.get_or_insert(at);
+        self.last = Some(at);
         self.generated += 1;
+        self.preemptions = preemptions;
         m.generation_tokens.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -615,12 +617,17 @@ impl RequestTracker {
         }
         let Some(a) = self.admitted else { return };
         let now = Instant::now();
-        let first = self.first.map_or(now, |_| a.first_token_at);
+        let first = self.first.unwrap_or(now);
         let last = self.last.unwrap_or(now).max(first);
-        m.e2e_request_latency.observe_duration(now - a.arrival);
+        let end = if reason == "abort" {
+            now.max(last)
+        } else {
+            last
+        };
+        m.e2e_request_latency.observe_duration(end - a.arrival);
         m.request_queue_time
             .observe_duration(a.scheduled - a.arrival);
-        m.request_inference_time.observe_duration(now - a.scheduled);
+        m.request_inference_time.observe_duration(end - a.scheduled);
         m.request_prefill_time.observe_duration(first - a.scheduled);
         m.request_decode_time.observe_duration(last - first);
         if self.generated > 1 {
@@ -633,7 +640,8 @@ impl RequestTracker {
             .observe(self.max_tokens as f64);
         m.request_params_n.observe(1.0);
         m.request_params_max_tokens.observe(self.max_tokens as f64);
-        m.request_num_preemptions.observe(0.0);
+        m.request_num_preemptions
+            .observe(f64::from(self.preemptions));
         m.request_prefill_kv_computed_tokens
             .observe((a.prompt - a.cached) as f64);
     }
@@ -644,6 +652,14 @@ impl Drop for RequestTracker {
         if !self.finished {
             self.record("abort");
         }
+    }
+}
+
+#[cfg(test)]
+fn small() -> EngineConfig {
+    EngineConfig {
+        num_gpu_blocks: 10,
+        ..EngineConfig::default()
     }
 }
 
@@ -697,7 +713,7 @@ mod tests {
 
     #[test]
     fn histogram_buckets_are_cumulative_with_inf() {
-        let metrics = Metrics::new("m", 100, 16, 10);
+        let metrics = Metrics::new("m", 100, &small());
         for v in [0.0005, 0.003, 0.003, 9999.0] {
             metrics.time_to_first_token.observe(v);
         }
@@ -718,7 +734,7 @@ mod tests {
 
     #[test]
     fn counters_get_total_and_created_samples() {
-        let text = Metrics::new("m", 100, 16, 10).render(&EngineSnapshot::default());
+        let text = Metrics::new("m", 100, &small()).render(&EngineSnapshot::default());
         assert!(text.contains("# TYPE vllm:prompt_tokens_total counter\n"));
         assert!(text.contains("# TYPE vllm:prompt_tokens_created gauge\n"));
         assert!(text.contains("vllm:request_success_total{engine=\"0\",finished_reason=\"abort\",model_name=\"m\"} 0.0\n"));
@@ -726,13 +742,13 @@ mod tests {
 
     #[test]
     fn label_values_are_escaped() {
-        let text = Metrics::new("a\"b\\c\nd", 10, 16, 10).render(&EngineSnapshot::default());
+        let text = Metrics::new("a\"b\\c\nd", 10, &small()).render(&EngineSnapshot::default());
         assert!(text.contains("model_name=\"a\\\"b\\\\c\\nd\""));
     }
 
     #[test]
     fn unfinished_tracker_counts_an_abort() {
-        let metrics = Arc::new(Metrics::new("m", 100, 16, 10));
+        let metrics = Arc::new(Metrics::new("m", 100, &small()));
         drop(metrics.tracker(5));
         metrics.tracker(5).finish(&FinishReason::Length);
         assert_eq!(metrics.finished("abort"), 1);
@@ -747,7 +763,7 @@ mod concurrency {
 
     #[test]
     fn concurrent_scrapes_never_see_a_torn_histogram() {
-        let metrics = Arc::new(Metrics::new("m", 100, 16, 10));
+        let metrics = Arc::new(Metrics::new("m", 100, &small()));
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let writers: Vec<_> = (0..3)
             .map(|_| {

@@ -31,6 +31,7 @@ fn sim(latency: LatencyModel) -> SimConfig {
     let mut config = sim_config(&[MODEL], latency);
     config.enable_prompt_tokens_details = true;
     config.engine.max_num_seqs = 4_096;
+    config.engine.max_num_batched_tokens = 8_192;
     config
 }
 
@@ -141,6 +142,7 @@ async fn hot_prompts_and_sessions_under_load_spread_stick_and_explain() {
         prefill_pair_secs: 0.0,
         prefill_fixed_secs: 1e-3,
         decode_token_secs: 2e-3,
+        decode_seq_secs: 0.0,
     };
     let mut sims = Vec::new();
     for _ in 0..4 {

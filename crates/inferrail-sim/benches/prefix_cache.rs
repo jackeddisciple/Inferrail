@@ -1,7 +1,8 @@
 use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use inferrail_sim::cache::{PrefixCache, block_hashes};
+use inferrail_sim::cache::block_hashes;
+use inferrail_sim::pool::BlockPool;
 use inferrail_sim::tokenizer;
 
 fn prompt(tokens: usize) -> Vec<u32> {
@@ -23,14 +24,23 @@ fn hashing(c: &mut Criterion) {
 }
 
 fn lookup(c: &mut Criterion) {
-    let mut group = c.benchmark_group("prefix_cache_match");
+    let mut group = c.benchmark_group("block_pool_hit");
     for tokens in [1_024, 8_192, 32_768] {
         let hashes = block_hashes(&prompt(tokens), 16);
-        let mut cache = PrefixCache::new(1 << 16);
-        cache.insert(&hashes);
+        let mut pool = BlockPool::new(1 << 16, true);
+        let mut blocks = Vec::new();
+        pool.allocate(hashes.len(), &mut blocks, &mut Vec::new());
+        for (&id, &hash) in blocks.iter().zip(&hashes) {
+            pool.cache(id, hash);
+        }
+        pool.free(&blocks);
+        let mut hit = Vec::with_capacity(hashes.len());
         group.throughput(Throughput::Elements(hashes.len() as u64));
         group.bench_with_input(BenchmarkId::from_parameter(tokens), &hashes, |b, hashes| {
-            b.iter(|| cache.match_prefix(black_box(hashes)))
+            b.iter(|| {
+                pool.longest_hit(black_box(hashes), &mut hit);
+                hit.len()
+            })
         });
     }
     group.finish();

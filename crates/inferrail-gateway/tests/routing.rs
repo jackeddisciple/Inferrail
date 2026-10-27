@@ -25,6 +25,7 @@ fn sim(blocks: usize, latency: LatencyModel) -> SimConfig {
     let mut config = sim_config(&[MODEL], latency);
     config.enable_prompt_tokens_details = true;
     config.engine.num_gpu_blocks = blocks;
+    config.max_model_len = config.max_model_len.min(blocks * 16);
     config
 }
 
@@ -240,6 +241,7 @@ async fn queued_prefill_is_estimated_while_it_waits_and_drains_after() {
         prefill_pair_secs: 0.0,
         prefill_fixed_secs: 1e-3,
         decode_token_secs: 1e-3,
+        decode_seq_secs: 0.0,
     };
     let sims = fleet_of(1, 4_096, latency).await;
     let gw = TestGateway::start(routed(

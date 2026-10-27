@@ -17,6 +17,7 @@ fn prefill_heavy() -> LatencyModel {
         prefill_pair_secs: 0.0,
         prefill_fixed_secs: 2e-3,
         decode_token_secs: 5e-3,
+        decode_seq_secs: 0.0,
     }
 }
 
@@ -399,6 +400,7 @@ async fn engine_ttft_on_an_idle_engine_is_exactly_the_latency_model() {
         prefill_pair_secs: 2e-9,
         prefill_fixed_secs: 3e-3,
         decode_token_secs: 1e-3,
+        decode_seq_secs: 0.0,
     };
     let sim = spawn(config(latency)).await;
     let mut expected = 0.0;

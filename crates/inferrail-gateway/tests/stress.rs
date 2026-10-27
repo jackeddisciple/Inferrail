@@ -34,6 +34,7 @@ async fn sims(n: usize, latency: LatencyModel) -> Vec<Upstream> {
     for _ in 0..n {
         let mut config = sim_config(&[MODEL], latency);
         config.engine.max_num_seqs = 4_096;
+        config.engine.max_num_batched_tokens = 8_192;
         out.push(Upstream::spawn(config).await);
     }
     out

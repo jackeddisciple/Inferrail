@@ -25,6 +25,7 @@ impl Slot {
 #[derive(Debug)]
 struct Cell {
     generation: u64,
+    capacity: usize,
     shadow: Lru,
 }
 
@@ -98,6 +99,7 @@ impl KvIndex {
                 let index = u32::try_from(cells.len()).unwrap_or(u32::MAX);
                 cells.push(Arc::new(Mutex::new(Cell {
                     generation: 0,
+                    capacity: 0,
                     shadow: Lru::new(0),
                 })));
                 registry.ids.push(Some(id.clone()));
@@ -132,6 +134,19 @@ impl KvIndex {
     /// on that replica, whose shadow cache holds `capacity` blocks. Returns
     /// the blocks the replica did not hold before, for [`KvIndex::revoke`].
     pub fn record(&self, slot: Slot, hashes: &[BlockHash], capacity: usize) -> Vec<BlockHash> {
+        self.record_with(slot, hashes, capacity, 0)
+    }
+
+    /// Like [`KvIndex::record`] for a prompt that also takes `held` blocks
+    /// without a hash while it runs, such as its last partial block: the
+    /// replica then keeps that many fewer cached blocks.
+    pub fn record_with(
+        &self,
+        slot: Slot,
+        hashes: &[BlockHash],
+        capacity: usize,
+        held: usize,
+    ) -> Vec<BlockHash> {
         let Some(cell) = self.cell(slot) else {
             return Vec::new();
         };
@@ -140,9 +155,11 @@ impl KvIndex {
             return Vec::new();
         }
         let index = slot.index;
-        if cell.shadow.capacity() != capacity {
+        cell.capacity = capacity;
+        let room = capacity.saturating_sub(held);
+        if cell.shadow.capacity() != room {
             cell.shadow
-                .resize(capacity, |gone| self.blocks.remove(gone, index));
+                .resize(room, |gone| self.blocks.remove(gone, index));
         }
         let chain: Vec<u128> = raw(hashes).collect();
         let fresh: Vec<u128> = chain
@@ -266,7 +283,7 @@ impl KvIndex {
                 replicas.push(ReplicaStats {
                     replica: id.clone(),
                     blocks: cell.shadow.len(),
-                    capacity: cell.shadow.capacity(),
+                    capacity: cell.capacity,
                 });
             }
         }
@@ -361,6 +378,20 @@ mod tests {
         assert_eq!(index.stats().entries, 2);
         index.record(a, &chain(3, 4), 0);
         assert_eq!(index.stats().entries, 0);
+    }
+
+    #[test]
+    fn blocks_held_without_a_hash_leave_less_room_for_cached_ones() {
+        let index = KvIndex::new();
+        let a = index.slot(&id(0));
+        index.record(a, &chain(1, 4), 8);
+        index.record_with(a, &chain(2, 4), 8, 1);
+        assert_eq!(index.longest_prefix(&chain(1, 4), &[a]), [3]);
+        assert_eq!(index.stats().replicas[0].blocks, 7);
+        assert_eq!(index.stats().replicas[0].capacity, 8);
+        index.record(a, &chain(2, 4), 8);
+        assert_eq!(index.longest_prefix(&chain(1, 4), &[a]), [3]);
+        index.verify().unwrap();
     }
 
     #[test]

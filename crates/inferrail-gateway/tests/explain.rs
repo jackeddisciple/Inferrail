@@ -24,6 +24,7 @@ fn sim(blocks: usize, latency: LatencyModel) -> SimConfig {
     let mut config = sim_config(&[MODEL], latency);
     config.enable_prompt_tokens_details = true;
     config.engine.num_gpu_blocks = blocks;
+    config.max_model_len = config.max_model_len.min(blocks * 16);
     config
 }
 

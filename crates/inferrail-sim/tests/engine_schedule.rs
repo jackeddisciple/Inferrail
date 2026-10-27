@@ -1,5 +1,5 @@
-//! Randomized schedules on a paused clock: arrivals, prompt sharing and
-//! cancellations must never break the engine's invariants.
+//! Randomized schedules on a paused clock: arrivals, prompt sharing,
+//! preemption and cancellations must never break the engine's invariants.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -58,11 +58,14 @@ async fn run_schedule(arrivals: Vec<Arrival>, cap: usize) -> Result<(), TestCase
         block_size: 16,
         num_gpu_blocks: 64,
         max_num_seqs: cap,
+        max_num_batched_tokens: 128,
+        enable_prefix_caching: true,
         latency: LatencyModel {
             prefill_token_secs: 100e-6,
             prefill_pair_secs: 1e-9,
             prefill_fixed_secs: 1e-3,
             decode_token_secs: 5e-3,
+            decode_seq_secs: 0.0,
         },
     };
     let engine = Engine::start(config);
@@ -84,23 +87,26 @@ async fn run_schedule(arrivals: Vec<Arrival>, cap: usize) -> Result<(), TestCase
         let engine = engine.clone();
         tasks.push(tokio::spawn(async move {
             let tokens = prompt(a.prefix, a.suffix, i as u64);
+            let output = (0..=a.tokens as u32).map(|t| 90_000 + t).collect();
             let work = async {
                 let mut seq = engine
-                    .submit(&tokens)
+                    .submit(&tokens, output)
                     .admitted()
                     .await
                     .expect("engine alive");
-                let done = Done {
+                let first_token = seq.next_token().await.expect("first token");
+                let mut generated = 1;
+                while seq.next_token().await.is_some() {
+                    generated += 1;
+                }
+                assert_eq!(generated, a.tokens + 1);
+                Done {
                     arrival: seq.arrival,
                     scheduled: seq.scheduled,
-                    first_token: seq.first_token_at,
+                    first_token,
                     prompt: seq.prompt_tokens,
                     cached: seq.cached_tokens,
-                };
-                for _ in 0..a.tokens {
-                    seq.next_token().await;
                 }
-                done
             };
             match a.cancel_after_ms {
                 Some(ms) => tokio::time::timeout(Duration::from_millis(ms), work)
@@ -116,7 +122,14 @@ async fn run_schedule(arrivals: Vec<Arrival>, cap: usize) -> Result<(), TestCase
             finished.push(done);
         }
     }
-    tokio::time::sleep(Duration::from_millis(1)).await;
+    let drained = Instant::now();
+    while engine.snapshot().running + engine.snapshot().waiting > 0 {
+        prop_assert!(
+            drained.elapsed() < Duration::from_secs(10),
+            "aborts never freed"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
     watcher.abort();
 
     let snap = engine.snapshot();

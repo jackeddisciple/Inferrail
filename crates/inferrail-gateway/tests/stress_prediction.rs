@@ -30,7 +30,8 @@ fn sim(blocks: usize, latency: LatencyModel) -> SimConfig {
     config.enable_prompt_tokens_details = true;
     config.engine.num_gpu_blocks = blocks;
     config.engine.max_num_seqs = 4_096;
-    config.max_model_len = 1 << 20;
+    config.engine.max_num_batched_tokens = 8_192;
+    config.max_model_len = (1 << 20).min(blocks * 16);
     config
 }
 

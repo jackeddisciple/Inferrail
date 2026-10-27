@@ -23,7 +23,7 @@ use serde::Serialize;
 use tokio::net::TcpListener;
 use xxhash_rust::xxh3::xxh3_128;
 
-use crate::engine::{Engine, EngineConfig, Sequence};
+use crate::engine::{Engine, EngineConfig, EngineError, Sequence};
 use crate::metrics::{self, Metrics};
 use crate::tokenizer;
 use wire::Meta;
@@ -65,6 +65,15 @@ impl SimConfig {
     pub fn validate(&self) -> Result<(), InvalidConfig> {
         if self.max_model_len == 0 {
             return Err(InvalidConfig("max_model_len must be positive".to_owned()));
+        }
+        let kv_tokens = self.engine.kv_tokens();
+        if kv_tokens < self.max_model_len {
+            return Err(InvalidConfig(format!(
+                "to serve at least one request with the model's max seq len ({}), the KV cache needs {} blocks but has {}; raise num_gpu_blocks or lower max_model_len",
+                self.max_model_len,
+                self.max_model_len.div_ceil(self.engine.block_size.max(1)),
+                self.engine.num_gpu_blocks
+            )));
         }
         if let Some(bad) = self
             .served_names()
@@ -120,8 +129,7 @@ impl Sim {
         let metrics = Arc::new(Metrics::new(
             names[0].clone(),
             config.max_model_len,
-            config.engine.block_size,
-            config.engine.num_gpu_blocks,
+            &config.engine,
         ));
         Ok(Self {
             state: Arc::new(AppState {
@@ -213,6 +221,13 @@ impl ApiError {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             body: Box::new(ErrorResponse::new(message, "InternalServerError", 500)),
+        }
+    }
+
+    fn engine(err: EngineError) -> Self {
+        match err {
+            EngineError::Stopped => Self::internal(err.to_string()),
+            EngineError::TooLong | EngineError::NoOutput => Self::bad_request(err.to_string()),
         }
     }
 }
@@ -511,21 +526,32 @@ fn cached_detail(state: &AppState, seq: &Sequence) -> Option<u64> {
         .then_some(seq.cached_tokens as u64)
 }
 
+fn submit(state: &AppState, plan: &Plan) -> (crate::engine::Ticket, Vec<String>) {
+    let (ids, pieces) = tokenizer::generate(plan.seed, plan.max_tokens)
+        .into_iter()
+        .unzip();
+    (state.engine.submit(&plan.prompt, ids), pieces)
+}
+
 async fn full_response(state: Arc<AppState>, plan: Plan) -> Result<Response, ApiError> {
     let mut tracker = state.metrics.tracker(plan.max_tokens);
-    let mut seq = match state.engine.submit(&plan.prompt).admitted().await {
+    let (ticket, pieces) = submit(&state, &plan);
+    let mut seq = match ticket.admitted().await {
         Ok(seq) => seq,
         Err(err) => {
             tracker.finish(&FinishReason::Error);
-            return Err(ApiError::internal(err.to_string()));
+            return Err(ApiError::engine(err));
         }
     };
     tracker.admitted(&seq);
     let mut text = String::new();
-    for (_, piece) in tokenizer::generate(plan.seed, plan.max_tokens) {
-        seq.next_token().await;
-        tracker.token();
-        text.push_str(&piece);
+    for piece in &pieces {
+        let Some(at) = seq.next_token().await else {
+            tracker.finish(&FinishReason::Error);
+            return Err(ApiError::engine(EngineError::Stopped));
+        };
+        tracker.token(at, seq.preemptions());
+        text.push_str(piece);
     }
     tracker.finish(&plan.finish);
     let usage = wire::full_usage(
@@ -574,30 +600,35 @@ fn token_frames(
 fn stream_response(state: Arc<AppState>, plan: Plan) -> Response {
     let body = async_stream::stream! {
         let mut tracker = state.metrics.tracker(plan.max_tokens);
-        let admitted = state.engine.submit(&plan.prompt).admitted().await;
-        let mut seq = match admitted {
+        let (ticket, pieces) = submit(&state, &plan);
+        let mut seq = match ticket.admitted().await {
             Ok(seq) => seq,
             Err(err) => {
                 tracker.finish(&FinishReason::Error);
-                yield Ok::<Bytes, Infallible>(frame(&ApiError::internal(err.to_string()).body));
+                yield Ok::<Bytes, Infallible>(frame(&ApiError::engine(err).body));
                 yield Ok(Bytes::from_static(DONE_FRAME));
                 return;
             }
         };
         tracker.admitted(&seq);
-        let pieces = tokenizer::generate(plan.seed, plan.max_tokens);
         let Some((last, head)) = pieces.split_last() else {
             return;
         };
-        for (i, (_, piece)) in head.iter().enumerate() {
-            seq.next_token().await;
-            tracker.token();
+        for (i, piece) in head.iter().enumerate() {
+            let Some(at) = seq.next_token().await else {
+                tracker.finish(&FinishReason::Error);
+                return;
+            };
+            tracker.token(at, seq.preemptions());
             for bytes in token_frames(&plan, i, piece, None) {
                 yield Ok(bytes);
             }
         }
-        seq.next_token().await;
-        tracker.token();
+        let Some(at) = seq.next_token().await else {
+            tracker.finish(&FinishReason::Error);
+            return;
+        };
+        tracker.token(at, seq.preemptions());
         tracker.finish(&plan.finish);
         let usage = wire::stream_usage(
             plan.prompt.len() as u64,
@@ -605,7 +636,7 @@ fn stream_response(state: Arc<AppState>, plan: Plan) -> Response {
             cached_detail(&state, &seq),
         );
         drop(seq);
-        for bytes in token_frames(&plan, head.len(), &last.1, Some(&plan.finish)) {
+        for bytes in token_frames(&plan, head.len(), last, Some(&plan.finish)) {
             yield Ok(bytes);
         }
         if plan.include_usage {
@@ -667,7 +698,7 @@ async fn version() -> Response {
 }
 
 async fn reset_prefix_cache(State(state): State<Arc<AppState>>) -> StatusCode {
-    state.engine.reset_prefix_cache();
+    state.engine.reset_prefix_cache().await;
     StatusCode::OK
 }
 

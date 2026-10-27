@@ -38,6 +38,12 @@ impl Prompt {
     pub(crate) fn cached_tokens(&self, blocks: usize) -> u32 {
         u32::try_from(blocks.min(self.cacheable) * self.block_size).unwrap_or(u32::MAX)
     }
+
+    /// Blocks of the engine's cache this prompt takes while it runs beyond
+    /// its full ones: its last, partial block, which holds no hash.
+    pub(crate) fn partial_blocks(&self) -> usize {
+        usize::from(!(self.tokens as usize).is_multiple_of(self.block_size.max(1)))
+    }
 }
 
 /// Why a request was routed without its prompt.

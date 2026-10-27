@@ -26,6 +26,7 @@ fn sim(blocks: usize) -> SimConfig {
     let mut config = sim_config(&[MODEL], LatencyModel::ZERO);
     config.enable_prompt_tokens_details = true;
     config.engine.num_gpu_blocks = blocks;
+    config.max_model_len = config.max_model_len.min(blocks * 16);
     config
 }
 
@@ -155,7 +156,7 @@ async fn streams_and_completions_carry_predictions() {
 
 #[tokio::test]
 async fn capacity_is_learned_from_the_engine() {
-    let upstream = Upstream::spawn(sim(40)).await;
+    let upstream = Upstream::spawn(sim(60)).await;
     let gw = TestGateway::start(tokenized(fleet(
         &urls(&[&upstream]),
         &format!("{FAST_HEALTH}load:\n  scrape_interval: 20ms\n  scrape_timeout: 20ms\n  max_age: 100ms\n"),
@@ -172,7 +173,7 @@ async fn capacity_is_learned_from_the_engine() {
     }
     let page = gw.gateway.render_metrics();
     assert!(
-        page.contains("inferrail_replica_index_capacity_blocks{replica=\"r0\"} 40"),
+        page.contains("inferrail_replica_index_capacity_blocks{replica=\"r0\"} 60"),
         "{page}"
     );
 }

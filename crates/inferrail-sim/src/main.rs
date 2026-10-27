@@ -29,9 +29,17 @@ struct Args {
     max_model_len: usize,
     #[arg(long, default_value_t = 256)]
     max_num_seqs: usize,
+    /// Tokens one scheduler step may compute; longer prompts prefill in chunks.
+    #[arg(long, default_value_t = 2_048)]
+    max_num_batched_tokens: usize,
     /// KV cache capacity in blocks.
     #[arg(long, alias = "num-gpu-blocks", default_value_t = 4_096)]
     num_gpu_blocks_override: usize,
+    /// Keep finished blocks for later prompts to reuse (the default).
+    #[arg(long, overrides_with = "no_enable_prefix_caching")]
+    enable_prefix_caching: bool,
+    #[arg(long, overrides_with = "enable_prefix_caching")]
+    no_enable_prefix_caching: bool,
     /// Report cached prompt tokens in usage, like vLLM's flag of the same name.
     #[arg(long)]
     enable_prompt_tokens_details: bool,
@@ -49,9 +57,12 @@ struct Args {
     /// Fixed prefill overhead in milliseconds (d).
     #[arg(long, default_value_t = 5.0)]
     prefill_fixed_ms: f64,
-    /// Time per output token in milliseconds.
+    /// Time of a decode step for one sequence in milliseconds.
     #[arg(long, default_value_t = 20.0)]
     decode_token_ms: f64,
+    /// Time each further sequence adds to a decode step in microseconds.
+    #[arg(long, default_value_t = 100.0)]
+    decode_seq_us: f64,
     /// Ignore the latency flags and answer as fast as possible.
     #[arg(long)]
     zero_latency: bool,
@@ -69,6 +80,7 @@ impl Args {
                 prefill_pair_secs: self.prefill_pair_ns / 1e9,
                 prefill_fixed_secs: self.prefill_fixed_ms / 1e3,
                 decode_token_secs: self.decode_token_ms / 1e3,
+                decode_seq_secs: self.decode_seq_us / 1e6,
             }
         };
         SimConfig {
@@ -82,6 +94,8 @@ impl Args {
                 block_size: self.block_size,
                 num_gpu_blocks: self.num_gpu_blocks_override,
                 max_num_seqs: self.max_num_seqs,
+                max_num_batched_tokens: self.max_num_batched_tokens,
+                enable_prefix_caching: !self.no_enable_prefix_caching,
                 latency,
             },
         }
@@ -128,6 +142,8 @@ async fn main() -> anyhow::Result<()> {
         block_size = config.engine.block_size,
         num_gpu_blocks = config.engine.num_gpu_blocks,
         max_num_seqs = config.engine.max_num_seqs,
+        max_num_batched_tokens = config.engine.max_num_batched_tokens,
+        prefix_caching = config.engine.enable_prefix_caching,
         latency = ?config.engine.latency,
         "inferrail-sim listening"
     );
@@ -149,10 +165,18 @@ mod tests {
             (got.prefill_pair_secs, want.prefill_pair_secs),
             (got.prefill_fixed_secs, want.prefill_fixed_secs),
             (got.decode_token_secs, want.decode_token_secs),
+            (got.decode_seq_secs, want.decode_seq_secs),
         ] {
             assert!((a - b).abs() <= b * 1e-12, "{a} != {b}");
         }
         assert_eq!(config.served_names(), ["inferrail/sim-8b"]);
+        assert_eq!(
+            config.engine,
+            inferrail_sim::engine::EngineConfig {
+                latency: config.engine.latency,
+                ..inferrail_sim::engine::EngineConfig::default()
+            }
+        );
     }
 
     #[test]
@@ -164,13 +188,26 @@ mod tests {
             "b",
             "--num-gpu-blocks-override",
             "99",
+            "--max-model-len",
+            "1584",
+            "--max-num-batched-tokens",
+            "512",
             "--enable-prompt-tokens-details",
+            "--no-enable-prefix-caching",
             "--zero-latency",
         ]);
         let config = args.sim_config();
         assert!(config.validate().is_ok());
         assert_eq!(config.served_names(), ["a", "b"]);
         assert_eq!(config.engine.num_gpu_blocks, 99);
+        assert_eq!(config.engine.max_num_batched_tokens, 512);
+        assert!(!config.engine.enable_prefix_caching);
+        let on = Args::parse_from([
+            "inferrail-sim",
+            "--no-enable-prefix-caching",
+            "--enable-prefix-caching",
+        ]);
+        assert!(on.sim_config().engine.enable_prefix_caching);
         assert!(config.enable_prompt_tokens_details);
         assert!(config.engine.latency.is_zero());
     }
@@ -181,6 +218,9 @@ mod tests {
             &["inferrail-sim", "--block-size", "0"][..],
             &["inferrail-sim", "--max-num-seqs", "0"],
             &["inferrail-sim", "--max-model-len", "0"],
+            &["inferrail-sim", "--num-gpu-blocks-override", "99"],
+            &["inferrail-sim", "--max-num-batched-tokens", "100"],
+            &["inferrail-sim", "--decode-seq-us=-1"],
             &["inferrail-sim", "--decode-token-ms=-1"],
             &["inferrail-sim", "--served-model-name", "has space"],
         ] {

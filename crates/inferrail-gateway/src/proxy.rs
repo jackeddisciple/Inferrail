@@ -291,7 +291,9 @@ async fn attempt(
                     shared.config.index.default_capacity_blocks,
                 );
                 let slot = index.slot(replica.id());
-                Some((index, slot, index.record(slot, &prompt.hashes, capacity)))
+                let held = prompt.partial_blocks();
+                let fresh = index.record_with(slot, &prompt.hashes, capacity, held);
+                Some((index, slot, fresh))
             }
             _ => None,
         };

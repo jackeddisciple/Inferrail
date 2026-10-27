@@ -4,15 +4,15 @@ use inferrail_sim::server::{Sim, SimConfig};
 use tokio::net::TcpListener;
 
 async fn sim(latency: LatencyModel) -> String {
-    serve(latency, SimConfig::default().engine.num_gpu_blocks).await
+    serve(latency, true).await
 }
 
-async fn serve(latency: LatencyModel, blocks: usize) -> String {
+async fn serve(latency: LatencyModel, caching: bool) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let url = format!("http://{}", listener.local_addr().expect("addr"));
     let mut config = SimConfig::default();
     config.engine.latency = latency;
-    config.engine.num_gpu_blocks = blocks;
+    config.engine.enable_prefix_caching = caching;
     let sim = Sim::new(config).expect("sim config");
     tokio::spawn(sim.serve(listener, std::future::pending()));
     url
@@ -71,6 +71,7 @@ async fn the_fit_recovers_other_parameters_within_five_percent() {
             prefill_pair_secs: 8e-9,
             prefill_fixed_secs: 12e-3,
             decode_token_secs: 5e-3,
+            decode_seq_secs: 0.0,
         },
         10_000,
     )
@@ -103,7 +104,7 @@ async fn a_second_run_on_the_same_engine_measures_it_again() {
 async fn an_engine_that_caches_nothing_is_fitted_on_what_it_computed() {
     let latency = LatencyModel::GPU_24GB_8B;
     let plan = Plan {
-        url: serve(latency, 0).await,
+        url: serve(latency, false).await,
         max_context: 6_000,
         repeats: 1,
         ..Plan::default()

@@ -22,6 +22,7 @@ pub fn fast_latency() -> LatencyModel {
         prefill_pair_secs: 0.0,
         prefill_fixed_secs: 1e-3,
         decode_token_secs: 2e-3,
+        decode_seq_secs: 0.0,
     }
 }
 

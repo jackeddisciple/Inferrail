@@ -1,14 +1,18 @@
 use std::time::Duration;
 
-/// Prefill and decode timing with the same shape as the router's cost model:
-/// `P(u, c) = a*u + b*u*(c + u/2) + d` for `u` uncached tokens attending to
-/// `c` cached ones, and a constant time per decoded token.
+/// Step timing with the same shape as the router's cost model. A prompt of
+/// `u` uncached tokens attending to `c` cached ones costs
+/// `P(u, c) = a*u + b*u*(c + u/2) + d` however it is cut into chunks, `d`
+/// once per prefill. A step that decodes `n` sequences costs
+/// `decode_token_secs + decode_seq_secs * (n - 1)` on top of its prefill
+/// chunks, so prefills and decodes sharing a step slow each other down.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LatencyModel {
     pub prefill_token_secs: f64,
     pub prefill_pair_secs: f64,
     pub prefill_fixed_secs: f64,
     pub decode_token_secs: f64,
+    pub decode_seq_secs: f64,
 }
 
 impl LatencyModel {
@@ -17,14 +21,17 @@ impl LatencyModel {
         prefill_pair_secs: 0.0,
         prefill_fixed_secs: 0.0,
         decode_token_secs: 0.0,
+        decode_seq_secs: 0.0,
     };
 
-    /// Roughly an 8B model on one 24 GB GPU: 10k prefill tokens/s, 20 ms TPOT.
+    /// Roughly an 8B model on one 24 GB GPU: 10k prefill tokens/s, 20 ms TPOT
+    /// alone and 0.1 ms more for every other sequence in the batch.
     pub const GPU_24GB_8B: Self = Self {
         prefill_token_secs: 100e-6,
         prefill_pair_secs: 3.3e-9,
         prefill_fixed_secs: 5e-3,
         decode_token_secs: 20e-3,
+        decode_seq_secs: 100e-6,
     };
 
     pub fn validate(&self) -> Result<(), String> {
@@ -33,6 +40,7 @@ impl LatencyModel {
             ("prefill_pair_secs", self.prefill_pair_secs),
             ("prefill_fixed_secs", self.prefill_fixed_secs),
             ("decode_token_secs", self.decode_token_secs),
+            ("decode_seq_secs", self.decode_seq_secs),
         ] {
             if !value.is_finite() || value < 0.0 {
                 return Err(format!(
@@ -48,20 +56,36 @@ impl LatencyModel {
     }
 
     pub fn prefill_secs(&self, uncached: u64, cached: u64) -> f64 {
-        let u = uncached as f64;
-        let c = cached as f64;
-        self.prefill_token_secs * u
-            + self.prefill_pair_secs * u * (c + u / 2.0)
-            + self.prefill_fixed_secs
+        self.chunk_secs(uncached, cached) + self.prefill_fixed_secs
     }
 
     pub fn prefill(&self, uncached: u64, cached: u64) -> Duration {
         seconds(self.prefill_secs(uncached, cached))
     }
 
+    /// One chunk of `tokens` prompt tokens after `context` already computed,
+    /// without the fixed cost; chunks of one prompt add up to its prefill.
+    pub fn chunk_secs(&self, tokens: u64, context: u64) -> f64 {
+        let u = tokens as f64;
+        let c = context as f64;
+        self.prefill_token_secs * u + self.prefill_pair_secs * u * (c + u / 2.0)
+    }
+
+    /// One step's decode work for `sequences` decoding together.
+    pub fn decode_secs(&self, sequences: u64) -> f64 {
+        match sequences {
+            0 => 0.0,
+            n => self.decode_token_secs + self.decode_seq_secs * (n - 1) as f64,
+        }
+    }
+
     pub fn decode_step(&self) -> Duration {
         seconds(self.decode_token_secs)
     }
+}
+
+pub(crate) fn duration(secs: f64) -> Duration {
+    seconds(secs)
 }
 
 impl Default for LatencyModel {
@@ -87,6 +111,23 @@ mod tests {
         assert!((0.6..0.7).contains(&cold), "{cold}");
         assert!(warm < cold / 2.0, "{warm}");
         assert_eq!(model.decode_step(), Duration::from_millis(20));
+        assert_eq!(model.decode_secs(0), 0.0);
+        assert!((model.decode_secs(65) - 26.4e-3).abs() < 1e-12);
+    }
+
+    #[test]
+    fn chunks_add_up_to_the_whole_prefill() {
+        let model = LatencyModel::default();
+        let (u, c) = (7_000u64, 1_500u64);
+        let whole = model.prefill_secs(u, c);
+        let mut done = 0;
+        let mut chunked = model.prefill_fixed_secs;
+        while done < u {
+            let n = (u - done).min(2_048);
+            chunked += model.chunk_secs(n, c + done);
+            done += n;
+        }
+        assert!((whole - chunked).abs() < 1e-12, "{whole} vs {chunked}");
     }
 
     #[test]
@@ -104,6 +145,9 @@ mod tests {
         };
         assert!(model.validate().is_err());
         model.prefill_pair_secs = f64::NAN;
+        assert!(model.validate().is_err());
+        model.prefill_pair_secs = 0.0;
+        model.decode_seq_secs = -1e-6;
         assert!(model.validate().is_err());
         assert!(LatencyModel::default().validate().is_ok());
     }
