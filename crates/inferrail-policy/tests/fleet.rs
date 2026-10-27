@@ -188,6 +188,7 @@ fn serve_with(
         let ctx = RouteContext {
             prompt_tokens: prompt.tokens,
             blocks: &prompt.blocks,
+            block_size: BLOCK,
             now: (now * 1e9) as u64,
             ..RouteContext::new(&model, &candidates)
         };
@@ -376,4 +377,66 @@ fn hot(count: usize, seed: u64, system: u32) -> Vec<Prompt> {
             }
         })
         .collect()
+}
+
+/// Conversations that all open with one system prompt: each turn's prompt
+/// is the system prompt, every earlier question and reply, and a new
+/// question, and turns of `live` conversations interleave.
+fn conversations(count: usize, live: usize, seed: u64) -> Vec<Prompt> {
+    let rng = SplitMix::new(seed);
+    let mut talks: Vec<Vec<(u64, u32)>> = Vec::new();
+    let mut part = 5_000_000u64;
+    let mut out = Vec::new();
+    while out.len() < count {
+        if talks.len() < live {
+            talks.push(vec![(9, 1_024)]);
+        }
+        let k = rng.below(talks.len());
+        let (question, reply) = (between(&rng, 3, 20) * BLOCK, between(&rng, 2, 8) * BLOCK);
+        talks[k].push((part, question));
+        let tokens: u32 = talks[k].iter().map(|&(_, t)| t).sum();
+        out.push(Prompt {
+            tokens,
+            blocks: chain(&talks[k]),
+            output: reply,
+        });
+        talks[k].push((part + 1, reply));
+        part += 2;
+        if tokens > 6_000 {
+            talks.swap_remove(k);
+        }
+    }
+    out
+}
+
+#[test]
+fn conversations_keep_their_history_when_their_system_prompt_turns_hot() {
+    let prompts = conversations(4_000, 40, 3);
+    let cold = Settings {
+        hot_prefix: None,
+        ..Settings::seeded(11)
+    };
+    for rate in [20.0, 30.0] {
+        let plain = serve_with(
+            PolicyKind::CostModel,
+            cold.clone(),
+            &prompts,
+            rate,
+            4,
+            4_096,
+        );
+        let hot = serve(PolicyKind::CostModel, &prompts, rate, 4, 4_096);
+        assert!(
+            hot.hit_rate() >= plain.hit_rate() - 0.01,
+            "at {rate}/s hit rate {:.3} vs {:.3} without replication",
+            hot.hit_rate(),
+            plain.hit_rate()
+        );
+        assert!(
+            hot.p99_ttft() <= plain.p99_ttft() * 1.1,
+            "at {rate}/s p99 {:.3} vs {:.3} without replication",
+            hot.p99_ttft(),
+            plain.p99_ttft()
+        );
+    }
 }

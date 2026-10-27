@@ -70,6 +70,8 @@ pub struct RouteContext<'a> {
     pub prompt_tokens: u32,
     /// Hashes of the prompt's full blocks; empty when it was not tokenized.
     pub blocks: &'a [BlockHash],
+    /// Tokens per block.
+    pub block_size: u32,
     /// Names the conversation a request belongs to, when the client did.
     pub session: Option<u64>,
     /// The gateway's clock in nanoseconds, for rates.
@@ -84,6 +86,7 @@ impl<'a> RouteContext<'a> {
             model,
             prompt_tokens: 0,
             blocks: &[],
+            block_size: 0,
             session: None,
             now: 0,
             candidates,

@@ -124,9 +124,11 @@ impl CostModelPolicy {
     /// A root prefix that needs more than `utilization` of one replica's
     /// prefill gets `ceil(demand / utilization)` owners: the candidates
     /// holding most of it, then those its key hashes to. Every owner is
-    /// priced as if it held what the best of them holds, so the cost model
-    /// shares the prefix among them by their queues; the first request an
-    /// owner takes warms it.
+    /// priced as if it held what all the owners holding the whole root
+    /// share, so the cost model shares the prefix among them by their
+    /// queues, while what only one of them holds, such as a conversation's
+    /// history, counts only there; the first request an owner takes warms
+    /// it.
     fn spread_hot_prefix(&self, ctx: &RouteContext<'_>, plan: &mut Plan, observe: bool) {
         let Some(hot) = &self.hot else { return };
         let Some(root) = prefix_key(ctx.blocks, hot.blocks) else {
@@ -154,13 +156,23 @@ impl CostModelPolicy {
             let c = &candidates[i];
             Reverse((c.cached_tokens, weight(root, c.id)))
         });
-        let warm = candidates[order[0]].cached_tokens;
-        for &i in &order[..owners] {
+        let owned = &order[..owners];
+        let root_tokens = (ctx.blocks.len().min(hot.blocks as usize) as u32)
+            .saturating_mul(ctx.block_size)
+            .max(1);
+        let shared = owned
+            .iter()
+            .map(|&i| candidates[i].cached_tokens)
+            .filter(|&held| held >= root_tokens)
+            .min()
+            .unwrap_or(0);
+        for &i in owned {
             plan.owner[i] = true;
-            let warmed = Hits::gpu(warm.max(candidates[i].cached_tokens));
-            plan.estimates[i] = self
-                .cost
-                .estimate(ctx.prompt_tokens, &candidates[i], warmed);
+            if candidates[i].cached_tokens < shared {
+                plan.estimates[i] =
+                    self.cost
+                        .estimate(ctx.prompt_tokens, &candidates[i], Hits::gpu(shared));
+            }
         }
     }
 
@@ -315,6 +327,7 @@ mod tests {
         RouteContext {
             prompt_tokens: prompt,
             blocks,
+            block_size: 16,
             ..RouteContext::new(&pool.model, candidates)
         }
     }
@@ -523,6 +536,50 @@ mod tests {
             choices.iter().all(|c| c.index == spot),
             "one replica takes it all"
         );
+    }
+
+    #[test]
+    fn a_conversation_keeps_its_history_when_its_prefix_turns_hot() {
+        let pool = Pool::new(3);
+        let policy = CostModelPolicy::new(&hot_settings(Duration::from_millis(100)));
+        let cost = CostModel::default();
+        let prompt = chain(8, 198);
+        let candidates = fleet(
+            &pool.ids,
+            &[
+                (1, 3_072, 0.05, None),
+                (1, 1_024, 0.0, None),
+                (1, 0, 0.0, None),
+            ],
+        );
+        let ctx = |step: u64| RouteContext {
+            now: step,
+            ..context(&pool, &candidates, 3_172, &prompt)
+        };
+        for step in 0..12 {
+            assert_eq!(policy.choose(&ctx(step)).unwrap().index, 0, "step {step}");
+        }
+        let explained = policy.explain(&ctx(12));
+        assert_eq!(explained.hot_prefix.unwrap().owners, 3);
+        let system = cost.estimate(3_172, &candidates[2], Hits::gpu(1_024));
+        assert_eq!(explained.candidates[2].estimate, Some(system));
+        assert_eq!(explained.winner, Some(0));
+
+        let preamble = fleet(
+            &pool.ids,
+            &[
+                (1, 1_024, 0.3, None),
+                (1, 16, 0.0, None),
+                (1, 0, 0.01, None),
+            ],
+        );
+        let spread = policy.explain(&RouteContext {
+            now: 12,
+            ..context(&pool, &preamble, 1_100, &prompt[..68])
+        });
+        let warm = cost.estimate(1_100, &preamble[1], Hits::gpu(1_024));
+        assert_eq!(spread.candidates[1].estimate, Some(warm));
+        assert_eq!(spread.winner, Some(1));
     }
 
     #[test]

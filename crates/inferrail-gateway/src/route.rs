@@ -56,6 +56,9 @@ impl Request<'_> {
             model: self.model,
             prompt_tokens: self.tokens,
             blocks: self.blocks(),
+            block_size: self
+                .prompt
+                .map_or(0, |p| u32::try_from(p.block_size).unwrap_or(u32::MAX)),
             session: self.session,
             now,
             candidates,
