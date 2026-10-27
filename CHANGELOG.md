@@ -3,6 +3,56 @@
 Notable changes to Inferrail. Versions follow
 [Semantic Versioning](https://semver.org).
 
+## [0.1.9] Bug Fixes and Improvements (27 October 2026)
+
+Fixes from an adversarial pass over the routing brain. Every policy's
+explanation was checked against the choice it then makes on random fleets
+over time, hot prefix replication ran on simulated fleets of multi turn
+chats over one shared system prompt, and `inferrail-calibrate` ran against
+simulators that had already seen its prompts or cache nothing.
+
+### Fixed
+
+* Once a root prefix turned hot, with hot prefix replication on as it is
+  by default, every owner was priced as holding what the best owner held,
+  which for a chat is often one conversation's whole history. The
+  conversation's next turn then went to an owner holding only the system
+  prompt, or nothing, priced at 16 ms where it took 235 to 339 ms. Owners
+  are now priced on what all the owners holding the whole root share, so a
+  history counts only where it is, and a replica holding no more than a
+  chat template's opening block does not cool the rest. Over 40 live
+  conversations on one system prompt at 20 requests a second, replication
+  had cut the hit rate from 0.92 to 0.84 and raised p99 TTFT from 0.12 s to
+  0.53 s; it now matches running without it.
+* `/admin/explain` priced hot prefix owners without the request it
+  explained, while routing counts the request's own prefill toward its
+  prefix's demand first, so near the threshold explain named a winner that
+  routing then passed over, or no hot prefix steer where routing reported
+  one. Both now count it.
+* Every `inferrail-calibrate` run drew its prompts from seed 0, so a second
+  run against the same engine found the first run's prompts in its prefix
+  cache and fitted the cache: no per token cost, 6.7 ms of fixed time and R
+  squared 0.46, written out as a usable fragment. Each run now draws its
+  own seed, recorded in the fragment and the JSON, unless `--seed` names
+  one.
+* Calibration assumed every probe found exactly its planned prefix cached.
+  Against an engine with prefix caching off, every such probe recomputed in
+  full and the fit came out with no per token cost and 184 ms of fixed
+  time. Each probe now reads the engine's own count of cached prompt tokens
+  around it, and the fit uses what the engine computed; the probes in the
+  JSON carry that count.
+
+### Added
+
+* `RouteContext::block_size`, the tokens per block of the prompt's hashes,
+  filled by the gateway from the tokenized prompt.
+* A regression test for every fix: a property test that whenever a policy
+  explains a winner, routing picks it with the same steer and guards; a
+  sketch property that a rate counted ahead equals the rate after the add;
+  a fleet simulation of multi turn chats over a hot system prompt; and
+  calibrations run twice against one simulator and against one that caches
+  nothing.
+
 ## [0.1.8] The Routing Brain (26 October 2026)
 
 The gateway now routes on what it predicts each replica has cached. The

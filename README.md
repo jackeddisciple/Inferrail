@@ -12,18 +12,18 @@ most of its prompt in cache, without letting any replica overload.
 The goal is lower tail latency and fewer GPUs for the same traffic, proven
 with benchmarks anyone can rerun.
 
-> **Status: v0.1.8, the routing brain.** The gateway proxies chat and
-> completions to a fleet of engines, streams responses untouched, retries
-> before the first byte, ejects failing replicas, discovers replicas
-> through DNS, reads every engine's load ten times a second, tokenizes
-> prompts at the edge with token ids identical to vLLM's and predicts for
-> every replica how much of each prompt it already holds. It now routes on
-> those predictions: `cost_model` sends each request to the replica with
-> the lowest estimated time to first token, inside load guards that keep
-> any replica from melting, `kv_aware` and `prefix_hash` stand in for the
-> weighted and hashing routers others ship, `inferrail-calibrate` measures
-> the cost model on an engine, and `/admin/explain` shows why a replica
-> won. See [Roadmap](#roadmap).
+> **Status: v0.1.9, the routing brain, hardened.** The gateway proxies
+> chat and completions to a fleet of engines, streams responses untouched,
+> retries before the first byte, ejects failing replicas, discovers
+> replicas through DNS, reads every engine's load ten times a second,
+> tokenizes prompts at the edge with token ids identical to vLLM's and
+> predicts for every replica how much of each prompt it already holds. It
+> now routes on those predictions: `cost_model` sends each request to the
+> replica with the lowest estimated time to first token, inside load
+> guards that keep any replica from melting, `kv_aware` and `prefix_hash`
+> stand in for the weighted and hashing routers others ship,
+> `inferrail-calibrate` measures the cost model on an engine, and
+> `/admin/explain` shows why a replica won. See [Roadmap](#roadmap).
 
 ## Why this exists
 
@@ -50,7 +50,7 @@ the cache away. Inferrail treats routing as a cost estimate instead: for each
 replica, how long until this request's first token, given what is cached
 there and what is queued there?
 
-## What is in v0.1.8
+## What is in v0.1.9
 
 | Piece | What it does |
 | --- | --- |
@@ -757,11 +757,13 @@ includes:
   departures, with sessions and hot prefixes in play, `cost_model` never
   gives a replica more than `ceil((1 + epsilon) * average)` requests; some
   replica is always within the cap; explaining never changes the next
-  choice; more cache never costs more and a tier hit never costs more than
-  ignoring it; the count min sketch never underestimates; the calibration
-  fit recovers random parameters through noise. The worked example of the
-  design (a cached replica behind a long queue loses to an idle cold one,
-  and wins once the cold one is busier) is a test.
+  choice, and whenever it names a winner, routing picks that replica with
+  the same steer and guards; more cache never costs more and a tier hit
+  never costs more than ignoring it; the count min sketch never
+  underestimates; the calibration fit recovers random parameters through
+  noise. The worked example of the design (a cached replica behind a long
+  queue loses to an idle cold one, and wins once the cold one is busier) is
+  a test.
 * **Fleet simulations** (`crates/inferrail-policy/tests/fleet.rs`): every
   policy routing the same seeded traffic over replicas that prefill at the
   simulator's speed and evict their prefix caches. The cache aware policies
@@ -770,7 +772,8 @@ includes:
   shared and unique prompts; under Zipf traffic it puts at most 29% of
   requests on one of four replicas where `prefix_hash` puts 39%; and a hot
   system prompt that sends `prefix_hash` past 20 s at p99 leaves it under
-  0.3 s.
+  0.3 s. Multi turn chats over one hot system prompt keep their hit rate
+  and p99 with hot prefix replication on, as with it off.
 * **Gateway invariants**: no policy ever routes to an unhealthy replica or
   one that does not serve the model; bytes the engine sends reach the client
   unchanged under any chunking; request bodies reach the engine byte for
@@ -803,7 +806,9 @@ includes:
   any engine, and marks replicas that were unhealthy or full.
 * **Calibration tests**: `inferrail-calibrate` against simulators with two
   different parameter sets recovers `a`, `b` and `d` within 5%, with every
-  probe's engine time equal to the latency model to a microsecond.
+  probe's engine time equal to the latency model to a microsecond, and
+  does so again on a second run against the same simulator and against one
+  that caches nothing.
 * **Harness tests**: workload shapes and determinism, Poisson statistics,
   TTFT, TPOT and ITL against servers with known timing, coordinated
   omission against a server that falls behind, a blocked client loop
