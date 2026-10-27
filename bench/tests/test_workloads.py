@@ -8,7 +8,17 @@ from collections import Counter
 import pytest
 
 from inferrail_bench import schedule, text
-from inferrail_bench.workloads import WORKLOADS, Mixed, MultiTurn, SharedPrompt, Unique, generate
+from inferrail_bench.workloads import (
+    WORKLOADS,
+    AgentLoop,
+    FewShot,
+    Mixed,
+    MultiTurn,
+    Rag,
+    SharedPrompt,
+    Unique,
+    generate,
+)
 from inferrail_bench.workloads.multi_turn import load_sharegpt
 
 
@@ -170,3 +180,76 @@ def test_poisson_offsets_have_the_right_rate_and_shape():
     assert statistic < 1.36 / math.sqrt(n)
     with pytest.raises(ValueError, match="positive"):
         schedule.poisson(0, 1, seed=1)
+
+
+def test_w3_agents_resend_a_growing_context_after_each_tool_call():
+    workload = AgentLoop()
+    offsets = [i * 0.2 for i in range(600)]
+    requests = workload.requests(600, seed=5, offsets=offsets)
+    by_agent: dict[str, list] = {}
+    for at, request in zip(offsets, requests, strict=True):
+        by_agent.setdefault(request.session, []).append((at, request))
+    assert 5 < len(by_agent) < 120
+    systems = set(workload.system_prompts(5))
+    for steps in by_agent.values():
+        assert [r.turn for _, r in steps] == list(range(len(steps)))
+        assert steps[0][1].messages[0].content in systems
+        for (before, a), (after, b) in itertools.pairwise(steps):
+            assert b.messages[: len(a.messages)] == a.messages
+            assert len(b.messages) == len(a.messages) + 2
+            assert b.messages[len(a.messages)].role == "assistant"
+            assert text.tokens(b.messages[-1].content) - 3 >= 300
+            assert after - before >= 1.0
+        for _, request in steps:
+            context = sum(text.tokens(m.content) for m in request.messages)
+            assert context < workload.max_context
+            assert 30 <= request.max_tokens <= 120
+    longest = max(len(steps) for steps in by_agent.values())
+    assert longest >= 10
+    first = [r for r in requests if r.turn == 0]
+    assert all(3_000 <= sum(text.tokens(m.content) for m in r.messages) <= 5_100 for r in first)
+
+
+def test_w3_agents_stop_before_their_context_runs_out():
+    workload = AgentLoop(steps=(200, 200), max_context=8_000)
+    requests = workload.requests(400, seed=1, offsets=[i * 2.0 for i in range(400)])
+    for request in requests:
+        assert sum(text.tokens(m.content) for m in request.messages) < 8_000
+    assert len({r.session for r in requests}) > 10
+
+
+def test_w4_prompts_quote_zipf_popular_documents():
+    workload = Rag()
+    requests = workload.requests(3000, seed=6)
+    first = Counter(r.tags["documents"][0] for r in requests)
+    every = Counter(d for r in requests for d in r.tags["documents"])
+    assert first.most_common(1)[0][0] == 0
+    assert every[0] > every[10] > every[500]
+    weights = [1 / rank**1.1 for rank in range(1, 2001)]
+    assert abs(first[0] / 3000 - weights[0] / sum(weights)) < 0.03
+    for request in requests:
+        docs = request.tags["documents"]
+        assert 1 <= len(docs) <= 4
+        assert len(set(docs)) == len(docs)
+        system, user = request.messages
+        assert system.content.startswith("Answer the question")
+        assert user.content.startswith(f"Document {docs[0]}: ")
+        assert user.content.startswith(workload.document(6, docs[0]))
+    assert workload.document(6, 3) == workload.document(6, 3)
+    assert workload.document(6, 3) != workload.document(7, 3)
+
+
+def test_w5_batches_share_a_long_block_of_examples():
+    workload = FewShot()
+    requests = workload.requests(800, seed=2)
+    blocks = workload.examples(2)
+    tasks = Counter(r.tags["task"] for r in requests)
+    assert set(tasks) == set(range(4))
+    assert min(tasks.values()) > 150
+    for request in requests:
+        (message,) = request.messages
+        assert message.content.startswith(blocks[request.tags["task"]])
+        assert 1 <= request.max_tokens <= 16
+    for block in blocks:
+        assert 2_900 <= text.tokens(block) <= 3_200
+    assert len({r.messages[0].content for r in requests}) == len(requests)

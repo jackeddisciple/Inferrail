@@ -12,7 +12,16 @@ from inferrail_bench.cli import describe, measure
 BASELINES = ("round_robin", "random", "least_request", "p2c")
 POLICIES = (*BASELINES, "prefix_hash", "kv_aware", "cost_model")
 SIM_FLAGS = ("--enable-prompt-tokens-details",)
-RATES = {"w1": 6.0, "w2": 25.0, "w6": 9.0, "mix": 7.0, "hot": 10.0}
+RATES = {
+    "w1": 6.0,
+    "w2": 25.0,
+    "w3": 2.0,
+    "w4": 8.0,
+    "w5": 10.0,
+    "w6": 9.0,
+    "mix": 7.0,
+    "hot": 10.0,
+}
 PARAMS = {"w1": {"prompts": 32}}
 
 
