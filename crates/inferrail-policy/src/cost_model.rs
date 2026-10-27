@@ -45,6 +45,8 @@ struct Plan {
     guarded: Guarded,
     hot: Option<HotPrefix>,
     owner: Vec<bool>,
+    /// Every estimate before hot prefix credit, once any was credited.
+    uncredited: Option<Vec<Estimate>>,
 }
 
 impl Plan {
@@ -116,6 +118,7 @@ impl CostModelPolicy {
             guarded,
             hot: None,
             owner: vec![false; n],
+            uncredited: None,
         };
         self.spread_hot_prefix(ctx, &mut plan, observe);
         plan
@@ -199,6 +202,8 @@ impl CostModelPolicy {
         for &i in &order[..owners] {
             plan.owner[i] = true;
             if candidates[i].cached_tokens < shared {
+                plan.uncredited
+                    .get_or_insert_with(|| plan.estimates.clone());
                 plan.estimates[i] =
                     self.cost
                         .estimate(ctx.prompt_tokens, &candidates[i], Hits::gpu(shared));
@@ -212,25 +217,36 @@ impl CostModelPolicy {
         (0..ctx.candidates.len()).find(|&i| tag(ctx.candidates[i].id) == replica && plan.allowed(i))
     }
 
-    /// Whether candidate `i` is among the cheapest allowed: lowest estimate,
-    /// then fewest requests in flight.
-    fn cheapest(ctx: &RouteContext<'_>, plan: &Plan) -> impl Fn(usize) -> bool {
+    /// Whether candidate `i` is among the cheapest allowed by `estimates`:
+    /// lowest estimate, then fewest requests in flight.
+    fn cheapest(
+        ctx: &RouteContext<'_>,
+        plan: &Plan,
+        estimates: &[Estimate],
+    ) -> impl Fn(usize) -> bool + use<> {
         let n = ctx.candidates.len();
+        let ttft = |i: usize| estimates[i].ttft_secs;
         let low = (0..n)
             .filter(|&i| plan.allowed(i))
-            .map(|i| plan.ttft(i))
+            .map(ttft)
             .fold(f64::INFINITY, f64::min);
         let fewest = (0..n)
-            .filter(|&i| plan.allowed(i) && plan.ttft(i) == low)
+            .filter(|&i| plan.allowed(i) && ttft(i) == low)
             .map(|i| ctx.candidates[i].in_flight)
             .min()
             .unwrap_or(0);
         let best: Vec<bool> = (0..n)
-            .map(|i| {
-                plan.allowed(i) && plan.ttft(i) == low && ctx.candidates[i].in_flight == fewest
-            })
+            .map(|i| plan.allowed(i) && ttft(i) == low && ctx.candidates[i].in_flight == fewest)
             .collect();
         move |i| best[i]
+    }
+
+    /// Whether winner `w` won only by the credit of a hot prefix it does
+    /// not hold yet: credited, and not among the cheapest without it.
+    fn lifted(ctx: &RouteContext<'_>, plan: &Plan, w: usize) -> bool {
+        plan.uncredited.as_ref().is_some_and(|before| {
+            before[w] != plan.estimates[w] && !Self::cheapest(ctx, plan, before)(w)
+        })
     }
 }
 
@@ -255,9 +271,9 @@ impl RoutingPolicy for CostModelPolicy {
         let (index, steer) = match self.sticky(ctx, &plan) {
             Some(i) => (i, Some(Steer::Session)),
             None => {
-                let best = Self::cheapest(ctx, &plan);
+                let best = Self::cheapest(ctx, &plan, &plan.estimates);
                 let i = pick_among(&self.rng, ctx.candidates.len(), best)?;
-                (i, plan.owner[i].then_some(Steer::HotPrefix))
+                (i, Self::lifted(ctx, &plan, i).then_some(Steer::HotPrefix))
             }
         };
         if let (Some(sessions), Some(session)) = (&self.sessions, ctx.session) {
@@ -288,7 +304,7 @@ impl RoutingPolicy for CostModelPolicy {
         let (winner, steer, decided_by) = match self.sticky(ctx, &plan) {
             Some(i) => (Some(i), Some(Steer::Session), None),
             None => {
-                let best = Self::cheapest(ctx, &plan);
+                let best = Self::cheapest(ctx, &plan, &plan.estimates);
                 let tied: Vec<usize> = (0..n).filter(|&i| best(i)).collect();
                 let winner = (tied.len() == 1).then(|| tied[0]);
                 let decided_by = winner.and_then(|w| {
@@ -298,7 +314,9 @@ impl RoutingPolicy for CostModelPolicy {
                     (plan.ttft(runner_up) > plan.ttft(w))
                         .then(|| plan.estimates[w].ahead_of(&plan.estimates[runner_up]))
                 });
-                let steer = winner.filter(|&w| plan.owner[w]).map(|_| Steer::HotPrefix);
+                let steer = winner
+                    .filter(|&w| Self::lifted(ctx, &plan, w))
+                    .map(|_| Steer::HotPrefix);
                 (winner, steer, decided_by)
             }
         };
@@ -548,15 +566,21 @@ mod tests {
         assert_eq!(owners, 2);
         assert_eq!(used.len(), owners, "{share:?}");
         assert!(used.iter().all(|&r| share[r] > 300), "{share:?}");
-        assert!(late.iter().all(|c| c.steer == Some(Steer::HotPrefix)));
-        let first_visits = choices
-            .iter()
-            .enumerate()
-            .filter(|(i, c)| choices[..*i].iter().all(|p| p.index != c.index))
-            .count();
+        let first_visits: Vec<usize> = (0..choices.len())
+            .filter(|&i| choices[..i].iter().all(|p| p.index != choices[i].index))
+            .collect();
         assert_eq!(
-            first_visits, owners,
+            first_visits.len(),
+            owners,
             "only a new owner computes the prefix again"
+        );
+        let steered: Vec<usize> = (0..choices.len())
+            .filter(|&i| choices[i].steer == Some(Steer::HotPrefix))
+            .collect();
+        assert_eq!(
+            steered,
+            first_visits[1..],
+            "only the owner taking the prefix on is steered there"
         );
 
         let plain = CostModelPolicy::new(&settings());
@@ -669,9 +693,22 @@ mod tests {
             estimates[1],
             cost.estimate(1_060, &system_only[1], Hits::gpu(1_024))
         );
+        assert_eq!(
+            spread.steer, None,
+            "it was the cheapest without the credit too"
+        );
         let (choice, estimates, truth) = conversation(&single, [3_072, 0, 0], 30);
         assert_eq!(choice.index, 0, "{estimates:?}");
         assert_eq!(estimates, truth, "no owner is credited with the history");
+        let (lifted, _) = first_turns(
+            &single,
+            &pool,
+            &system,
+            &[(1_024, 0.05), (0, 0.0), (0, 0.01)],
+            1,
+            31,
+        );
+        assert_eq!((lifted.index, lifted.steer), (1, Some(Steer::HotPrefix)));
     }
 
     #[test]

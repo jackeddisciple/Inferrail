@@ -337,7 +337,7 @@ default) serves OpenMetrics, apart from the client port:
 | `inferrail_index_entries`, `inferrail_index_bytes`, `inferrail_index_resets_total` | replica for resets | blocks the index holds, its memory, engines found restarted |
 | `inferrail_estimated_ttft_seconds` | model, policy | the cost model's estimate for the chosen replica, at every decision, to set against `inferrail_ttft_seconds` |
 | `inferrail_routing_guards_total` | model, guard | decisions where `bounded_load` or `kv_pressure` set replicas aside, or `kv_waived` when every replica was under KV pressure |
-| `inferrail_routing_steered_total` | model, reason | decisions decided by `session` affinity, landing on a `hot_prefix` owner, or routed by the `no_prefix` fallback |
+| `inferrail_routing_steered_total` | model, reason | decisions decided by `session` affinity, won by a `hot_prefix` owner only through the credit for a prefix it did not hold yet, or routed by the `no_prefix` fallback |
 | `inferrail_ejections_total`, `inferrail_load_scrapes_total` | replica (and result) | passive ejections, engine scrapes |
 | `inferrail_replica_*` | replica | health, ejection, in flight requests and prompt tokens, queued prefill, the engine's running, waiting, KV usage and prefix cache counters, the age of its report, and the blocks and capacity the index assumes |
 

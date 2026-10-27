@@ -100,7 +100,8 @@ impl<'a> RouteContext<'a> {
 pub enum Steer {
     /// The conversation's last replica, kept by session affinity.
     Session,
-    /// An owner of a hot root prefix, priced as holding it.
+    /// An owner of a hot root prefix that won only by being priced as
+    /// holding a prefix it does not hold yet.
     HotPrefix,
     /// The prompt had no full block to hash, so a fallback rule chose.
     NoPrefix,

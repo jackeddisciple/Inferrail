@@ -343,7 +343,7 @@ impl Metrics {
         );
         registry.register(
             "inferrail_routing_steered",
-            "Routing decisions steered beyond the policy's plain rule: by session affinity, to a hot prefix owner, or by a fallback for prompts without a full block.",
+            "Routing decisions steered beyond the policy's plain rule: by session affinity, to a hot prefix owner its plain estimate would have passed over, or by a fallback for prompts without a full block.",
             this.steered.clone(),
         );
         for (model, policy) in &fleet.policies {
