@@ -3,6 +3,52 @@
 Notable changes to Inferrail. Versions follow
 [Semantic Versioning](https://semver.org).
 
+## [0.1.10] Bug Fixes and Improvements (28 October 2026)
+
+Fixes for the gaps the 0.1.9 pass left open: hot prefix credit while one
+replica holds the prefix, what counts as a hot prefix steer, a race in the
+prefill queue, and how the affinity table tells conversations apart.
+
+### Fixed
+
+* While a single replica held a hot root prefix, a cold owner was still
+  credited with all that replica held, a conversation's history included,
+  so a turn could move to a replica holding none of it. An owner is now
+  credited only with a prefix hot in its own right: the sketch counts the
+  demand of the prefixes owners hold beside the root's, and a held prefix
+  counts once it needs more than `utilization` of a replica itself. First
+  turns of new conversations still spread at once, since their system
+  prompt carries the root's whole demand.
+* The affinity table took a slot from the low 16 bits of a conversation
+  key and a tag from the high 32 with one bit forced on, so keys apart only
+  in bits 16 to 32 shared both and one conversation was sent to another's
+  replica. Keys are now mixed first and 48 of their bits checked.
+* Enqueueing on a replica's virtual prefill queue decided whether the
+  request waited alone before its compare and swap, so a request queued in
+  between could have its work overwritten. It now decides inside the
+  update. No test reproduced the race; one queueing eight requests at once,
+  2,000 times, guards it.
+
+### Changed
+
+* `inferrail_routing_steered_total{reason="hot_prefix"}`, the decision log
+  and route spans count a hot prefix steer only when the winner was
+  credited with a prefix it did not hold yet and would have lost without
+  that credit. Every win by an owner counted before, so on one hot prompt
+  every decision read as steered, where now only the one that brings in a
+  new owner does.
+* A decision on a prompt whose root a replica holds adds its work to one or
+  two more keys of the sketch. With 16 threads deciding at once on 8
+  prompts a decision takes 3.8 µs where it took 2.7 µs; a single decision
+  (A5) is unchanged at 7.9 µs p99 over 64 replicas.
+
+### Added
+
+* Regression tests: conversations on a hot system prompt held by one
+  replica and by two, steers counted only when the credit changed the
+  pick, keys apart in bits the table used to ignore, and requests queued
+  at once.
+
 ## [0.1.9] Bug Fixes and Improvements (27 October 2026)
 
 Fixes from an adversarial pass over the routing brain. Every policy's
