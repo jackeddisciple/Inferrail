@@ -13,6 +13,11 @@
   * `metrics.txt` is a `/metrics` page with every default vLLM family,
     rendered by `prometheus_client` 0.26.0 from the metric definitions in
     vLLM's `v1/metrics/loggers.py`. `make_metrics_fixture.py` rebuilds it.
+  * `kv_events/batches.jsonl` holds KV event batches as the engine publishes
+    them over ZeroMQ, one message per line with its topic, sequence number
+    and msgpack payload in hex, encoded by msgspec with the structs of
+    vLLM's `distributed/kv_events.py`. `kv_events/make_fixture.py` rebuilds
+    it.
 
 * `sglang/`: what SGLang v0.5.21 serves on `/metrics` for a server with two
   data parallel ranks and priority scheduling, rendered by `prometheus_client`

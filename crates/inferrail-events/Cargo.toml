@@ -1,12 +1,23 @@
 [package]
 name = "inferrail-events"
-description = "Engine KV event subscribers, decoding and gap detection."
+description = "Engine KV events: vLLM's event format and the ZeroMQ wire protocol."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 publish.workspace = true
+
+[dependencies]
+rmp.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util"] }
+tracing.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["io-util", "test-util"] }
 
 [lints]
 workspace = true

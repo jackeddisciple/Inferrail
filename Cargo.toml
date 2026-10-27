@@ -13,6 +13,7 @@ publish = false
 [workspace.dependencies]
 inferrail-control = { path = "crates/inferrail-control" }
 inferrail-core = { path = "crates/inferrail-core" }
+inferrail-events = { path = "crates/inferrail-events" }
 inferrail-index = { path = "crates/inferrail-index" }
 inferrail-load = { path = "crates/inferrail-load" }
 inferrail-policy = { path = "crates/inferrail-policy" }
@@ -41,6 +42,7 @@ opentelemetry-otlp = { version = "0.33.1", default-features = false, features = 
 opentelemetry_sdk = { version = "0.33.1", default-features = false, features = ["trace"] }
 prometheus-client = "0.25.1"
 proptest = "1.12"
+rmp = "0.8.15"
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "stream"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["float_roundtrip", "raw_value"] }

@@ -1,11 +1,9 @@
-//! Engine KV event subscribers, decoding and gap detection.
+//! Engine KV events: vLLM's event batches in msgpack, and the ZeroMQ wire
+//! protocol they travel over, spoken directly so no libzmq is needed.
 
-pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
+pub mod publisher;
+pub mod vllm;
+pub mod zmtp;
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn crate_name_matches_package() {
-        assert_eq!(super::CRATE_NAME, "inferrail-events");
-    }
-}
+pub use publisher::{Published, Publisher, PublisherConfig, Subscriber, replay};
+pub use vllm::{BlockRemoved, BlockStored, DecodeError, EventBatch, KvEvent, MEDIUM_GPU};
