@@ -327,12 +327,13 @@ impl Lease {
     /// Queues `prefill` of work on the replica behind what is already
     /// there, or from `now` when no other request is waiting on it.
     pub fn enqueue(&self, now: Nanos, prefill: Duration) {
-        let alone = self.replica.prefilling() <= u32::from(self.prefilling);
+        let mine = u32::from(self.prefilling);
         let work = u64::try_from(prefill.as_nanos()).unwrap_or(u64::MAX);
         let _ =
             self.replica
                 .queue_until
-                .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |until| {
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |until| {
+                    let alone = self.replica.prefilling() <= mine;
                     let start = if alone { now } else { until.max(now) };
                     Some(start.saturating_add(work))
                 });
@@ -602,6 +603,28 @@ pub(crate) mod tests {
         assert_eq!(replica.queued(at(1_200)), ms(40));
         drop((first, slow, next));
         assert_eq!(counters(&replica), (0, 0, 0, 0, 0));
+    }
+
+    #[test]
+    fn requests_queued_at_once_all_count() {
+        for _ in 0..2_000 {
+            let replica = capped(None, None);
+            let start = Arc::new(std::sync::Barrier::new(8));
+            let threads: Vec<_> = (0..8)
+                .map(|_| {
+                    let (replica, start) = (Arc::clone(&replica), Arc::clone(&start));
+                    std::thread::spawn(move || {
+                        start.wait();
+                        let lease = replica.try_acquire(1).unwrap();
+                        lease.enqueue(1_000, Duration::from_millis(1));
+                        lease
+                    })
+                })
+                .collect();
+            let leases: Vec<Lease> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+            assert_eq!(replica.queued(1_000), Duration::from_millis(8));
+            drop(leases);
+        }
     }
 
     #[tokio::test(start_paused = true)]
