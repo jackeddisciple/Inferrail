@@ -1161,7 +1161,7 @@ dependencies = [
 
 [[package]]
 name = "inferrail-calibrate"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "anyhow",
  "clap",
@@ -1178,7 +1178,7 @@ dependencies = [
 
 [[package]]
 name = "inferrail-control"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "arc-swap",
  "inferrail-core",
@@ -1191,7 +1191,7 @@ dependencies = [
 
 [[package]]
 name = "inferrail-core"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "humantime-serde",
  "proptest",
@@ -1204,7 +1204,7 @@ dependencies = [
 
 [[package]]
 name = "inferrail-events"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "proptest",
  "rmp",
@@ -1216,7 +1216,7 @@ dependencies = [
 
 [[package]]
 name = "inferrail-gateway"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1255,7 +1255,7 @@ dependencies = [
 
 [[package]]
 name = "inferrail-index"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "criterion",
  "inferrail-core",
@@ -1264,7 +1264,7 @@ dependencies = [
 
 [[package]]
 name = "inferrail-load"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "arc-swap",
  "criterion",
@@ -1276,7 +1276,7 @@ dependencies = [
 
 [[package]]
 name = "inferrail-policy"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "criterion",
  "inferrail-core",
@@ -1288,7 +1288,7 @@ dependencies = [
 
 [[package]]
 name = "inferrail-sim"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -1313,7 +1313,7 @@ dependencies = [
 
 [[package]]
 name = "inferrail-tokenize"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "criterion",
  "daachorse",

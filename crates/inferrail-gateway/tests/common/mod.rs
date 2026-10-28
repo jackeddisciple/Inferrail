@@ -40,7 +40,16 @@ pub enum Fault {
     Delay(Duration),
 }
 
-type Tasks = Arc<Mutex<Vec<AbortHandle>>>;
+type Tasks = Arc<Mutex<Serving>>;
+
+/// The open connections of the live accept loop. A kill bumps the
+/// generation under the lock a loop takes to register a connection, so a
+/// connection accepted while the kill lands is dropped, not left serving.
+#[derive(Default)]
+struct Serving {
+    generation: u64,
+    tasks: Vec<AbortHandle>,
+}
 
 /// An in process sim behind its own accept loop, so it can be killed for
 /// real and made to misbehave on demand.
@@ -106,6 +115,7 @@ impl Upstream {
             Arc::clone(&self.tasks),
         );
         let conns = Arc::clone(&self.tasks);
+        let generation = self.tasks.lock().expect("tasks").generation;
         let accept = tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
@@ -151,15 +161,23 @@ impl Upstream {
                         Ok::<_, std::io::Error>(response)
                     }
                 });
+                let mut serving = conns.lock().expect("tasks");
+                if serving.generation != generation {
+                    return;
+                }
                 let conn = tokio::spawn(async move {
                     let _ = auto::Builder::new(TokioExecutor::new())
                         .serve_connection(TokioIo::new(stream), service)
                         .await;
                 });
-                conns.lock().expect("tasks").push(conn.abort_handle());
+                serving.tasks.push(conn.abort_handle());
             }
         });
-        tasks.lock().expect("tasks").push(accept.abort_handle());
+        tasks
+            .lock()
+            .expect("tasks")
+            .tasks
+            .push(accept.abort_handle());
     }
 
     pub fn url(&self) -> String {
@@ -181,7 +199,9 @@ impl Upstream {
 
     /// Drops the listener and every open connection, like a crashed process.
     pub fn kill(&self) {
-        for task in self.tasks.lock().expect("tasks").drain(..) {
+        let mut serving = self.tasks.lock().expect("tasks");
+        serving.generation += 1;
+        for task in serving.tasks.drain(..) {
             task.abort();
         }
     }

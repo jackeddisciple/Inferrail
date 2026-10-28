@@ -12,18 +12,20 @@ most of its prompt in cache, without letting any replica overload.
 The goal is lower tail latency and fewer GPUs for the same traffic, proven
 with benchmarks anyone can rerun.
 
-> **Status: v0.1.10, the routing brain, hardened.** The gateway proxies
-> chat and completions to a fleet of engines, streams responses untouched,
-> retries before the first byte, ejects failing replicas, discovers
-> replicas through DNS, reads every engine's load ten times a second,
-> tokenizes prompts at the edge with token ids identical to vLLM's and
-> predicts for every replica how much of each prompt it already holds. It
-> now routes on those predictions: `cost_model` sends each request to the
-> replica with the lowest estimated time to first token, inside load
-> guards that keep any replica from melting, `kv_aware` and `prefix_hash`
-> stand in for the weighted and hashing routers others ship,
-> `inferrail-calibrate` measures the cost model on an engine, and
-> `/admin/explain` shows why a replica won. See [Roadmap](#roadmap).
+> **Status: v0.1.11, realistic simulation and the control plane.** The
+> gateway proxies chat and completions to a fleet of vLLM or SGLang
+> engines, tokenizes prompts at the edge with token ids identical to
+> vLLM's, predicts for every replica how much of each prompt it already
+> holds and routes on those predictions: `cost_model` sends each request
+> to the replica with the lowest estimated time to first token, inside
+> load guards that keep any replica from melting. The simulator now
+> schedules the way vLLM does, in continuous batching steps over one pool
+> of KV blocks with chunked prefill and preemption, and publishes KV
+> events in vLLM's own format. One command runs the full benchmark matrix
+> and builds its report. Routing changes while the gateway runs, without
+> dropping a request, from the config file, SIGHUP or the admin API, with
+> A/B splits between policies and candidate policies in shadow. See
+> [Roadmap](#roadmap).
 
 ## Why this exists
 
@@ -50,22 +52,22 @@ the cache away. Inferrail treats routing as a cost estimate instead: for each
 replica, how long until this request's first token, given what is cached
 there and what is queued there?
 
-## What is in v0.1.10
+## What is in v0.1.11
 
 | Piece | What it does |
 | --- | --- |
-| `inferrail-gateway` | OpenAI compatible proxy on hyper: chat and completions, streaming pass through, model list, request IDs, retries before the first byte, health checks, outlier ejection, breakers, DNS discovery, graceful shutdown, edge tokenization on a bounded worker pool, cache predictions per replica, a virtual prefill queue per replica, session keys, `/admin/explain`, Prometheus metrics on an admin port, OpenTelemetry traces and a sampled decision log |
+| `inferrail-gateway` | OpenAI compatible proxy on hyper: chat and completions, streaming pass through, model list, request IDs, retries before the first byte, health checks, outlier ejection, breakers, DNS discovery, graceful shutdown, edge tokenization on a bounded worker pool, cache predictions per replica, a virtual prefill queue per replica, session keys, live config from the file, SIGHUP or the admin API, A/B splits, shadow policies with a replayable log, `/admin/explain`, Prometheus metrics on an admin port, OpenTelemetry traces and a sampled decision log |
 | `inferrail-policy` | The `RoutingPolicy` trait and seven policies: the round robin, random, least request and power of two choices baselines, `prefix_hash` on rendezvous hashing, the weighted `kv_aware` score, and `cost_model`, the lowest estimated time to first token with bounded load, KV pressure, hot prefix replication and session affinity |
 | `inferrail-calibrate` | Measures an idle engine's prefill with prompts of known cached and uncached length, timed by the engine's own histogram, and fits the cost model's parameters into a config fragment |
 | `inferrail-tokenize` | Chat templates and Hugging Face tokenizers with token ids identical to vLLM v0.31.0 on three model families, a cache of repeated prompt pieces, the simulator's tokenizer, and chained XXH3 128 bit block hashes salted by model, adapter and `cache_salt` |
 | `inferrail-index` | The KV index in approximate mode: a sharded map from block hash to replicas and a shadow LRU per replica sized to its KV capacity, with longest prefix lookup in microseconds |
+| `inferrail-events` | vLLM v0.31.0's KV event batches encoded and decoded byte for byte, and ZMTP 3.0 without libzmq: a publisher shaped like vLLM's with sequence numbers and replay, and SUB and REQ clients |
 | `inferrail-load` | Reads vLLM and SGLang `/metrics` pages, scrapes every replica ten times a second and publishes load snapshots that are never used once stale |
 | `inferrail-control` | Lock free replica registry with request, prompt token and queued prefill counters, health state with exponential ejection backoff, the active health checker and DNS discovery |
-| `inferrail-core` | Lossless OpenAI wire types, an incremental SSE decoder and validated YAML configuration |
-| `inferrail-sim` | A CPU mock of vLLM v0.31.0 with the same HTTP API, streaming bytes and Prometheus metrics, a calibrated latency model and a real prefix cache |
-| Other crates | `events` compiles as a stub with the boundaries the exact index will use |
-| `bench/` | The benchmark harness (`inferrail-bench`): open loop workloads W1, W2 and W6 plus a mix of shared and unique prompts and Zipf hot system prompts, TTFT, TPOT and ITL measurement, prediction accuracy against the engines' own counts, replica shares, JSON results, charts and policy comparisons on simulators, plus the OpenAI SDK suites |
-| `deploy/compose`, `dashboards/` | Gateway, simulators, Prometheus, Grafana and Jaeger in one `make stack`, with a dashboard that now shows estimated against measured TTFT, queued prefill and the load guards |
+| `inferrail-core` | Lossless OpenAI wire types, an incremental SSE decoder, and validated YAML configuration that knows which sections can change live |
+| `inferrail-sim` | A CPU mock of vLLM v0.31.0 with the same HTTP API, streaming bytes and Prometheus metrics: continuous batching with chunked prefill over one ref counted pool of KV blocks, prefill and decode slowing each other down, preemption, a calibrated latency model and KV events |
+| `bench/` | The benchmark harness (`inferrail-bench`): open loop workloads W1 to W6, W8, `mix` and `hot` with Poisson or Gamma arrivals and a diurnal ramp, TTFT, TPOT and ITL measurement, prediction accuracy against the engines' own counts, replica shares, benchmark matrices from one sweep file and a report with knee charts and milestone verdicts, plus the OpenAI SDK suites |
+| `deploy/compose`, `dashboards/` | Gateway, simulators, Prometheus, Grafana and Jaeger in one `make stack`, with a dashboard that now shows config reloads, traffic splits and shadow policies |
 | CI | fmt, clippy with warnings denied, nextest, doc tests, ruff, pytest, `cargo audit`, `cargo machete`, and the official OpenAI SDK and the harness against the simulator and the gateway on every push |
 
 ## Quick start
@@ -128,6 +130,19 @@ decided it.
 curl -s localhost:9090/admin/explain/v1/chat/completions \
   -H 'content-type: application/json' \
   -d '{"model": "sim", "messages": [{"role": "user", "content": "Hello"}]}'
+```
+
+Change how it routes while it runs: edit `deploy/local.yaml` and the
+gateway picks it up within two seconds, or patch the config in effect over
+the admin port. This sends a tenth of the traffic to `kv_aware` and
+watches `least_request` in shadow:
+
+```sh
+curl -s -X PATCH localhost:9090/admin/config \
+  -H 'content-type: application/json' \
+  -d '{"routing": {"split": {"cost_model": 90, "kv_aware": 10},
+                   "shadow": ["least_request"]}}'
+curl -s localhost:9090/admin/shadow
 ```
 
 Measure an engine's prefill and get the cost model for it, ready to paste
@@ -339,6 +354,11 @@ default) serves OpenMetrics, apart from the client port:
 | `inferrail_routing_guards_total` | model, guard | decisions where `bounded_load` or `kv_pressure` set replicas aside, or `kv_waived` when every replica was under KV pressure |
 | `inferrail_routing_steered_total` | model, reason | decisions decided by `session` affinity, won by a `hot_prefix` owner only through the credit for a prefix it did not hold yet, or routed by the `no_prefix` fallback |
 | `inferrail_ejections_total`, `inferrail_load_scrapes_total` | replica (and result) | passive ejections, engine scrapes |
+| `inferrail_config_reloads_total`, `inferrail_config_generation` | result for reloads | reload attempts from the file, SIGHUP or the admin API, `applied`, `unchanged` or `rejected`, and the config generation in effect |
+| `inferrail_model_policy`, `inferrail_model_policy_percent` | model, policy | the policies routing each model, and each one's percent of its traffic |
+| `inferrail_shadow_decisions_total` | model, policy, agreed | requests a shadow policy chose a replica for, by whether it agreed with the routing policy |
+| `inferrail_shadow_estimated_ttft_seconds_total` | model, policy, pick | the cost model's estimated TTFT summed over shadowed requests, for the routing policy's pick (`active`) and the shadow's (`shadow`) |
+| `inferrail_shadow_dropped_total` | | requests left out of the shadow because its worker was behind |
 | `inferrail_replica_*` | replica | health, ejection, in flight requests and prompt tokens, queued prefill, the engine's running, waiting, KV usage and prefix cache counters, the age of its report, and the blocks and capacity the index assumes |
 
 Replica gauges are read from the fleet when Prometheus scrapes, series of
@@ -378,7 +398,10 @@ policy's traffic share, prefix cache hit rates, decision time, retries,
 ejections and errors, and the predicted hit rate next to the engines' own,
 tokenization outcomes and time, the blocks the index holds per replica, the
 cost model's estimated TTFT next to the measured one, queued prefill per
-replica, and how often the load guards and steering act.
+replica, how often the load guards and steering act, and the control
+plane: the config generation and reloads, each model's split, and every
+shadow policy's agreement and estimated gain. The compose gateway runs
+`least_request` and `prefix_hash` in shadow so those panels have data.
 
 ## Routing
 
@@ -486,6 +509,66 @@ token prompt, the index lookup of every candidate included, takes 7 µs at
 p99 over 64 replicas and 20 µs over 256 (benchmark A5, target 200 µs); a
 baseline choice takes nanoseconds.
 
+## Control plane
+
+**Live config.** `routing`, each model's `policy`, `split`, `shadow`,
+`cost_model` and `aliases`, the static `replicas`, `retry` and
+`logging.log_prompts` change while the gateway runs, without dropping a
+request. The gateway rereads its config file every
+`server.reload_interval` (2 s, off at 0) and applies it when it differs
+from the config in effect; SIGHUP rereads it at once. A request reads one
+snapshot of the config and its policies, so a reload never changes a
+decision halfway and its retries use the policy that routed it. Policies
+whose settings did not change keep their state (a round robin rotation, a
+hot prefix sketch, a session table), unchanged replicas keep their health
+and counters, and requests on a removed replica finish there. A change to
+anything built at startup (listeners, the upstream client, discovery,
+health checks, load scraping, telemetry, tokenizers, the index or the model
+list) is refused whole, naming the sections, and the running config stays.
+The reasoning is in
+[ADR 015](docs/adr/015-live-config-split-and-shadow.md).
+
+**Admin API.** On the admin port, next to `/metrics` and `/admin/explain`:
+
+| Route | What it does |
+| --- | --- |
+| `GET /admin/config` | the config in effect and its generation |
+| `PATCH /admin/config` | applies a JSON merge patch to the config in effect, leaving the file alone, so the file's next edit replaces the patch |
+| `POST /admin/reload` | rereads the config file now |
+| `GET /admin/index` | KV index entries, bytes per entry, and each replica's predicted blocks against its capacity |
+| `GET /admin/replicas` | health, ejection, requests in flight, queued prefill, and each engine's last load report with its age |
+| `GET /admin/shadow` | each shadow policy's decisions, agreement with the routing policy and estimated gain |
+
+Every reload attempt counts in `inferrail_config_reloads_total{result}`,
+and `inferrail_config_generation` names the config in effect. Admin routes
+have no authentication yet, so keep `server.admin_listen` on localhost or a
+private network.
+
+**A/B splits.** `routing.split`, or a model's own `split`, gives each
+policy a percent of the traffic. A request's arm follows from its
+conversation key, or its request ID when it names none, so a conversation
+stays with one policy and a retry keeps its arm. Each arm has its own
+policy state; every metric already carries the policy label, responses
+name the policy in `x-inferrail-policy`, the harness records it per
+request, and `inferrail_model_policy_percent` reports the shares.
+`/admin/explain?policy=` explains any arm.
+
+**Shadow policies.** `routing.shadow`, or a model's `shadow`, lists
+policies that choose a replica for every routed request without routing
+it. They see exactly the candidates the routing policy saw, in the same
+state, and run on one worker thread off the request path; when it falls
+behind, requests are left out of the shadow and counted in
+`inferrail_shadow_dropped_total`, never delayed. The model's cost model
+prices each shadow pick next to the routing pick, giving agreement, the
+share of requests priced faster or slower, and the mean estimated gain on
+`/admin/shadow` and in metrics. That is the cost model's own view, which
+favors `cost_model` by construction, so a shadow's gain is a reason to try
+it in a split, not proof. With `observability.shadow_log` every config
+generation and every shadow decision, with what the shadows saw, is
+written as JSON lines; `inferrail-gateway --replay-shadow <log>` rebuilds
+each shadow from the logged configs, replays the requests in order and
+checks every pick, so the log is evidence anyone can rerun.
+
 ## The simulator
 
 Real GPUs are rented, not owned, so most development and every CI run happen
@@ -504,25 +587,52 @@ simulator against fixtures derived from that version's source.
 `POST /reset_prefix_cache`. An `x-request-id` header becomes the response id,
 as in vLLM.
 
-**Latency model.** One FIFO prefill queue on a virtual timeline, so
-concurrent prompts wait for each other exactly as on a single GPU. Prefill
-of `u` uncached tokens attending to `c` cached ones costs
+**Scheduler.** One task runs the engine in steps, as vLLM's V1 scheduler
+does. Each step has a token budget (`--max-num-batched-tokens`, 2048):
+running requests first, in the order they started, each decoding one token
+or computing the next chunk of its prompt, then waiting requests in
+arrival order while sequences and budget last. A waiting request that does
+not fit blocks the ones behind it. A running request that needs a block
+when none is free preempts the newest running request, which gives its
+blocks back and is recomputed later, counted in `vllm:num_preemptions`.
+Steps are planned on a virtual timeline, each starting when the previous
+one ends, so timer overshoot never accumulates. See
+[ADR 012](docs/adr/012-continuous-batching-simulator.md).
+
+**Latency model.** A step costs its prefill chunks plus its decode batch.
+Prefill of `u` uncached tokens attending to `c` cached ones costs
 
 ```
 P(u, c) = a*u + b*u*(c + u/2) + d
 ```
 
-the same shape as the router's cost model, so calibration can recover the
-parameters. Its TTFT and prefill time histograms are stamped when the model
-produces the first token, as vLLM stamps them in its engine core, so they
-carry no timer rounding. Decode emits tokens at a fixed time per output token, and
-deadlines are planned ahead so timer overshoot never accumulates. The
-defaults approximate an 8B model on one 24 GB GPU.
+the same shape as the router's cost model. The chunks of one prompt add up
+to exactly `P(u, c)`, so calibration recovers the parameters and an idle
+engine's TTFT is still `P` to the nanosecond. Decoding `n` sequences costs
+`decode_token_secs + decode_seq_secs * (n - 1)` per step (20 ms and 0.1 ms
+by default), so prefill stretches the decode steps it shares and a big
+batch decodes slower. TTFT and prefill time histograms are stamped when
+the model produces the first token, as vLLM stamps them in its engine
+core. The defaults approximate an 8B model on one 24 GB GPU.
 
-**Prefix cache.** Prompts are cut into full blocks, hashed as a chain so each
-hash names its whole prefix, and kept in an O(1) LRU sized in blocks. Long
-prefixes are evicted from the tail first, as vLLM frees them, and a fully
-cached prompt still recomputes its last block.
+**KV cache.** Prompts are cut into full blocks, hashed as a chain so each
+hash names its whole prefix, and held in one ref counted pool. Running
+requests hold blocks by reference, so a shared prefix counts once in KV
+usage; a freed block keeps its hash and serves later hits until the pool
+hands it out again. Free blocks leave in vLLM's order: unhashed ones
+first, then cached ones least recently freed, a request's tail before its
+head. Blocks are cached when their computation is scheduled, generated
+ones included, and a fully cached prompt still recomputes its last block.
+`--no-enable-prefix-caching` keeps nothing.
+
+**KV events.** With `--kv-events-config '{"enable_kv_cache_events": true}'`
+every step's stores, evictions and clears go out as one numbered batch on
+a ZeroMQ PUB socket (`tcp://*:5557` unless `endpoint` says otherwise), in
+vLLM v0.31.0's msgspec encoding byte for byte, with stored blocks carrying
+their token ids and parent hash. A `replay_endpoint` answers requests for
+the last `buffer_steps` batches. `inferrail-events` speaks ZMTP 3.0
+itself, so nothing links libzmq, and pyzmq subscribers read the stream
+unchanged. See [ADR 013](docs/adr/013-kv-events-without-libzmq.md).
 
 **Tokenizer.** A deterministic stand in whose token boundaries depend only on
 the text to their left, so shared text means shared tokens. Generated text
@@ -536,9 +646,11 @@ finish reasons, TTFT, inter token latency, end to end, queue, prefill and
 decode time histograms, with vLLM's names, help text, labels, buckets and
 `prometheus_client` text format.
 
-**Cancellation.** A client that disconnects, whether queued, prefilling or
-streaming, releases its sequence slot and KV blocks immediately and is
-counted as an abort.
+**Cancellation.** A client that disconnects while its request waits
+withdraws it at once; one that is running leaves at the next step
+boundary, as vLLM aborts between steps. Either way its sequence slot and
+KV blocks are released and it is counted as an abort.
+
 
 Useful flags (all names follow vLLM where one exists):
 
@@ -548,16 +660,23 @@ Useful flags (all names follow vLLM where one exists):
 | `--block-size` | 16 | tokens per KV block |
 | `--num-gpu-blocks-override` | 4096 | KV cache capacity in blocks |
 | `--max-num-seqs` | 256 | running sequence cap |
+| `--max-num-batched-tokens` | 2048 | tokens one step may compute; longer prompts prefill in chunks |
 | `--max-model-len` | 32768 | context length |
+| `--no-enable-prefix-caching` | caching on | keep no finished blocks |
 | `--enable-prompt-tokens-details` | off | report cached tokens in usage |
+| `--kv-events-config` | off | publish KV events, as vLLM's flag of the same name |
 | `--prefill-token-us`, `--prefill-pair-ns`, `--prefill-fixed-ms` | 100, 3.3, 5 | `a`, `b` and `d` above |
-| `--decode-token-ms` | 20 | time per output token |
+| `--decode-token-ms` | 20 | decode step time for one sequence |
+| `--decode-seq-us` | 100 | time each further sequence adds to a decode step |
 | `--zero-latency` | off | answer as fast as possible, for overhead benchmarks |
 
-Not modeled yet: decode interference inside a continuous batch, preemption,
-KV events and caching of generated blocks. Requests that need `n > 1`,
-logprobs, `echo` or `best_of` get a 400 naming the parameter instead of an
-answer that silently differs from vLLM; stop strings are ignored.
+The simulator refuses what vLLM refuses: a KV pool too small for one
+request of `--max-model-len`, or a token budget below `--max-num-seqs`.
+Not modeled yet: KV blocks offloaded to CPU memory or disk, adapters,
+speculative decoding and engines spread over several GPUs. Requests that
+need `n > 1`, logprobs, `echo` or `best_of` get a 400 naming the parameter
+instead of an answer that silently differs from vLLM; stop strings are
+ignored.
 
 ## Benchmark harness
 
@@ -573,12 +692,20 @@ benchmark plan requires (see [ADR 007](docs/adr/007-benchmark-harness.md)):
   every user, with 50 to 500 token questions. W2: multi turn chats whose
   history is resent each turn, each user thinking 10 to 20 s before the
   next question, generated or replayed from a ShareGPT file, each request
-  naming its conversation in `x-session-id`. W6: prompts that share
-  nothing, the control where cache affinity must not hurt. `mix`: W1 and
-  W6 requests arriving together, half each, so a policy must weigh the
-  cache one kind finds against the prefill the other queues. `hot`: W1
-  with its system prompts drawn by Zipf weight (exponent 1.1), so a few
-  are hot.
+  naming its conversation in `x-session-id`. W3: agent loops that resend
+  a context growing by a tool call and its result each step, over shared
+  tool definitions. W4: RAG, one to four documents drawn by Zipf weight
+  from a corpus of 2,000 after a short shared instruction. W5: few shot
+  evaluation, short questions after a shared block of worked examples. W6:
+  prompts that share nothing, the control where cache affinity must not
+  hurt. W8: shared prompts arriving in Gamma bursts over a diurnal ramp.
+  `mix`: W1 and W6 requests arriving together, half each, so a policy must
+  weigh the cache one kind finds against the prefill the other queues.
+  `hot`: W1 with its system prompts drawn by Zipf weight (exponent 1.1),
+  so a few are hot.
+* **Arrivals.** Poisson by default; any workload can take Gamma gaps of a
+  chosen coefficient of variation (`--arrivals gamma --cv 4`) or a diurnal
+  ramp (`--ramp diurnal`) that keeps the mean rate.
 * **Measurements.** TTFT, time per output token, inter token latency, end
   to end latency, throughput, goodput against the default SLO (TTFT at most
   2 s, TPOT at most 100 ms), the prefix hit rate from usage and from the
@@ -591,74 +718,92 @@ benchmark plan requires (see [ADR 007](docs/adr/007-benchmark-harness.md)):
   the share of exact predictions, of over and under predictions, the mean
   error in tokens and the predicted hit rate. Harness gateways tokenize
   with `builtin:sim`.
-* **Fair comparisons.** `compare` gives every policy the same requests and
-  arrival times and a cold gateway and simulators per run, discards a
-  warmup, and repeats with new seeds.
+* **Fair comparisons.** `compare` and `sweep` give every policy the same
+  requests and arrival times and a cold gateway and simulators per run,
+  discard a warmup, and repeat with new seeds.
+* **Sweeps.** `inferrail-bench sweep` runs a benchmark matrix from one
+  TOML file: shared settings and a list of points, each a workload with
+  its rates and overrides. Policies run innermost, so drift over a long
+  sweep falls on every policy alike; `--jobs` runs several fleets at once,
+  and a stopped sweep resumes, skipping runs whose result file matches
+  their specification. `inferrail-bench report` turns result files alone
+  into the milestone verdict, the benchmark targets the simulator speaks
+  to, a headline per point, knee and goodput charts and a table per rate.
+  See [ADR 014](docs/adr/014-sweeps-and-the-report.md).
 
 ```sh
+make sweep       # bench/sweeps/sim.toml: 372 runs, then the report
 make routing     # every policy on W1, W2, W6, mix and hot, 3 repetitions
 make baselines   # the four cache blind baselines on W1, W2 and W6
-make report      # charts and report.md from bench/results
+make report      # charts and reports from bench/results
 ```
 
-The committed results in [`bench/results/routing`](bench/results/routing)
-compare all seven policies on three simulators with the default latency
-model of an 8B model on one 24 GB GPU, every run recorded from one clean
-commit. Each workload runs at about 70% of what a cache blind fleet
-sustains: W1 with 32 system prompts (more than one replica's KV cache
-holds) at 6 req/s, W2 with users who think 10 to 20 s between turns at 25
-req/s, W6 at 9 req/s, `mix` at 7 req/s and `hot` at 10 req/s. Medians over
-three repetitions, TTFT p50 / p99 in ms:
+The committed sweep in [`bench/results/sweep`](bench/results/sweep) runs
+every policy on every workload on three continuous batching simulators
+with the default latency model of an 8B model on one 24 GB GPU: 372 runs
+and 146,099 requests from one clean commit, none failed. Main rates sit
+near 70% of what a cache blind fleet sustains: W1 with 32 system prompts
+at 6 req/s, W2 at 15, W3 at 3, W4 at 9, W5 at 12, W6 at 9, `mix` at 7,
+`hot` at 10 and W8 at a mean of 5 over its diurnal ramp. Medians over
+three repetitions, p99 TTFT in ms:
 
-| Policy | W1 | W1 hit rate | W2 | W6 | mix | hot | hot busiest replica |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| `round_robin` | 512 / 1,846 | 0.39 | 105 / 909 | 314 / 855 | 485 / 2,028 | 291 / 2,154 | 33% |
-| `random` | 716 / 3,395 | 0.39 | 135 / 1,592 | 400 / 1,658 | 732 / 3,390 | 342 / 1,892 | 37% |
-| `least_request` | 685 / 1,900 | 0.41 | 135 / 1,264 | 353 / 1,085 | 614 / 2,283 | 305 / 1,908 | 34% |
-| `p2c` | 637 / 2,425 | 0.40 | 136 / 1,226 | 356 / 1,105 | 555 / 2,293 | 280 / 1,910 | 35% |
-| `prefix_hash` | 52 / 792 | 0.89 | 109 / 1,446 | 400 / 1,931 | 363 / 2,156 | 55 / 950 | 47% |
-| `kv_aware` | 51 / 845 | 0.88 | 115 / 1,307 | 352 / 1,057 | 299 / 1,295 | 52 / 896 | 38% |
-| `cost_model` | 48 / 836 | 0.91 | 95 / 867 | 289 / 679 | 265 / 898 | 50 / 749 | 37% |
-| `cost_model` with sessions | | | 112 / 1,534 | | | | |
+| Policy | W1 | W2 | W3 | W4 | W5 | W6 | mix | hot | W8 CV 2 | W8 CV 4 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `round_robin` | 3,498 | 490 | 8,778 | 593 | 83 | 1,470 | 4,492 | 3,613 | 6,113 | 16,514 |
+| `random` | 6,431 | 1,598 | 14,625 | 983 | 123 | 3,154 | 6,250 | 3,132 | 8,869 | 16,015 |
+| `least_request` | 4,135 | 756 | 8,030 | 761 | 91 | 1,416 | 4,277 | 3,489 | 6,584 | 14,936 |
+| `p2c` | 4,949 | 726 | 8,957 | 843 | 97 | 1,837 | 4,070 | 2,430 | 8,523 | 13,570 |
+| `prefix_hash` | 1,112 | 655 | 79,786 | 889 | 117 | 3,507 | 3,075 | 1,245 | 1,357 | 4,588 |
+| `kv_aware` | 1,044 | 552 | 2,443 | 761 | 94 | 1,406 | 1,321 | 1,121 | 1,126 | 1,410 |
+| `cost_model` | 994 | 409 | 1,524 | 512 | 92 | 909 | 1,200 | 989 | 1,012 | 1,398 |
+| `cost_model` hit rate | 0.88 | 0.23 | 0.88 | 0.25 | 0.94 | 0 | 0.44 | 0.87 | 0.85 | 0.87 |
 
-![TTFT by policy on W1](bench/report/routing/w1_ttft.png)
+![p99 TTFT on W1 as load rises](bench/report/sweep/w1-knee_knee_p99.png)
 
 What the numbers say:
 
-* **Shared prompts.** Routing on the cache keeps 88 to 91% of W1's prompt
-  tokens cached where every cache blind policy keeps about 40%, close to
-  the one in three a replica's share of the traffic gives. `cost_model`
-  cuts round robin's p99 TTFT by 55% (1,846 to 836 ms) and its median
-  tenfold. `prefix_hash` has the lowest W1 p99, 792 ms, while putting 46%
-  of the requests on one of three replicas.
-* **Mixed traffic.** When long unique prompts arrive with shared ones,
-  `cost_model` has a p99 TTFT 31% below `kv_aware` (898 against 1,295 ms)
-  and 61% below `least_request`: requests in flight, the load `kv_aware`
-  and the baselines see, are mostly decoding and say little about the
-  prefill queued ahead of a new request.
-* **No regression.** With nothing to share (W6), `cost_model` still has the
-  lowest TTFT, 37% below `least_request` at p99, because queued prefill is
-  the better load signal; `prefix_hash`, blind to load, is worst.
-* **Hot prompts.** Under Zipf traffic `cost_model` has the lowest p99 and
-  `prefix_hash` the most lopsided fleet, 47% of the requests on one
-  replica.
-* **Conversations.** With 10 to 20 s between turns most history is evicted
-  before the next one, and every cache aware policy reuses about 10% of W2
-  against 3%. `cost_model` has the best p50 and p99; `prefix_hash` and
-  `kv_aware` pin conversations to replicas whatever their queues and raise
-  p99. Session affinity does the same to `cost_model` (p99 867 to 1,534
-  ms): the index already finds each conversation's history, so on the
-  simulator affinity adds nothing over cache scoring and costs tail
-  latency.
+* **The milestone.** `cost_model` has a lower p99 TTFT than
+  `least_request` on W1 to W3 without losing goodput: 994 against 4,135
+  ms on shared system prompts, 409 against 756 ms on conversations and
+  1,524 against 8,030 ms on agent loops. It keeps 88% of W1's and W3's
+  prompt tokens cached where the cache blind policies keep 39 to 57%.
+* **Capacity.** On W1, round robin and `least_request` fall apart past 6
+  req/s: at 8 their goodput drops to 0.3 and 0.2 req/s with p99 TTFT over
+  10 s. `cost_model` and `kv_aware` keep goodput at the offered rate up to
+  10 req/s, the highest rate swept, with p99 under 1.1 s, so the same
+  three replicas carry at least two thirds more shared prompt traffic when
+  routed on the cache.
+* **Agents and bursts.** On W3 `cost_model` cuts `least_request`'s p99 by
+  81%, while `prefix_hash` sends every agent sharing tool definitions to
+  one replica and reaches 80 s. Under Gamma bursts with a CV of 4 over a
+  diurnal ramp (W8), the cache blind policies keep at most a sixth of
+  `cost_model`'s goodput.
+* **No regression.** With nothing to share (W6) `cost_model` still has the
+  lowest p99, 36% below `least_request`, because queued prefill is the
+  better load signal. On W5, where every policy finds 94% of prompt tokens
+  cached, all are within noise and round robin has the lowest p99 (83
+  against 92 ms).
+* **Targets.** Against the benchmark plan: an 88% engine hit rate on W1
+  (target 80%), p99 TTFT 72% below round robin on W1 (target 40%), and
+  goodput 44% above `least_request` at the median point (target 30%).
+* **Where it loses.** Past W3's knee `kv_aware` beats `cost_model`: at 4
+  req/s its p99 is 4.1 s against 15.4 s, as `cost_model`'s hit rate falls
+  from 88% to 73%, and 56% at 5 req/s, where `kv_aware` keeps 78% and 68%.
+  W2 at 25 req/s, kept as an overload point, saturates every policy (p99
+  16 to 20 s).
+* **Predictions.** The approximate index predicted the engine's cached
+  tokens exactly on 94% of requests and over predicted on 4%: generated
+  blocks and concurrent prefills now shape the simulator's cache in ways
+  the router's own decisions do not show. The exact index, fed by the KV
+  events the simulator now publishes, closes that gap.
 
-No run lost a request, the gateway's prediction matched the engine's cached
-tokens on all but 2 of 64,263 requests, the engines' own hit rates match the
-ones measured from usage, and the client sent every request within 3 ms of
-its schedule at p99. The full report, with distributions, hit rates and replica
-shares for every workload, is in
-[`bench/report/routing/report.md`](bench/report/routing/report.md); the
-earlier comparison of the baselines alone is in
-[`bench/report/baselines/report.md`](bench/report/baselines/report.md).
+The full report, with the milestone verdict, the targets, knee and goodput
+charts and every table, is in
+[`bench/report/sweep/report.md`](bench/report/sweep/report.md). The earlier
+comparisons on the FIFO simulator,
+[`routing`](bench/report/routing/report.md) and
+[`baselines`](bench/report/baselines/report.md), stay in the repository but
+are not comparable with these numbers.
 
 ## Configuration
 
@@ -667,6 +812,8 @@ DNS group are required; everything else has a safe default, unknown keys are
 rejected, and every problem is reported at once with its path.
 
 ```yaml
+server:
+  reload_interval: 2s
 models:
   - name: meta-llama/Llama-3.1-8B-Instruct
     aliases: [llama-8b]
@@ -689,6 +836,8 @@ discovery:
       refresh: 2s
 routing:
   default_policy: cost_model
+  split: {cost_model: 90, kv_aware: 10}
+  shadow: [least_request]
   epsilon: 1.0
   kappa: 0.92
   session_affinity: true
@@ -719,6 +868,7 @@ observability:
   decision_log:
     path: /var/log/inferrail/decisions.jsonl
     sample_rate: 0.01
+  shadow_log: /var/log/inferrail/shadow.jsonl
 ```
 
 See [`deploy/inferrail.example.yaml`](deploy/inferrail.example.yaml) for every
@@ -783,6 +933,26 @@ includes:
   succeeds whenever a healthy replica is within its attempts; every request
   is counted in exactly one metrics outcome; metrics of departed replicas
   never outlive them, even when requests race their removal.
+* **Simulator scheduling**: random schedules with shared prompts,
+  preemption and cancellations keep the sequence cap and arrival order,
+  and leave no block held once they drain; the block pool matches a naive
+  reference model under any sequence of operations; a long prompt's
+  chunks add up to its idle `P(u, c)` within a microsecond; TTFT bends at
+  the engine's capacity and more load never lowers it; decode steps
+  stretch with the batch and with prefill; and a dry pool preempts but
+  finishes every request.
+* **KV events**: batches encode byte for byte as vLLM's msgspec does,
+  checked against fixtures it produced; pyzmq subscribes to the
+  simulator; and a mirror built from the stream alone equals the engine's
+  cache after concurrent traffic, eviction and resets, with every stored
+  block's hash rebuilt from the token ids it carries.
+* **Control plane**: 400 requests, half streamed, through 30 reloads that
+  switch policy, epsilon and the replica set every 100 ms all complete;
+  unchanged policies keep their state; restart only changes are refused
+  whole; a 75/25 split routes within statistical bounds and keeps 40
+  conversations on one arm each; 300 requests over two config generations
+  with every policy in shadow replay offline to all 1,800 picks, and a
+  tampered line is caught.
 * **Fuzzing**: random wire payloads must round trip, random engine schedules
   must keep FIFO admission and clean accounting, random HTTP requests must
   get responses that obey the vLLM contract, and hostile YAML fails fast.
@@ -816,6 +986,10 @@ includes:
   omission against a server that falls behind, a blocked client loop
   showing up as lag, prediction accuracy, results, reports and a full
   comparison on real binaries.
+* **Sweep tests**: sweep files and their errors, run order, resuming by
+  specification, parallel jobs, a report rebuilt byte for byte from result
+  files, and the same point run twice on fresh fleets agreeing within 3% on
+  mean TTFT, end to end latency, TPOT, hit rate and goodput.
 * **SDK tests** (`make e2e`): the official OpenAI Python SDK, sync and async,
   against the simulator binary and through the gateway binary in front of
   three simulators.
@@ -826,7 +1000,7 @@ includes:
 | --- | --- |
 | 2,000 concurrent streams through the gateway over 3 simulators | all complete in 0.3 to 0.7 s, zero errors, even spread |
 | Open loop at 2,000 and 5,000 req/s, 10,000 requests each, with metrics and load scraping on | the gateway adds about 0.1 ms at p50 and under 0.25 ms at p99 |
-| The same at 5,000 req/s with the decision log at full sampling and traces exported to an unreachable collector | the gateway adds 0.15 ms at p50 and 0.34 ms at p99; 15,000 decisions logged, none dropped |
+| The same at 5,000 req/s with the decision log at full sampling and traces exported to an unreachable collector | the gateway adds 0.17 ms at p50 and 0.36 ms at p99; 15,000 decisions logged, none dropped |
 | A simulator killed under 1,000 req/s, then restarted | zero errors for requests sent after the kill, ejected within 10 ms, back in rotation within 60 ms |
 | A replica that hangs, with requests waiting on it | they move to another replica as soon as probes mark it down |
 | Requests that make every engine fail | at most half the replicas are ejected; the pool never empties |
@@ -837,7 +1011,7 @@ includes:
 | 640 MiB streamed to 20 clients that stop reading | about 20 MB held in total |
 | An 8 MiB request body sent in one byte chunks | about 11 MB held while it arrives |
 | 1,000 concurrent streams through the async SDK, direct and via the gateway | all complete with exact usage |
-| 2,000 concurrent SSE streams straight to one simulator | all complete in 0.55 s, zero errors |
+| 2,000 concurrent SSE streams straight to one simulator | all complete in 0.6 s, zero errors |
 | 35,000 request simulator soak | resident memory grew under 20 MB |
 | Engine load reports under 1,000 req/s through 3 simulators | every reader saw a report under 102 ms old (p99 100 ms); never stale |
 | 64 replicas scraped every 100 ms under 2,000 req/s | oldest report 112 ms, zero errors |
@@ -858,7 +1032,10 @@ includes:
 | A full `cost_model` decision for an 8,000 token prompt, index lookup included, 20,000 times | p99 6.5 µs at 8 replicas, 7 µs at 64, 20 µs at 256 |
 | 16 threads sharing one policy of each kind, sessions and hot prefixes in play | 800,000 decisions each, every one valid |
 | Open loop at 2,000 and 5,000 req/s over 8 replicas with each cache aware policy, three runs | decisions under 50 µs at p99; the gateway adds 0.2 to 0.4 ms at p50, and its p99, 0.9 to 3.4 ms with client, gateway and eight simulators on one laptop, varies as much between runs as between policies |
-| 4,000 requests at 400 req/s over 4 simulators, Zipf over 16 system prompts, 300 sessions, explain requests mixed in | the busiest replica took 26.6 to 27.3%; 97 to 98% of each session's turns stayed on its replica; zero errors |
+| 4,000 requests at 400 req/s over 4 simulators, Zipf over 16 system prompts, 300 sessions, explain requests mixed in | the busiest replica took 25.9 to 27.3%; 97 to 98% of each session's turns stayed on its replica; zero errors |
+| 10,000 requests at 1,000 req/s through a simulator publishing KV events, mirrored by a subscriber | 6,348 batches without a gap; the mirror equals the engine's cache and the last 1,000 batches replay exactly |
+| Open loop at 5,000 req/s with six policies in shadow and the shadow log on | no measurable cost at p50 or p99, nothing dropped; the 18.5 MiB log replays offline to every pick in 0.06 s |
+| 239 config patches every 20 ms, with live policies, splits, shadows and replicas, and 130,000 admin reads, under 2,000 req/s | zero errors; each patch applied in 0.08 ms at p50 and 0.2 ms at p99 |
 
 The suite runs clean ten times in a row with every core saturated.
 
@@ -874,9 +1051,10 @@ crates/
   inferrail-sim/         mock vLLM engine (binary and library)
   inferrail-tokenize/    chat templates, tokenizers, block hashing
   inferrail-index/       KV block index
-  inferrail-events/      engine KV event subscribers
+  inferrail-events/      vLLM KV event codec and ZMTP publisher and clients
   inferrail-calibrate/   engine profiler that fits the cost model
 bench/                   benchmark harness and the OpenAI SDK suites
+  sweeps/                benchmark matrices, one TOML file each
   results/               raw results of committed runs
   report/                charts and reports generated from them
 dashboards/              Grafana dashboard JSON
@@ -912,13 +1090,16 @@ committed, rerunnable benchmarks, not a claim.
   with bounded load, KV pressure guards, hot prefix replication and optional
   session affinity, `inferrail-calibrate` to fit it to an engine, and
   `/admin/explain` to show why a replica won.
-* **Realistic simulation.** Continuous batching, prefill and decode
-  interference, preemption and KV events in the simulator, more workloads
-  and one command for the full sweep.
+* **Realistic simulation and the control plane.** Shipped in v0.1.11:
+  continuous batching with chunked prefill, prefill and decode
+  interference, one pool of KV blocks with preemption and KV events in
+  vLLM's format in the simulator; workloads W3, W4, W5 and W8, bursty and
+  diurnal arrivals, and one command for the full sweep and its report;
+  live config, the admin API, A/B splits and shadow policies.
 * **Exact index.** An exact mode fed by engine KV events over ZMQ, with gap
   detection and fallback to the approximate mode.
 * **Production controls.** SLO aware admission, token based rate limits,
-  hot reload, shadow mode, API keys and TLS.
+  API keys and TLS.
 * **Advanced regimes.** Disaggregated prefill and decode pools, tiered KV
   cache across GPU, CPU and disk, and Kubernetes packaging.
 * **Proof.** A benchmark report against cache blind baselines on synthetic

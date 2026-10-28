@@ -3,6 +3,158 @@
 Notable changes to Inferrail. Versions follow
 [Semantic Versioning](https://semver.org).
 
+## [0.1.11] Realistic Simulation, Sweeps and the Control Plane (28 October 2026)
+
+The simulator now schedules like vLLM: continuous batching steps over one
+pool of KV blocks, with prefill and decode slowing each other down and
+preemption when blocks run out, and it publishes KV events in vLLM's own
+format. One sweep file and one command run every workload, policy, rate and
+repetition on fresh fleets and build a report against the benchmark
+targets. The gateway takes config changes live, splits traffic between
+policies and runs candidate policies in shadow with a replayable log. Over
+372 runs on three simulators, `cost_model` beats `least_request` on shared
+prompts, conversations and agent loops, with p99 TTFT 76%, 46% and 81%
+lower without losing goodput, and keeps up with shared prompt traffic to 10
+req/s where the cache blind policies collapse past 6.
+
+### Added
+
+#### `inferrail-sim`
+
+* Continuous batching: each step decodes running requests and computes
+  prompt chunks within a token budget (`--max-num-batched-tokens`, 2048),
+  running requests first, then waiting ones in arrival order while
+  sequences and budget last. A step costs its chunks plus its decode batch,
+  `decode_token_secs + decode_seq_secs * (n - 1)` (`--decode-seq-us`, 100),
+  so prefills stretch the decode steps they share and the reverse; chunks of
+  one prompt add up to exactly `P(u, c)`, so calibration is unchanged.
+* One ref counted pool of KV blocks: shared prefixes count once in KV
+  usage, freed blocks keep their hash until reused, blocks are cached when
+  scheduled, generated ones included, and free blocks leave in vLLM's order.
+* Preemption by recompute when the pool runs dry, counted in
+  `vllm:num_preemptions` and `vllm:request_num_preemptions`;
+  `--no-enable-prefix-caching`.
+* KV events with vLLM's `--kv-events-config`: every step's stores,
+  evictions and clears as one numbered batch on a ZeroMQ PUB socket, with
+  a replay socket. Stored blocks carry their token ids.
+
+#### `inferrail-events`
+
+* vLLM v0.31.0's KV event batches encoded and decoded byte for byte as
+  msgspec does, and ZMTP 3.0 spoken directly: a publisher shaped like vLLM's
+  with sequence numbers, a high water mark and replays, and SUB and REQ
+  clients. No libzmq.
+
+#### `inferrail-gateway`
+
+* Live config: routing, each model's policy, split, shadow, cost model and
+  aliases, static replicas, retries and prompt logging apply from the file
+  every `server.reload_interval` (2 s), on SIGHUP or through the admin API,
+  without dropping a request; unchanged policies keep their state and
+  restart only sections are refused whole.
+* The admin API: `GET` and `PATCH /admin/config` (JSON merge patch),
+  `POST /admin/reload`, `GET /admin/index`, `/admin/replicas` and
+  `/admin/shadow`.
+* A/B splits by percent per model or for all, a conversation keeping its
+  policy; responses name the policy in `x-inferrail-policy`;
+  `/admin/explain?policy=` explains any arm or shadow.
+* Shadow policies evaluated off the request path on the candidates the
+  routing policy saw, priced against the routed pick by the cost model, and
+  logged to `observability.shadow_log` for `--replay-shadow`, which rebuilds
+  them and checks every pick.
+* Metrics `inferrail_config_reloads_total`, `inferrail_config_generation`,
+  `inferrail_model_policy_percent`, `inferrail_shadow_decisions_total`,
+  `inferrail_shadow_estimated_ttft_seconds_total` and
+  `inferrail_shadow_dropped_total`.
+
+#### `bench/`
+
+* Workloads W3 (agent loops over a growing context), W4 (RAG over Zipf
+  popular documents), W5 (few shot evaluation) and W8 (shared prompts in
+  Gamma bursts over a diurnal ramp); any workload can take Gamma arrivals
+  of a chosen CV or the ramp.
+* `inferrail-bench sweep`: a benchmark matrix from one TOML file, fresh
+  fleets per run, policies innermost, resuming runs whose results match
+  their specification; `bench/sweeps/sim.toml` with 372 runs.
+* `inferrail-bench report`: the milestone verdict, the benchmark targets,
+  a headline per point, knee and goodput charts for rate sweeps and a table
+  per rate, from result files alone. `make sweep` runs and reports in one
+  command.
+* The client records the routing policy of every response.
+
+#### Configuration
+
+* `server.reload_interval`, `routing.split` and `routing.shadow`, a
+  model's `split` and `shadow`, and `observability.shadow_log`, all
+  validated; a split's percents must add up to 100 and a model takes a
+  policy or a split, not both.
+* The compose gateway runs `least_request` and `prefix_hash` in shadow.
+
+#### Dashboard
+
+* A control plane row: the config generation and reloads, each model's
+  split, and every shadow policy's agreement and estimated TTFT gain.
+
+#### Tests
+
+* Random schedules against the step scheduler with sharing, preemption and
+  cancellations, a block pool against a naive model, the queueing knee and
+  monotone latency, KV event batches against fixtures msgspec produced,
+  pyzmq subscribing to the simulator, and a cache mirrored from events
+  alone equal to the engine's.
+* Reloads under load, policy state across reloads, refused restart only
+  changes, the admin API, split shares and sticky arms, shadow replay and
+  a caught tampered line, sweep files, resumes and a report rebuilt byte
+  for byte, and one point reproducing within 3% on fresh fleets.
+* Stress tests: six policies in shadow at 5,000 req/s with the log on,
+  at no measurable cost and with every pick replayed; 239 config
+  patches every 20 ms under 2,000 req/s with zero errors; and 10,000
+  requests through a simulator publishing KV events, mirrored without
+  a gap.
+* ADR 012 (the continuous batching simulator), ADR 013 (KV events without
+  libzmq), ADR 014 (sweeps and the report) and ADR 015 (live config, the
+  admin API, splits and shadows).
+
+### Changed
+
+* The simulator refuses configs vLLM refuses: a KV pool smaller than one
+  request of `max_model_len`, or a token budget below `max_num_seqs`.
+* The approximate index leaves room for each prompt's partial block, which
+  the engine now holds.
+
+### Results
+
+* The committed sweep: 372 runs and 146,099 requests from one clean
+  commit, none failed, in `bench/results/sweep`, with its report in
+  `bench/report/sweep`.
+* p99 TTFT of `cost_model` against `least_request` at each workload's
+  main rate: W1 994 against 4,135 ms, W2 409 against 756, W3 1,524
+  against 8,030, W4 512 against 761, W6 909 against 1,416, `mix` 1,200
+  against 4,277, `hot` 989 against 3,489, and W8 in Gamma bursts of CV 4
+  1,398 against 14,936. On W5 every policy is within noise.
+* Against the benchmark plan's targets: an 88% engine hit rate on W1
+  (target 80%), p99 TTFT 72% below round robin on W1 (target 40%),
+  unique prompts 36% faster than `least_request` at p99 (target within
+  5%), and goodput 44% above `least_request` at the median point
+  (target 30%).
+
+### Known issues
+
+* Past W3's knee `kv_aware` beats `cost_model`: at 4 req/s its p99 is
+  4.1 s against 15.4 s, as `cost_model`'s hit rate falls from 88% to
+  73%, and to 56% at 5 req/s.
+* On the continuous batching simulator the approximate index predicts
+  the engine's cached tokens exactly on 94% of requests: generated
+  blocks and concurrent prefills shape the cache beyond what the
+  router's own decisions show. The exact index, fed by KV events,
+  removes this.
+* Calibration runs must last as long as the sweep: W2 at 25 req/s held
+  up over 30 s and saturated every policy over 60 s. It stays in the
+  sweep as an overload point, and W2's main rate is 15.
+* `decode_interference_secs` stays 0 until GPU calibration measures it.
+* Admin routes have no authentication yet, and a patch made over the
+  API is replaced by the next edit of the config file.
+
 ## [0.1.10] Bug Fixes and Improvements (28 October 2026)
 
 Fixes for the gaps the 0.1.9 pass left open: hot prefix credit while one
