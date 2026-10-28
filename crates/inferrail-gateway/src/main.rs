@@ -47,6 +47,27 @@ async fn shutdown_signal() {
     tracing::info!("shutting down");
 }
 
+/// Reloads the config file on every SIGHUP.
+async fn reload_on_hangup(gateway: Gateway, path: PathBuf) {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let Ok(mut hangups) = signal(SignalKind::hangup()) else {
+            return;
+        };
+        while hangups.recv().await.is_some() {
+            match gateway.reload_from(&path) {
+                Ok(done) => {
+                    tracing::info!(generation = done.generation, changed = ?done.changed, "reloaded on SIGHUP")
+                }
+                Err(err) => tracing::warn!(error = %err, "config change not applied"),
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (gateway, path);
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
@@ -83,6 +104,11 @@ async fn main() -> anyhow::Result<()> {
         replicas = gateway.registry().load().replicas().len(),
         "inferrail-gateway listening"
     );
+    let interval = gateway.config().server.reload_interval;
+    if !interval.is_zero() {
+        tokio::spawn(gateway.clone().watch_config(args.config.clone(), interval));
+    }
+    tokio::spawn(reload_on_hangup(gateway.clone(), args.config.clone()));
     let (stop, mut stopped) = tokio::sync::watch::channel(());
     let admin = tokio::spawn(gateway.clone().serve_admin(admin_listener, async move {
         let _ = stopped.changed().await;

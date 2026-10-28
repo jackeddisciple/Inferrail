@@ -1,22 +1,23 @@
 //! OpenAI compatible gateway that routes requests across engine replicas.
 
-use std::collections::HashMap;
 use std::future::Future;
 use std::hash::{BuildHasher, RandomState};
-use std::sync::{Arc, Mutex};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use inferrail_control::discovery::refresh;
 use inferrail_control::{
     CheckerConfig, Clock, HealthPolicy, Registry, ReplicaSpec, Resolve, SystemResolver,
     run_checker, run_dns,
 };
-use inferrail_core::config::{Config, ConfigIssues, PolicyKind};
-use inferrail_core::ids::ModelId;
+use inferrail_core::config::{Config, ConfigError, ConfigIssues, PolicyKind};
 use inferrail_index::KvIndex;
 use inferrail_load::{CollectorConfig, run_collector};
-use inferrail_policy::{CostModel, RoutingPolicy, Settings};
 use tokio::net::TcpListener;
 use tokio::task::JoinSet;
+use xxhash_rust::xxh3::xxh3_64;
 
 mod admin;
 mod body;
@@ -25,6 +26,7 @@ pub mod errors;
 mod explain;
 pub mod headers;
 pub mod inspect;
+mod live;
 pub mod metrics;
 mod models;
 mod prompts;
@@ -52,6 +54,26 @@ pub enum BuildError {
     Workers(std::io::Error),
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum ReloadError {
+    #[error("{0}")]
+    Load(#[from] ConfigError),
+    #[error("invalid config: {0}")]
+    Invalid(ConfigIssues),
+    #[error("only a restart applies changes to {}", .0.join(", "))]
+    Restart(Vec<String>),
+    #[error("replica {0} uses https; TLS to engines is not supported yet")]
+    Https(String),
+}
+
+/// What a reload applied: the config generation now live and the sections
+/// that changed, none when the new config was the same.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reloaded {
+    pub generation: u64,
+    pub changed: Vec<String>,
+}
+
 const PRUNE_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// A configured gateway. Cheap to clone; clones share all state.
@@ -60,13 +82,15 @@ pub struct Gateway {
     shared: Arc<Shared>,
 }
 
+/// The gateway's state. `config` is the config it started with, which
+/// holds every section a reload cannot change; `live` holds the rest.
 #[derive(Debug)]
 pub(crate) struct Shared {
     config: Config,
+    live: ArcSwap<live::Live>,
+    seed: u64,
+    reloading: Mutex<()>,
     registry: Arc<Registry>,
-    names: HashMap<String, ModelId>,
-    policies: HashMap<ModelId, Box<dyn RoutingPolicy>>,
-    costs: HashMap<ModelId, CostModel>,
     client: upstream::Client,
     ids: request_id::RequestIds,
     clock: Clock,
@@ -81,15 +105,45 @@ pub(crate) struct Shared {
 }
 
 impl Shared {
-    fn policy(&self, model: &ModelId) -> Result<&dyn RoutingPolicy, errors::GatewayError> {
-        self.policies
-            .get(model)
-            .map(Box::as_ref)
-            .ok_or_else(|| errors::GatewayError::unknown_model(model.as_str()))
+    pub(crate) fn live(&self) -> Arc<live::Live> {
+        self.live.load_full()
     }
+}
 
-    fn cost(&self, model: &ModelId) -> CostModel {
-        self.costs.get(model).copied().unwrap_or_default()
+fn check_https(config: &Config) -> Result<(), String> {
+    let urls = config
+        .replicas
+        .iter()
+        .map(|r| (r.id.as_str(), &r.url))
+        .chain(
+            config
+                .discovery
+                .dns
+                .iter()
+                .map(|g| (g.name.as_str(), &g.url)),
+        );
+    for (id, url) in urls {
+        if url.scheme() == "https" {
+            return Err(id.to_owned());
+        }
+    }
+    Ok(())
+}
+
+/// Warns about each model whose policy routes on cached prefixes it will
+/// never be told about.
+fn warn_blind(config: &Config, prompts: &prompts::Prompts, indexed: bool) {
+    for model in &config.models {
+        let kind = config.policy_for(model);
+        let sees_prefixes =
+            prompts.tokenizes(&model.name) && (kind == PolicyKind::PrefixHash || indexed);
+        if kind.is_cache_aware() && !sees_prefixes {
+            tracing::warn!(
+                model = %model.name,
+                policy = %kind,
+                "the policy routes on cached prefixes, but this model gets no cache predictions; it routes on load alone"
+            );
+        }
     }
 }
 
@@ -119,22 +173,7 @@ impl Gateway {
 
     fn check_startup(config: &Config) -> Result<(), BuildError> {
         config.validate().map_err(BuildError::Invalid)?;
-        let urls = config
-            .replicas
-            .iter()
-            .map(|r| (r.id.as_str(), &r.url))
-            .chain(
-                config
-                    .discovery
-                    .dns
-                    .iter()
-                    .map(|g| (g.name.as_str(), &g.url)),
-            );
-        for (id, url) in urls {
-            if url.scheme() == "https" {
-                return Err(BuildError::Https(id.to_owned()));
-            }
-        }
+        check_https(config).map_err(BuildError::Https)?;
         let log = &config.observability.decision_log;
         if let Some(path) = log.path.as_deref().filter(|_| log.sample_rate > 0.0) {
             decision_log::writable(path).map_err(|source| BuildError::DecisionLog {
@@ -154,44 +193,16 @@ impl Gateway {
         }
         let prompts = prompts::Prompts::new(&config, &tokenizers).map_err(BuildError::Workers)?;
         let index = (config.index.enabled && prompts.any()).then(|| Arc::new(KvIndex::new()));
-        let seed = config
-            .routing
-            .seed
-            .unwrap_or_else(|| RandomState::new().hash_one("inferrail routing"));
-        let mut names = HashMap::new();
-        let mut policies = HashMap::new();
-        let mut costs = HashMap::new();
-        for model in &config.models {
-            names.insert(model.name.as_str().to_owned(), model.name.clone());
-            for alias in &model.aliases {
-                names.insert(alias.clone(), model.name.clone());
-            }
-            let kind = config.policy_for(model);
-            let sees_prefixes = prompts.tokenizes(&model.name)
-                && (kind == PolicyKind::PrefixHash || index.is_some());
-            if kind.is_cache_aware() && !sees_prefixes {
-                tracing::warn!(
-                    model = %model.name,
-                    policy = %kind,
-                    "the policy routes on cached prefixes, but this model gets no cache predictions; it routes on load alone"
-                );
-            }
-            let model_seed = inferrail_policy::mix_seed(seed, model.name.as_str());
-            let settings = Settings::new(&config, model, model_seed);
-            policies.insert(model.name.clone(), inferrail_policy::build(kind, &settings));
-            costs.insert(model.name.clone(), settings.cost);
-        }
+        let seed = RandomState::new().hash_one("inferrail routing");
+        warn_blind(&config, &prompts, index.is_some());
+        let live = live::Live::build(config.clone(), seed, None);
         let registry = Arc::new(Registry::new(ReplicaSpec::statics(&config)));
         let clock = Clock::default();
         let metrics = Arc::new(metrics::Metrics::new(metrics::FleetGauges {
             registry: Arc::clone(&registry),
             clock,
             max_age: config.load.max_age,
-            policies: config
-                .models
-                .iter()
-                .map(|m| (m.name.clone(), config.policy_for(m)))
-                .collect(),
+            policies: Arc::new(ArcSwap::from_pointee(live.policies())),
             index: index.clone(),
             tokenized: config
                 .models
@@ -227,9 +238,9 @@ impl Gateway {
                 .map_or(0, |d| d.as_secs()),
             resolver,
             ejecting: Mutex::new(()),
-            names,
-            policies,
-            costs,
+            live: ArcSwap::from_pointee(live),
+            seed,
+            reloading: Mutex::new(()),
             prompts,
             index,
             config,
@@ -239,8 +250,111 @@ impl Gateway {
         })
     }
 
-    pub fn config(&self) -> &Config {
-        &self.shared.config
+    /// The config in effect: the startup one with every reload since.
+    pub fn config(&self) -> Arc<Config> {
+        Arc::clone(&self.shared.live().config)
+    }
+
+    /// Applies `next` without dropping a request: requests already routed
+    /// finish with the policies that routed them, and policies whose
+    /// settings did not change keep their state. Sections only a restart
+    /// can change are refused, leaving the running config as it was.
+    pub fn reload(&self, next: Config) -> Result<Reloaded, ReloadError> {
+        let shared = &self.shared;
+        let _one_at_a_time = shared
+            .reloading
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let applied = Self::apply(shared, next);
+        shared.metrics.reloaded(match &applied {
+            Ok(r) if r.changed.is_empty() => "unchanged",
+            Ok(_) => "applied",
+            Err(_) => "rejected",
+        });
+        applied
+    }
+
+    fn apply(shared: &Shared, next: Config) -> Result<Reloaded, ReloadError> {
+        next.validate().map_err(ReloadError::Invalid)?;
+        let current = shared.live();
+        let restart = current.config.restart_changes(&next);
+        if !restart.is_empty() {
+            return Err(ReloadError::Restart(restart));
+        }
+        check_https(&next).map_err(ReloadError::Https)?;
+        let changed = current.config.changed_sections(&next);
+        if changed.is_empty() {
+            return Ok(Reloaded {
+                generation: current.generation,
+                changed,
+            });
+        }
+        warn_blind(&next, &shared.prompts, shared.index.is_some());
+        let live = live::Live::build(next, shared.seed, Some(&current));
+        if live.config.replicas != current.config.replicas {
+            let change = shared
+                .registry
+                .set_statics(ReplicaSpec::statics(&live.config));
+            for id in &change.rejected {
+                tracing::warn!(replica = %id, "a discovered replica already has this id; ignoring it");
+            }
+            tracing::info!(added = ?change.added, removed = ?change.removed, "static replicas changed");
+        }
+        let generation = live.generation;
+        shared.metrics.set_policies(live.policies());
+        shared.metrics.set_generation(generation);
+        shared.live.store(Arc::new(live));
+        tracing::info!(generation, changed = ?changed, "config reloaded");
+        Ok(Reloaded {
+            generation,
+            changed,
+        })
+    }
+
+    /// Reads, checks and applies the config file at `path`.
+    pub fn reload_from(&self, path: &Path) -> Result<Reloaded, ReloadError> {
+        let next = match Config::parse_unvalidated(&read(path)?) {
+            Ok(next) => next,
+            Err(err) => {
+                self.shared.metrics.reloaded("rejected");
+                return Err(err.into());
+            }
+        };
+        self.reload(next)
+    }
+
+    /// Rereads `path` every `interval` and applies it whenever its contents
+    /// change and differ from the config in effect, until the returned
+    /// future is dropped.
+    pub async fn watch_config(self, path: PathBuf, interval: Duration) {
+        let mut seen = None;
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            let reading = path.clone();
+            let Ok(Ok(text)) =
+                tokio::task::spawn_blocking(move || std::fs::read_to_string(reading)).await
+            else {
+                continue;
+            };
+            let hash = Some(xxh3_64(text.as_bytes()));
+            if hash == seen {
+                continue;
+            }
+            seen = hash;
+            let applied = match Config::parse_unvalidated(&text) {
+                Ok(next) if next == *self.config() => continue,
+                Ok(next) => self.reload(next),
+                Err(err) => {
+                    self.shared.metrics.reloaded("rejected");
+                    Err(err.into())
+                }
+            };
+            if let Err(err) = applied {
+                tracing::warn!(path = %path.display(), error = %err, "config change not applied");
+            }
+        }
     }
 
     pub fn registry(&self) -> &Registry {
@@ -338,6 +452,15 @@ impl Gateway {
     }
 }
 
+fn read(path: &Path) -> Result<String, ReloadError> {
+    std::fs::read_to_string(path).map_err(|source| {
+        ReloadError::Load(ConfigError::Io {
+            path: path.to_owned(),
+            source,
+        })
+    })
+}
+
 /// Drops index state of replicas that left the fleet, every `period`.
 async fn forget_departed(
     registry: Arc<Registry>,
@@ -367,7 +490,7 @@ fn prune_index(registry: &Registry, index: &KvIndex) {
 mod tests {
     use super::*;
     use inferrail_control::{Limits, Origin};
-    use inferrail_core::ids::{BlockHash, ReplicaId};
+    use inferrail_core::ids::{BlockHash, ModelId, ReplicaId};
 
     fn member(group: &ReplicaId, id: &str) -> ReplicaSpec {
         ReplicaSpec {

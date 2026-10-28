@@ -11,6 +11,7 @@ use url::Url;
 
 use crate::ids::{ModelId, ReplicaId};
 
+mod reload;
 mod validate;
 
 pub use validate::{
@@ -139,6 +140,10 @@ pub struct ServerConfig {
     pub header_read_timeout: Duration,
     #[serde(with = "humantime_serde")]
     pub shutdown_timeout: Duration,
+    /// How often the gateway rereads its config file and applies what
+    /// changed; zero turns that off, leaving SIGHUP and `/admin/reload`.
+    #[serde(with = "humantime_serde")]
+    pub reload_interval: Duration,
 }
 
 impl Default for ServerConfig {
@@ -150,6 +155,7 @@ impl Default for ServerConfig {
             max_body_bytes: 32 * 1024 * 1024,
             header_read_timeout: Duration::from_secs(30),
             shutdown_timeout: Duration::from_secs(30),
+            reload_interval: Duration::from_secs(2),
         }
     }
 }
@@ -637,6 +643,7 @@ replicas:
         assert!(!config.upstream.http2);
         assert_eq!(config.server.header_read_timeout, Duration::from_secs(30));
         assert_eq!(config.server.shutdown_timeout, Duration::from_secs(30));
+        assert_eq!(config.server.reload_interval, Duration::from_secs(2));
         assert!(config.discovery.dns.is_empty());
         assert!(config.load.enabled);
         assert_eq!(config.load.scrape_interval, Duration::from_millis(100));

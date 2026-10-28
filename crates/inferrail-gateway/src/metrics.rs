@@ -7,6 +7,7 @@ use std::fmt::{self, Write as _};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use hyper::StatusCode;
 use inferrail_control::{Clock, Registry};
 use inferrail_core::config::PolicyKind;
@@ -21,7 +22,7 @@ use prometheus_client::encoding::{
 use prometheus_client::metrics::MetricType;
 use prometheus_client::metrics::counter::{ConstCounter, Counter};
 use prometheus_client::metrics::family::Family;
-use prometheus_client::metrics::gauge::ConstGauge;
+use prometheus_client::metrics::gauge::{self, ConstGauge};
 use prometheus_client::metrics::histogram::Histogram;
 use prometheus_client::registry::Registry as MetricRegistry;
 
@@ -143,6 +144,14 @@ struct SteerLabels {
     reason: Text,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, EncodeLabelSet)]
+struct ResultLabels {
+    result: Text,
+}
+
+/// Each model's policy, as the policy gauge reports it; replaced on reload.
+pub type Policies = Arc<ArcSwap<Vec<(ModelId, PolicyKind)>>>;
+
 type Histograms<S> = Family<S, Histogram, fn() -> Histogram>;
 
 /// A label set that names a replica, kept so it can be removed when the
@@ -198,6 +207,9 @@ pub struct Metrics {
     estimated_ttft: Histograms<ModelPolicyLabels>,
     guards: Family<GuardLabels, Counter>,
     steered: Family<SteerLabels, Counter>,
+    reloads: Family<ResultLabels, Counter>,
+    generation: gauge::Gauge,
+    policies: Policies,
     series: Mutex<HashMap<ReplicaId, Vec<Series>>>,
 }
 
@@ -230,8 +242,17 @@ impl Metrics {
             estimated_ttft: histograms(|| Histogram::new(TTFT_BUCKETS)),
             guards: Family::default(),
             steered: Family::default(),
+            reloads: Family::default(),
+            generation: gauge::Gauge::default(),
+            policies: Arc::clone(&fleet.policies),
             series: Mutex::default(),
         };
+        this.generation.set(1);
+        for result in ["applied", "unchanged", "rejected"] {
+            let _ = this.reloads.get_or_create(&ResultLabels {
+                result: Text::Fixed(result),
+            });
+        }
         let mut registry = MetricRegistry::default();
         registry.register(
             "inferrail_requests",
@@ -346,7 +367,25 @@ impl Metrics {
             "Routing decisions steered beyond the policy's plain rule: by session affinity, to a hot prefix owner its plain estimate would have passed over, or by a fallback for prompts without a full block.",
             this.steered.clone(),
         );
-        for (model, policy) in &fleet.policies {
+        registry.register(
+            "inferrail_config_reloads",
+            "Config reloads by result: applied, unchanged when nothing changed, or rejected when the new config was invalid or needed a restart.",
+            this.reloads.clone(),
+        );
+        registry.register(
+            "inferrail_config_generation",
+            "The config generation in effect, 1 at startup and one more for every reload that changed something.",
+            this.generation.clone(),
+        );
+        this.series_for(&this.policies.load());
+        registry.register_collector(Box::new(fleet));
+        Self { registry, ..this }
+    }
+
+    /// Creates the guard and steer series a policy can move, so they read
+    /// zero before the first decision.
+    fn series_for(&self, policies: &[(ModelId, PolicyKind)]) {
+        for (model, policy) in policies {
             let (guards, steers): (&[&'static str], &[&'static str]) = match policy {
                 PolicyKind::CostModel => (
                     &["bounded_load", "kv_pressure", "kv_waived"],
@@ -356,20 +395,36 @@ impl Metrics {
                 _ => (&[], &[]),
             };
             for guard in guards {
-                let _ = this.guards.get_or_create(&GuardLabels {
+                let _ = self.guards.get_or_create(&GuardLabels {
                     model: Text::Model(model.clone()),
                     guard: Text::Fixed(guard),
                 });
             }
             for reason in steers {
-                let _ = this.steered.get_or_create(&SteerLabels {
+                let _ = self.steered.get_or_create(&SteerLabels {
                     model: Text::Model(model.clone()),
                     reason: Text::Fixed(reason),
                 });
             }
         }
-        registry.register_collector(Box::new(fleet));
-        Self { registry, ..this }
+    }
+
+    pub(crate) fn set_policies(&self, policies: Vec<(ModelId, PolicyKind)>) {
+        self.series_for(&policies);
+        self.policies.store(Arc::new(policies));
+    }
+
+    pub(crate) fn set_generation(&self, generation: u64) {
+        self.generation
+            .set(i64::try_from(generation).unwrap_or(i64::MAX));
+    }
+
+    pub(crate) fn reloaded(&self, result: &'static str) {
+        self.reloads
+            .get_or_create(&ResultLabels {
+                result: Text::Fixed(result),
+            })
+            .inc();
     }
 
     /// The counters the decision log updates: records queued, and dropped.
@@ -690,7 +745,7 @@ pub struct FleetGauges {
     pub registry: Arc<Registry>,
     pub clock: Clock,
     pub max_age: Duration,
-    pub policies: Vec<(ModelId, PolicyKind)>,
+    pub policies: Policies,
     pub index: Option<Arc<KvIndex>>,
     /// Models whose tokenizer loaded; their cache lookups count from zero.
     pub tokenized: Vec<ModelId>,
@@ -829,7 +884,7 @@ impl Collector for FleetGauges {
             None,
             MetricType::Gauge,
         )?;
-        for (model, policy) in &self.policies {
+        for (model, policy) in self.policies.load().iter() {
             let labels = [
                 ("model", Text::Model(model.clone())),
                 ("policy", Text::Fixed(policy.as_str())),
@@ -920,7 +975,10 @@ mod tests {
             registry: Arc::clone(fleet),
             clock: Clock::default(),
             max_age: Duration::from_millis(250),
-            policies: vec![(ModelId::new("m").unwrap(), PolicyKind::P2c)],
+            policies: Arc::new(ArcSwap::from_pointee(vec![(
+                ModelId::new("m").unwrap(),
+                PolicyKind::P2c,
+            )])),
             index: None,
             tokenized: Vec::new(),
         })
@@ -934,7 +992,7 @@ mod tests {
             registry: Arc::clone(&fleet),
             clock: Clock::default(),
             max_age: Duration::from_millis(250),
-            policies: Vec::new(),
+            policies: Arc::default(),
             index: None,
             tokenized: vec![a.clone(), b.clone()],
         });
@@ -1197,7 +1255,10 @@ mod tests {
             registry: Arc::clone(&fleet),
             clock: Clock::default(),
             max_age: Duration::from_millis(250),
-            policies: vec![(quoted.clone(), PolicyKind::P2c)],
+            policies: Arc::new(ArcSwap::from_pointee(vec![(
+                quoted.clone(),
+                PolicyKind::P2c,
+            )])),
             index: None,
             tokenized: Vec::new(),
         });

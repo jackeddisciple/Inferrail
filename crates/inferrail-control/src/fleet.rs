@@ -53,13 +53,62 @@ impl MembershipChange {
     }
 }
 
-/// Holds the current fleet for lock free readers. Writers (discovery) are
-/// rare and serialize on a mutex that the hot path never touches.
+/// Holds the current fleet for lock free readers. Writers (discovery and
+/// config reloads) are rare and serialize on a mutex that the hot path
+/// never touches.
 #[derive(Debug)]
 pub struct Registry {
     fleet: ArcSwap<Fleet>,
+    members: Mutex<Members>,
+}
+
+#[derive(Debug, Default)]
+struct Members {
     statics: Vec<Arc<Replica>>,
-    groups: Mutex<BTreeMap<ReplicaId, Vec<Arc<Replica>>>>,
+    groups: BTreeMap<ReplicaId, Vec<Arc<Replica>>>,
+}
+
+impl Members {
+    fn publish(&self, fleet: &ArcSwap<Fleet>) {
+        let all = self
+            .statics
+            .iter()
+            .chain(self.groups.values().flatten())
+            .cloned()
+            .collect();
+        fleet.store(Arc::new(Fleet::new(all)));
+    }
+}
+
+/// Replaces `previous` with `members`, keeping the replica of every member
+/// whose spec is unchanged so health and counters survive, and refusing ids
+/// in `taken` or given twice.
+fn replace(
+    previous: &[Arc<Replica>],
+    members: Vec<ReplicaSpec>,
+    taken: &HashSet<&str>,
+) -> (Vec<Arc<Replica>>, MembershipChange) {
+    let mut change = MembershipChange::default();
+    let mut next: Vec<Arc<Replica>> = Vec::with_capacity(members.len());
+    for spec in members {
+        if taken.contains(spec.id.as_str()) || next.iter().any(|r| r.id() == &spec.id) {
+            change.rejected.push(spec.id);
+            continue;
+        }
+        match previous.iter().find(|r| r.spec() == &spec) {
+            Some(kept) => next.push(Arc::clone(kept)),
+            None => {
+                change.added.push(spec.id.clone());
+                next.push(Arc::new(Replica::new(spec)));
+            }
+        }
+    }
+    change.removed = previous
+        .iter()
+        .filter(|old| !next.iter().any(|r| Arc::ptr_eq(r, old)))
+        .map(|old| old.id().clone())
+        .collect();
+    (next, change)
 }
 
 impl Registry {
@@ -70,8 +119,10 @@ impl Registry {
             .collect();
         Self {
             fleet: ArcSwap::from_pointee(Fleet::new(statics.clone())),
-            statics,
-            groups: Mutex::new(BTreeMap::new()),
+            members: Mutex::new(Members {
+                statics,
+                groups: BTreeMap::new(),
+            }),
         }
     }
 
@@ -83,46 +134,43 @@ impl Registry {
         self.fleet.load_full()
     }
 
+    fn members(&self) -> std::sync::MutexGuard<'_, Members> {
+        self.members.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// Replaces one discovery group's members. Members whose id and URL are
     /// unchanged keep their replica, so health and counters survive.
     pub fn set_group(&self, group: &ReplicaId, members: Vec<ReplicaSpec>) -> MembershipChange {
-        let mut groups = self.groups.lock().unwrap_or_else(PoisonError::into_inner);
-        let previous = groups.remove(group).unwrap_or_default();
-        let mut taken: HashSet<&str> = self.statics.iter().map(|r| r.id().as_str()).collect();
-        taken.extend(groups.values().flatten().map(|r| r.id().as_str()));
-
-        let mut change = MembershipChange::default();
-        let mut next: Vec<Arc<Replica>> = Vec::with_capacity(members.len());
-        for spec in members {
-            if taken.contains(spec.id.as_str()) || next.iter().any(|r| r.id() == &spec.id) {
-                change.rejected.push(spec.id);
-                continue;
-            }
-            match previous.iter().find(|r| r.spec() == &spec) {
-                Some(kept) => next.push(Arc::clone(kept)),
-                None => {
-                    change.added.push(spec.id.clone());
-                    next.push(Arc::new(Replica::new(spec)));
-                }
-            }
-        }
-        change.removed = previous
-            .iter()
-            .filter(|old| !next.iter().any(|r| Arc::ptr_eq(r, old)))
-            .map(|old| old.id().clone())
-            .collect();
-        if next.is_empty() {
-            groups.remove(group);
-        } else {
-            groups.insert(group.clone(), next);
-        }
-        let all = self
+        let mut all = self.members();
+        let previous = all.groups.remove(group).unwrap_or_default();
+        let taken: HashSet<&str> = all
             .statics
             .iter()
-            .chain(groups.values().flatten())
-            .cloned()
+            .chain(all.groups.values().flatten())
+            .map(|r| r.id().as_str())
             .collect();
-        self.fleet.store(Arc::new(Fleet::new(all)));
+        let (next, change) = replace(&previous, members, &taken);
+        if !next.is_empty() {
+            all.groups.insert(group.clone(), next);
+        }
+        all.publish(&self.fleet);
+        change
+    }
+
+    /// Replaces the replicas listed in the config, as a reload does. Ones
+    /// whose spec is unchanged keep their replica; requests already on a
+    /// removed one finish there.
+    pub fn set_statics(&self, members: Vec<ReplicaSpec>) -> MembershipChange {
+        let mut all = self.members();
+        let taken: HashSet<&str> = all
+            .groups
+            .values()
+            .flatten()
+            .map(|r| r.id().as_str())
+            .collect();
+        let (next, change) = replace(&all.statics, members, &taken);
+        all.statics = next;
+        all.publish(&self.fleet);
         change
     }
 }
@@ -200,6 +248,34 @@ mod tests {
         let change = registry.set_group(&group, vec![]);
         assert_eq!(change.removed.len(), 2);
         assert_eq!(ids(&registry.load()), ["s"]);
+    }
+
+    #[test]
+    fn statics_are_replaced_in_place_keeping_survivors() {
+        let registry = Registry::new(vec![
+            spec("a", "http://a:1", &["m"]),
+            spec("b", "http://b:1", &["m"]),
+        ]);
+        let group = ReplicaId::new("pool").unwrap();
+        registry.set_group(&group, vec![member("pool", 1)]);
+        let a = Arc::clone(registry.load().get("a").unwrap());
+        let change = registry.set_statics(vec![
+            spec("a", "http://a:1", &["m"]),
+            spec("c", "http://c:1", &["m"]),
+            spec("pool-10.0.0.1-8000", "http://x:1", &["m"]),
+        ]);
+        assert_eq!(change.added, [ReplicaId::new("c").unwrap()]);
+        assert_eq!(change.removed, [ReplicaId::new("b").unwrap()]);
+        assert_eq!(
+            change.rejected,
+            [ReplicaId::new("pool-10.0.0.1-8000").unwrap()]
+        );
+        assert_eq!(ids(&registry.load()), ["a", "c", "pool-10.0.0.1-8000"]);
+        assert!(Arc::ptr_eq(registry.load().get("a").unwrap(), &a));
+        let change = registry.set_statics(vec![spec("a", "http://a:2", &["m"])]);
+        assert_eq!((change.added.len(), change.removed.len()), (1, 2));
+        assert!(!Arc::ptr_eq(registry.load().get("a").unwrap(), &a));
+        assert_eq!(registry.load().replicas().len(), 2);
     }
 
     #[test]

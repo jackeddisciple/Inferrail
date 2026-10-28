@@ -21,6 +21,7 @@ use crate::decision_log::{self, Decision};
 use crate::errors::GatewayError;
 use crate::headers::{self, CACHED_TOKENS, PROMPT_TOKENS, REPLICA, SESSION_ID};
 use crate::inspect::{InspectError, inspect};
+use crate::live::Live;
 use crate::metrics::Routed;
 use crate::prompts::{self, Prompt, Skip};
 use crate::request_id::REQUEST_ID;
@@ -199,14 +200,15 @@ async fn attempt(
     let body = timeout_at(deadline, read_body(&parts.headers, body, limit))
         .await
         .map_err(|_| GatewayError::slow_body())??;
-    let Resolved { model, body, user } = resolve_model(shared, body)?;
+    let live = shared.live();
+    let Resolved { model, body, user } = resolve_model(shared, &live, body)?;
     let session = session_key(&parts.headers, user.as_deref());
     Span::current().record("gen_ai.request.model", model.as_str());
     seen.model = Some(model.clone());
-    if shared.config.logging.log_prompts {
+    if live.config.logging.log_prompts {
         tracing::debug!(request_id = ?id, body = %String::from_utf8_lossy(&body), "request body");
     }
-    let policy = shared.policy(&model)?;
+    let policy = live.policy(&model)?;
     let endpoint = if parts.uri.path() == "/v1/chat/completions" {
         Endpoint::Chat
     } else {
@@ -222,9 +224,10 @@ async fn attempt(
         .filter(|log| log.sampled(id.as_bytes()));
     let mut tried: Vec<ReplicaId> = Vec::new();
     let mut last: Option<Result<Response<ResponseBody>, GatewayError>> = None;
-    for attempt in 0..shared.config.retry.max_attempts {
+    let retry = &live.config.retry;
+    for attempt in 0..retry.max_attempts {
         if attempt > 0 {
-            let pause = backoff(shared.config.retry.backoff, attempt);
+            let pause = backoff(retry.backoff, attempt);
             if Instant::now() + pause >= deadline {
                 break;
             }
@@ -265,7 +268,7 @@ async fn attempt(
             prompt: prompt.as_ref(),
             index: shared.index.as_deref(),
             session,
-            cost: shared.cost(&model),
+            cost: live.cost(&model),
             max_age: shared.config.load.max_age,
             explain: sampled.is_some(),
         };
@@ -542,7 +545,11 @@ pub(crate) fn session_key(headers: &HeaderMap, user: Option<&str>) -> Option<u64
 
 /// Resolves the requested name to a served model. The body is only
 /// rewritten when the engine would otherwise see a different name.
-pub(crate) fn resolve_model(shared: &Shared, body: Bytes) -> Result<Resolved, GatewayError> {
+pub(crate) fn resolve_model(
+    shared: &Shared,
+    live: &Live,
+    body: Bytes,
+) -> Result<Resolved, GatewayError> {
     let (model, rewritten, user) = {
         let inspected = inspect(&body).map_err(|err| match err {
             InspectError::ModelNotString => GatewayError::bad_param(err.to_string(), "model"),
@@ -551,9 +558,8 @@ pub(crate) fn resolve_model(shared: &Shared, body: Bytes) -> Result<Resolved, Ga
         let user = inspected.user.as_deref().map(str::to_owned);
         match inspected.model.as_deref() {
             Some(name) => {
-                let model = shared
-                    .names
-                    .get(name)
+                let model = live
+                    .resolve(name)
                     .ok_or_else(|| GatewayError::unknown_model(name))?
                     .clone();
                 let rewrite =

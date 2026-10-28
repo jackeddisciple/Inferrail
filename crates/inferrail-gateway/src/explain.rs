@@ -94,8 +94,9 @@ async fn report(
     headers: &HeaderMap,
     body: Bytes,
 ) -> Result<Report, GatewayError> {
-    let Resolved { model, body, user } = resolve_model(shared, body)?;
-    let policy = shared.policy(&model)?;
+    let live = shared.live();
+    let Resolved { model, body, user } = resolve_model(shared, &live, body)?;
+    let policy = live.policy(&model)?;
     let (prepared, _) = shared.prompts.prepare(&model, endpoint, &body).await;
     let (prompt, skipped) = match prepared {
         Ok(prompt) => (Some(prompt), None),
@@ -112,7 +113,7 @@ async fn report(
         prompt: prompt.as_ref(),
         index: shared.index.as_deref(),
         session: session_key(headers, user.as_deref()),
-        cost: shared.cost(&model),
+        cost: live.cost(&model),
         max_age: shared.config.load.max_age,
         explain: true,
     };

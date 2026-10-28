@@ -744,7 +744,7 @@ fn discovery_churn_keeps_the_metrics_page_bounded() {
         registry: Arc::clone(&fleet),
         clock: Clock::default(),
         max_age: MAX_AGE,
-        policies: Vec::new(),
+        policies: Default::default(),
         index: None,
         tokenized: Vec::new(),
     });

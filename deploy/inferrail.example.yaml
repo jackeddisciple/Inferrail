@@ -8,6 +8,10 @@ server:
   max_body_bytes: 33554432
   header_read_timeout: 30s
   shutdown_timeout: 30s
+  # Reread this file this often and apply what changed in routing, models'
+  # policies and cost models, replicas, retry and log_prompts; 0s turns it
+  # off. Other sections need a restart.
+  reload_interval: 2s
 
 # A model's tokenizer is a model directory, a repository id already in the
 # local Hugging Face cache (org/name or org/name@revision), or builtin:sim for

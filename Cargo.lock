@@ -1219,6 +1219,7 @@ name = "inferrail-gateway"
 version = "0.1.10"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "axum",
  "clap",
  "criterion",

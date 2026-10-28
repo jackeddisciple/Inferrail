@@ -4,6 +4,8 @@ expression: shape(&page)
 ---
 TYPE inferrail_build_info gauge
 TYPE inferrail_client_disconnects counter
+TYPE inferrail_config_generation gauge
+TYPE inferrail_config_reloads counter
 TYPE inferrail_decision_log_dropped counter
 TYPE inferrail_decision_log_records counter
 TYPE inferrail_ejections counter
@@ -44,6 +46,8 @@ TYPE inferrail_ttft_seconds histogram
 TYPE inferrail_upstream_retries counter
 inferrail_build_info{version}
 inferrail_client_disconnects_total{model}
+inferrail_config_generation{}
+inferrail_config_reloads_total{result}
 inferrail_decision_log_dropped_total{}
 inferrail_decision_log_records_total{}
 inferrail_ejections_total{replica}

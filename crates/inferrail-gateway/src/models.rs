@@ -26,7 +26,8 @@ pub(crate) fn list(shared: &Shared) -> Response<ResponseBody> {
     let fleet = shared.registry.load();
     let now = shared.clock.now();
     let mut cards = Vec::new();
-    for model in &shared.config.models {
+    let live = shared.live();
+    for model in &live.config.models {
         let name = model.name.as_str();
         let mut serving: Vec<_> = fleet.serving(&model.name).iter().collect();
         serving.sort_by_key(|r| !r.is_routable(now));

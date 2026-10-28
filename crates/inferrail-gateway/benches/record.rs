@@ -25,7 +25,7 @@ fn bench(c: &mut Criterion) {
         registry: Arc::clone(&fleet),
         clock: Clock::default(),
         max_age: Duration::from_millis(250),
-        policies: Vec::new(),
+        policies: Default::default(),
         index: None,
         tokenized: Vec::new(),
     });
