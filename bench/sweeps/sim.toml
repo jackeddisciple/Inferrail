@@ -1,8 +1,9 @@
 # The full simulator sweep behind `make sweep`: every workload on three
 # simulators with the default latency model of an 8B model on one 24 GB GPU,
 # each policy on the same requests and arrival times, 3 repetitions. Main
-# rates sit near 70% of what a cache blind fleet sustains; the knee points
-# step through and past it. Results land in bench/results/sweep.
+# rates sit near 70% of what a cache blind fleet sustains; W2 also runs past
+# its knee, and the knee points step through and past it. Results land in
+# bench/results/sweep.
 
 name = "sim"
 policies = ["round_robin", "random", "least_request", "p2c", "prefix_hash", "kv_aware", "cost_model"]
@@ -19,7 +20,7 @@ params = { prompts = 32 }
 
 [[point]]
 workload = "w2"
-rates = [25]
+rates = [15, 25]
 
 [[point]]
 workload = "w3"

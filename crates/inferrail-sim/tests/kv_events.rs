@@ -5,16 +5,21 @@
 mod common;
 
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use common::{TestSim, config, fast_latency, spawn};
 use inferrail_events::{EventBatch, KvEvent, Published, Subscriber, replay};
 use inferrail_sim::cache::extend_hashes;
 use inferrail_sim::events::KvEventsConfig;
+use inferrail_sim::latency::LatencyModel;
 use serde_json::json;
 
 async fn publishing(blocks: usize) -> (TestSim, Subscriber) {
-    let mut cfg = config(fast_latency());
+    publishing_with(blocks, fast_latency()).await
+}
+
+async fn publishing_with(blocks: usize, latency: LatencyModel) -> (TestSim, Subscriber) {
+    let mut cfg = config(latency);
     cfg.engine.num_gpu_blocks = blocks;
     cfg.max_model_len = blocks * 16;
     cfg.kv_events = KvEventsConfig {
@@ -231,4 +236,78 @@ async fn without_prefix_caching_nothing_is_published() {
     tokio::time::sleep(Duration::from_millis(50)).await;
     complete(&sim, &tokens(1, 300), 30).await;
     assert!(drain(&mut sub).await.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "stress"]
+async fn ten_thousand_requests_keep_the_stream_exact() {
+    let latency = LatencyModel {
+        prefill_token_secs: 20e-6,
+        prefill_pair_secs: 0.0,
+        prefill_fixed_secs: 1e-4,
+        decode_token_secs: 1e-3,
+        decode_seq_secs: 1e-5,
+    };
+    let (sim, mut sub) = publishing_with(1_024, latency).await;
+    let collector = tokio::spawn(async move {
+        let mut out = Vec::new();
+        while let Ok(got) = tokio::time::timeout(Duration::from_secs(1), sub.recv()).await {
+            out.push(got.expect("a message"));
+        }
+        out
+    });
+    let (rate, total) = (1_000u32, 10_000u32);
+    let started = tokio::time::Instant::now();
+    let mut tasks = Vec::with_capacity(total as usize);
+    for i in 0..total {
+        tokio::time::sleep_until(started + Duration::from_secs(1) * i / rate).await;
+        let client = sim.client.clone();
+        let url = sim.url("/v1/completions");
+        let mut prompt = tokens(i % 32, 160 + (i as usize % 7) * 32);
+        prompt.extend(tokens(10_000 + i, 9));
+        tasks.push(tokio::spawn(async move {
+            let body = json!({"model": "llama", "prompt": prompt, "max_tokens": 8});
+            let reply = client.post(url).json(&body).send().await.expect("sent");
+            assert_eq!(reply.status(), 200);
+            reply.bytes().await.expect("body");
+        }));
+    }
+    for task in tasks {
+        task.await.expect("request");
+    }
+    let wall = started.elapsed();
+    let messages = collector.await.expect("collector");
+    check_sequence(&messages, 0);
+    let mut mirror = Mirror::default();
+    let (mut stored, mut removed) = (0usize, 0usize);
+    let decoding = Instant::now();
+    for message in &messages {
+        for event in EventBatch::decode(&message.payload).unwrap().events {
+            match &event {
+                KvEvent::BlockStored(e) => stored += e.block_hashes.len(),
+                KvEvent::BlockRemoved(e) => removed += e.block_hashes.len(),
+                KvEvent::AllBlocksCleared => {}
+            }
+            mirror.apply(&event);
+        }
+    }
+    let decode_secs = decoding.elapsed().as_secs_f64();
+    let snap = sim.sim.engine().snapshot();
+    assert_eq!(mirror.blocks(), snap.cached_blocks);
+    assert_eq!((snap.running, snap.kv_blocks_used), (0, 0));
+    assert!(removed > 0, "the pool never evicted");
+    let addr = sim.sim.kv_replay_addr().unwrap();
+    let tail = messages.len() - 1_000;
+    assert_eq!(
+        replay(addr, messages[tail].seq).await.unwrap(),
+        messages[tail..]
+    );
+    println!(
+        "kv events under {rate}/s x {total}: wall {:.2} s, {} batches without a gap, {stored} \
+         blocks stored and {removed} removed, mirror equals the engine's {} cached blocks, \
+         decoded and checked in {decode_secs:.2} s, last 1000 batches replayed exactly",
+        wall.as_secs_f64(),
+        messages.len(),
+        snap.cached_blocks,
+    );
 }

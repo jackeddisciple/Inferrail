@@ -1,5 +1,6 @@
 # The gateway inside the compose stack: three simulators, metrics on the
-# admin port for Prometheus and a tenth of requests traced to Jaeger.
+# admin port for Prometheus, a tenth of requests traced to Jaeger and two
+# policies in shadow for the control plane panels.
 server:
   listen: 0.0.0.0:8080
   admin_listen: 0.0.0.0:9090
@@ -22,6 +23,7 @@ replicas:
 
 routing:
   default_policy: cost_model
+  shadow: [least_request, prefix_hash]
 
 health:
   interval: 500ms

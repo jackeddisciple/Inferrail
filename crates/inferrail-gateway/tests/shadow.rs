@@ -215,12 +215,25 @@ async fn shadows_are_measured_against_the_routing_policy() {
     ] {
         assert!(page.contains(line), "{line} missing");
     }
-    let routed: f64 = page
-        .lines()
-        .filter(|l| l.starts_with("inferrail_routing_decisions_total") && l.contains("round_robin"))
-        .map(|l| l.rsplit_once(' ').unwrap().1.parse::<f64>().unwrap())
-        .sum();
-    assert_eq!(routed, 120.0, "shadows must not route");
+    let total = |family: &str, policy: &str| -> f64 {
+        page.lines()
+            .filter(|l| l.starts_with(family) && l.contains(policy))
+            .map(|l| l.rsplit_once(' ').unwrap().1.parse::<f64>().unwrap())
+            .sum()
+    };
+    let retries = total("inferrail_upstream_retries_total", "");
+    assert_eq!(
+        total("inferrail_routing_decisions_total", "policy=\"cost_model\""),
+        0.0
+    );
+    assert_eq!(
+        total(
+            "inferrail_routing_decisions_total",
+            "policy=\"round_robin\""
+        ),
+        120.0 + retries,
+        "shadows must not route"
+    );
 }
 
 #[tokio::test]

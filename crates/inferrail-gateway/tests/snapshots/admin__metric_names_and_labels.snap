@@ -40,7 +40,9 @@ TYPE inferrail_routing_decision_seconds histogram
 TYPE inferrail_routing_decisions counter
 TYPE inferrail_routing_guards counter
 TYPE inferrail_routing_steered counter
+TYPE inferrail_shadow_decisions counter
 TYPE inferrail_shadow_dropped counter
+TYPE inferrail_shadow_estimated_ttft_seconds counter
 TYPE inferrail_tokenize_cache_lookups counter
 TYPE inferrail_tokenize_seconds histogram
 TYPE inferrail_tokenized_requests counter
@@ -90,7 +92,9 @@ inferrail_routing_decision_seconds_sum{policy}
 inferrail_routing_decisions_total{model,policy,replica}
 inferrail_routing_guards_total{guard,model}
 inferrail_routing_steered_total{model,reason}
+inferrail_shadow_decisions_total{agreed,model,policy}
 inferrail_shadow_dropped_total{}
+inferrail_shadow_estimated_ttft_seconds_total{model,pick,policy}
 inferrail_tokenize_cache_lookups_total{model,result}
 inferrail_tokenize_seconds_bucket{model}
 inferrail_tokenize_seconds_count{model}

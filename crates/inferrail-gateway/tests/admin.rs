@@ -62,6 +62,7 @@ async fn metric_names_and_labels() {
         }
         config.models.push(other);
     }
+    config.models[0].shadow = Some(vec![PolicyKind::CostModel]);
     let gw = TestGateway::start(config).await;
     let admin = serve_admin(&gw.gateway).await;
     gw.stream(&streaming(chat("one", 3))).await;
@@ -101,6 +102,12 @@ async fn metric_names_and_labels() {
             .health()
             .is_ejected(gw.gateway.clock().now())
     );
+    wait_until(Duration::from_secs(2), || {
+        gw.gateway
+            .render_metrics()
+            .contains("inferrail_shadow_estimated_ttft_seconds_total{")
+    })
+    .await;
 
     let response = gw
         .client

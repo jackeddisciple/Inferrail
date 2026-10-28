@@ -1503,6 +1503,249 @@
           "legendFormat": "steered {{reason}}"
         }
       ]
+    },
+    {
+      "type": "row",
+      "title": "Control plane",
+      "id": 31,
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 76
+      },
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Config generation and reloads",
+      "id": 32,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "The config generation in effect, and reload attempts from the file, SIGHUP or the admin API by result.",
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 0,
+        "y": 77
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "inferrail_config_generation",
+          "legendFormat": "generation"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (result) (increase(inferrail_config_reloads_total[$__rate_interval]))",
+          "legendFormat": "reloads {{result}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Traffic split by policy",
+      "id": 33,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Each model's percent of traffic per policy, from routing.split or the model's split.",
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 6,
+        "y": 77
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          },
+          "min": 0,
+          "max": 100
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "inferrail_model_policy_percent",
+          "legendFormat": "{{model}} {{policy}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Shadow agreement with the routing policy",
+      "id": 34,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Share of shadowed requests where each shadow policy picked the replica the routing policy picked, and requests dropped from the shadow.",
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 12,
+        "y": 77
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (model, policy) (rate(inferrail_shadow_decisions_total{agreed=\"true\"}[$__rate_interval])) / sum by (model, policy) (rate(inferrail_shadow_decisions_total[$__rate_interval]))",
+          "legendFormat": "{{model}} {{policy}}"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "rate(inferrail_shadow_dropped_total[$__rate_interval])",
+          "legendFormat": "dropped per second"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Shadow estimated TTFT gain",
+      "id": 35,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Mean estimated TTFT of the routing policy's pick minus the shadow's, priced by the cost model; positive means the shadow looks faster. The cost model's view, so read it as a reason to try a split.",
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 18,
+        "y": 77
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "(sum by (model, policy) (rate(inferrail_shadow_estimated_ttft_seconds_total{pick=\"active\"}[$__rate_interval])) - sum by (model, policy) (rate(inferrail_shadow_estimated_ttft_seconds_total{pick=\"shadow\"}[$__rate_interval]))) / sum by (model, policy) (rate(inferrail_shadow_decisions_total[$__rate_interval]))",
+          "legendFormat": "{{model}} {{policy}}"
+        }
+      ]
     }
   ]
 }
