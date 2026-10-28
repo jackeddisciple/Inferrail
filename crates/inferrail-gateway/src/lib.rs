@@ -143,15 +143,16 @@ fn check_https(config: &Config) -> Result<(), String> {
 /// never be told about.
 fn warn_blind(config: &Config, prompts: &prompts::Prompts, indexed: bool) {
     for model in &config.models {
-        let kind = config.policy_for(model);
-        let sees_prefixes =
-            prompts.tokenizes(&model.name) && (kind == PolicyKind::PrefixHash || indexed);
-        if kind.is_cache_aware() && !sees_prefixes {
-            tracing::warn!(
-                model = %model.name,
-                policy = %kind,
-                "the policy routes on cached prefixes, but this model gets no cache predictions; it routes on load alone"
-            );
+        for (kind, _) in config.arms_for(model) {
+            let sees_prefixes =
+                prompts.tokenizes(&model.name) && (kind == PolicyKind::PrefixHash || indexed);
+            if kind.is_cache_aware() && !sees_prefixes {
+                tracing::warn!(
+                    model = %model.name,
+                    policy = %kind,
+                    "the policy routes on cached prefixes, but this model gets no cache predictions; it routes on load alone"
+                );
+            }
         }
     }
 }

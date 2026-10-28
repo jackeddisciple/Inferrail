@@ -149,8 +149,9 @@ struct ResultLabels {
     result: Text,
 }
 
-/// Each model's policy, as the policy gauge reports it; replaced on reload.
-pub type Policies = Arc<ArcSwap<Vec<(ModelId, PolicyKind)>>>;
+/// Each model's policies and the percent of its traffic each routes, as the
+/// policy gauges report them; replaced on reload.
+pub type Policies = Arc<ArcSwap<Vec<(ModelId, PolicyKind, u32)>>>;
 
 type Histograms<S> = Family<S, Histogram, fn() -> Histogram>;
 
@@ -384,8 +385,8 @@ impl Metrics {
 
     /// Creates the guard and steer series a policy can move, so they read
     /// zero before the first decision.
-    fn series_for(&self, policies: &[(ModelId, PolicyKind)]) {
-        for (model, policy) in policies {
+    fn series_for(&self, policies: &[(ModelId, PolicyKind, u32)]) {
+        for (model, policy, _) in policies {
             let (guards, steers): (&[&'static str], &[&'static str]) = match policy {
                 PolicyKind::CostModel => (
                     &["bounded_load", "kv_pressure", "kv_waived"],
@@ -409,7 +410,7 @@ impl Metrics {
         }
     }
 
-    pub(crate) fn set_policies(&self, policies: Vec<(ModelId, PolicyKind)>) {
+    pub(crate) fn set_policies(&self, policies: Vec<(ModelId, PolicyKind, u32)>) {
         self.series_for(&policies);
         self.policies.store(Arc::new(policies));
     }
@@ -884,12 +885,26 @@ impl Collector for FleetGauges {
             None,
             MetricType::Gauge,
         )?;
-        for (model, policy) in self.policies.load().iter() {
+        let policies = self.policies.load();
+        for (model, policy, _) in policies.iter() {
             let labels = [
                 ("model", Text::Model(model.clone())),
                 ("policy", Text::Fixed(policy.as_str())),
             ];
             ConstGauge::new(1i64).encode(info.encode_family(&labels)?)?;
+        }
+        let mut shares = encoder.encode_descriptor(
+            "inferrail_model_policy_percent",
+            "Percent of each model's requests its policy routes, below 100 under an A/B split.",
+            None,
+            MetricType::Gauge,
+        )?;
+        for (model, policy, percent) in policies.iter() {
+            let labels = [
+                ("model", Text::Model(model.clone())),
+                ("policy", Text::Fixed(policy.as_str())),
+            ];
+            ConstGauge::new(i64::from(*percent)).encode(shares.encode_family(&labels)?)?;
         }
         let mut build = encoder.encode_descriptor(
             "inferrail_build_info",
@@ -978,6 +993,7 @@ mod tests {
             policies: Arc::new(ArcSwap::from_pointee(vec![(
                 ModelId::new("m").unwrap(),
                 PolicyKind::P2c,
+                100,
             )])),
             index: None,
             tokenized: Vec::new(),
@@ -1258,6 +1274,7 @@ mod tests {
             policies: Arc::new(ArcSwap::from_pointee(vec![(
                 quoted.clone(),
                 PolicyKind::P2c,
+                100,
             )])),
             index: None,
             tokenized: Vec::new(),

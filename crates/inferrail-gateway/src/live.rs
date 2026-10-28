@@ -1,5 +1,5 @@
 //! What a config reload replaces: the config, the names clients may use,
-//! and each model's policy and cost model. A request reads one snapshot
+//! and each model's policies and cost model. A request reads one snapshot
 //! for its whole life, so a reload never changes a decision halfway.
 
 use std::collections::HashMap;
@@ -15,7 +15,7 @@ use crate::errors::GatewayError;
 /// them alone keeps the policy and what it has learned.
 #[derive(Debug, Clone)]
 pub(crate) struct Built {
-    kind: PolicyKind,
+    pub(crate) kind: PolicyKind,
     settings: Settings,
     pub(crate) policy: Arc<dyn RoutingPolicy>,
 }
@@ -33,10 +33,44 @@ impl Built {
     }
 }
 
+/// One policy of a split, taking the keys below `until` out of 100.
+#[derive(Debug)]
+pub(crate) struct Arm {
+    pub(crate) built: Built,
+    pub(crate) percent: u32,
+    until: u32,
+}
+
 #[derive(Debug)]
 pub(crate) struct ModelRouting {
-    pub(crate) policy: Built,
+    pub(crate) arms: Vec<Arm>,
     pub(crate) cost: CostModel,
+}
+
+impl ModelRouting {
+    /// The arm a request routes by: its key picks a percentile, so the
+    /// same conversation always lands on the same policy.
+    pub(crate) fn pick(&self, key: u64) -> &Built {
+        let at = (key % 100) as u32;
+        let arm = self.arms.iter().find(|a| at < a.until);
+        &arm.unwrap_or(&self.arms[self.arms.len() - 1]).built
+    }
+
+    /// The arm with the largest share, which explains requests without a
+    /// conversation.
+    pub(crate) fn main(&self) -> &Built {
+        let mut best = &self.arms[0];
+        for arm in &self.arms[1..] {
+            if arm.percent > best.percent {
+                best = arm;
+            }
+        }
+        &best.built
+    }
+
+    pub(crate) fn find(&self, kind: PolicyKind) -> Option<&Built> {
+        self.arms.iter().map(|a| &a.built).find(|b| b.kind == kind)
+    }
 }
 
 #[derive(Debug)]
@@ -60,17 +94,27 @@ impl Live {
             for alias in &model.aliases {
                 names.insert(alias.clone(), model.name.clone());
             }
-            let settings = Settings::new(
-                &config,
-                model,
-                inferrail_policy::mix_seed(seed, model.name.as_str()),
-            );
             let old = previous.and_then(|p| p.models.get(&model.name));
-            let routing = ModelRouting {
-                cost: settings.cost,
-                policy: Built::new(config.policy_for(model), settings, old.map(|o| &o.policy)),
-            };
-            models.insert(model.name.clone(), routing);
+            let split = config.arms_for(model);
+            let mut until = 0;
+            let mut arms = Vec::with_capacity(split.len());
+            for &(kind, percent) in &split {
+                let name = if split.len() == 1 {
+                    model.name.as_str().to_owned()
+                } else {
+                    format!("{}/{kind}", model.name)
+                };
+                let settings =
+                    Settings::new(&config, model, inferrail_policy::mix_seed(seed, &name));
+                until += percent;
+                arms.push(Arm {
+                    built: Built::new(kind, settings, old.and_then(|o| o.find(kind))),
+                    percent,
+                    until,
+                });
+            }
+            let cost = CostModel::from(config.cost_model_for(model));
+            models.insert(model.name.clone(), ModelRouting { arms, cost });
         }
         Self {
             config: Arc::new(config),
@@ -90,20 +134,27 @@ impl Live {
             .ok_or_else(|| GatewayError::unknown_model(model.as_str()))
     }
 
-    pub(crate) fn policy(&self, model: &ModelId) -> Result<&dyn RoutingPolicy, GatewayError> {
-        self.routing(model).map(|r| r.policy.policy.as_ref())
+    /// The policy that routes a request with `key` for `model`.
+    pub(crate) fn policy(&self, model: &ModelId, key: u64) -> Result<&Built, GatewayError> {
+        self.routing(model).map(|r| r.pick(key))
     }
 
     pub(crate) fn cost(&self, model: &ModelId) -> CostModel {
         self.models.get(model).map(|r| r.cost).unwrap_or_default()
     }
 
-    /// Each model's policy, for the policy gauge.
-    pub(crate) fn policies(&self) -> Vec<(ModelId, PolicyKind)> {
+    /// Each model's policies with the percent of traffic each routes, for
+    /// the policy gauges.
+    pub(crate) fn policies(&self) -> Vec<(ModelId, PolicyKind, u32)> {
         self.config
             .models
             .iter()
-            .map(|m| (m.name.clone(), self.models[&m.name].policy.kind))
+            .flat_map(|m| {
+                self.models[&m.name]
+                    .arms
+                    .iter()
+                    .map(|a| (m.name.clone(), a.built.kind, a.percent))
+            })
             .collect()
     }
 }
@@ -119,38 +170,58 @@ mod tests {
         .unwrap()
     }
 
+    fn policy_of(live: &Live, model: &str) -> Arc<dyn RoutingPolicy> {
+        let routing = live.routing(&ModelId::new(model).unwrap()).unwrap();
+        Arc::clone(&routing.main().policy)
+    }
+
     #[test]
     fn unchanged_policies_survive_a_rebuild() {
         let first = Live::build(config(""), 7, None);
-        let a = Arc::clone(
-            &first
-                .routing(&ModelId::new("a").unwrap())
-                .unwrap()
-                .policy
-                .policy,
-        );
+        let a = policy_of(&first, "a");
         let same = Live::build(config(""), 7, Some(&first));
         assert_eq!(same.generation, 2);
-        let kept = &same
-            .routing(&ModelId::new("a").unwrap())
-            .unwrap()
-            .policy
-            .policy;
-        assert!(Arc::ptr_eq(kept, &a));
+        assert!(Arc::ptr_eq(&policy_of(&same, "a"), &a));
         let tuned = Live::build(config("routing:\n  epsilon: 0.5\n"), 7, Some(&same));
-        let fresh = &tuned
-            .routing(&ModelId::new("a").unwrap())
-            .unwrap()
-            .policy
-            .policy;
-        assert!(!Arc::ptr_eq(fresh, &a));
+        assert!(!Arc::ptr_eq(&policy_of(&tuned, "a"), &a));
         let seeded = Live::build(config("routing:\n  seed: 8\n"), 7, Some(&first));
-        let other = &seeded
-            .routing(&ModelId::new("a").unwrap())
-            .unwrap()
-            .policy
-            .policy;
-        assert!(!Arc::ptr_eq(other, &a));
+        assert!(!Arc::ptr_eq(&policy_of(&seeded, "a"), &a));
+    }
+
+    #[test]
+    fn a_split_shares_keys_by_percent_and_keeps_its_arms() {
+        let split = "routing:\n  split: {cost_model: 70, kv_aware: 30}\n";
+        let live = Live::build(config(split), 1, None);
+        let routing = live.routing(&ModelId::new("a").unwrap()).unwrap();
+        let mut counts = std::collections::HashMap::new();
+        for key in 0..10_000u64 {
+            let kind = routing.pick(key.wrapping_mul(0x9e37_79b9_7f4a_7c15)).kind;
+            *counts.entry(kind).or_insert(0) += 1;
+        }
+        assert!(
+            (6_700..7_300).contains(&counts[&PolicyKind::CostModel]),
+            "{counts:?}"
+        );
+        assert_eq!(routing.pick(5).kind, routing.pick(105).kind);
+        assert_eq!(routing.main().kind, PolicyKind::CostModel);
+        let kv = Arc::clone(&routing.find(PolicyKind::KvAware).unwrap().policy);
+        let moved = Live::build(
+            config("routing:\n  split: {cost_model: 50, kv_aware: 50}\n"),
+            1,
+            Some(&live),
+        );
+        let after = moved.routing(&ModelId::new("a").unwrap()).unwrap();
+        assert!(Arc::ptr_eq(
+            &after.find(PolicyKind::KvAware).unwrap().policy,
+            &kv
+        ));
+        assert!(after.find(PolicyKind::P2c).is_none());
+        let single = Live::build(config(""), 1, None);
+        let alone = single.routing(&ModelId::new("a").unwrap()).unwrap();
+        assert_ne!(
+            alone.main().settings.seed,
+            routing.find(PolicyKind::CostModel).unwrap().settings.seed
+        );
     }
 
     #[test]
@@ -165,14 +236,14 @@ mod tests {
         assert_eq!(live.resolve("ay").map(ModelId::as_str), Some("a"));
         assert!(live.resolve("c").is_none());
         let b = ModelId::new("b").unwrap();
-        assert_eq!(live.policy(&b).unwrap().kind(), PolicyKind::P2c);
+        assert_eq!(live.policy(&b, 3).unwrap().policy.kind(), PolicyKind::P2c);
         assert_eq!(live.cost(&b).prefill_token_secs, 0.001);
-        assert!(live.policy(&ModelId::new("c").unwrap()).is_err());
+        assert!(live.policy(&ModelId::new("c").unwrap(), 0).is_err());
         assert_eq!(
             live.policies(),
             [
-                (ModelId::new("a").unwrap(), PolicyKind::P2c),
-                (b, PolicyKind::P2c)
+                (ModelId::new("a").unwrap(), PolicyKind::P2c, 100),
+                (b, PolicyKind::P2c, 100)
             ]
         );
     }

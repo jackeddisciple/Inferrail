@@ -19,7 +19,7 @@ use xxhash_rust::xxh3::xxh3_64_with_seed;
 use crate::body::{Recording, ResponseBody, UpstreamBody};
 use crate::decision_log::{self, Decision};
 use crate::errors::GatewayError;
-use crate::headers::{self, CACHED_TOKENS, PROMPT_TOKENS, REPLICA, SESSION_ID};
+use crate::headers::{self, CACHED_TOKENS, POLICY, PROMPT_TOKENS, REPLICA, SESSION_ID};
 use crate::inspect::{InspectError, inspect};
 use crate::live::Live;
 use crate::metrics::Routed;
@@ -208,7 +208,8 @@ async fn attempt(
     if live.config.logging.log_prompts {
         tracing::debug!(request_id = ?id, body = %String::from_utf8_lossy(&body), "request body");
     }
-    let policy = live.policy(&model)?;
+    let arm = session.unwrap_or_else(|| xxh3_64_with_seed(id.as_bytes(), 3));
+    let policy = live.policy(&model, arm)?.policy.as_ref();
     let endpoint = if parts.uri.path() == "/v1/chat/completions" {
         Endpoint::Chat
     } else {
@@ -371,6 +372,7 @@ async fn attempt(
                 id,
                 deadline,
                 prediction,
+                policy: policy.kind(),
             },
         )
         .instrument(upstream_span)
@@ -643,6 +645,7 @@ struct Upstream<'a> {
     id: &'a HeaderValue,
     deadline: Instant,
     prediction: Option<Prediction>,
+    policy: inferrail_core::config::PolicyKind,
 }
 
 /// One try against one replica. Nothing reaches the client until this
@@ -659,6 +662,7 @@ async fn forward(
         id,
         deadline,
         prediction,
+        policy,
     } = upstream;
     let replica = Arc::clone(lease.replica());
     let request = match upstream_request(&replica, parts, body, id) {
@@ -717,6 +721,8 @@ async fn forward(
     if let Ok(value) = HeaderValue::from_str(replica.id().as_str()) {
         head.headers.insert(REPLICA, value);
     }
+    head.headers
+        .insert(POLICY, HeaderValue::from_static(policy.as_str()));
     if let Some(prediction) = prediction {
         head.headers
             .insert(PROMPT_TOKENS, HeaderValue::from(prediction.prompt_tokens));

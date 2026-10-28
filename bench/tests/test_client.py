@@ -28,6 +28,7 @@ def test_ttft_itl_and_tpot_match_the_server_timing():
     for r in records:
         assert r.ok, r.error
         assert r.replica == "r0"
+        assert r.policy == "cost_model"
         assert len(r.token_times) == 10
         assert (r.prompt_tokens, r.completion_tokens, r.cached_tokens) == (40, 10, 32)
         assert 0.11 <= r.ttft <= 0.3, r.ttft

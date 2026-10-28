@@ -1,10 +1,10 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::time::Duration;
 
 use url::Url;
 
-use super::{Config, ContentFormat, CostModelConfig, ModelConfig, SIM_TOKENIZER};
+use super::{Config, ContentFormat, CostModelConfig, ModelConfig, PolicyKind, SIM_TOKENIZER};
 use crate::ids::ModelId;
 
 pub const MAX_BLOCK_SIZE: u32 = 4096;
@@ -186,6 +186,20 @@ fn check_tokenization(path: &str, model: &ModelConfig, c: &mut Collector) {
 
 /// Every cost is a time, so finite and never negative; prefill must cost
 /// something per token or cached tokens would be worth nothing.
+/// A split's percents must each be above zero and add up to 100.
+fn check_split(path: &str, split: &BTreeMap<PolicyKind, u32>, c: &mut Collector) {
+    if split.is_empty() {
+        return;
+    }
+    if split.values().any(|&p| p == 0 || p > 100) {
+        c.push(path, "each percent must be between 1 and 100");
+    }
+    let total: u32 = split.values().map(|&p| p.min(100)).sum();
+    if total != 100 {
+        c.push(path, format!("percents must add up to 100, not {total}"));
+    }
+}
+
 fn check_cost(path: &str, cost: &CostModelConfig, c: &mut Collector) {
     for (name, value) in [
         ("prefill_token_secs", cost.prefill_token_secs),
@@ -448,9 +462,22 @@ impl Config {
         if !(MIN_HOT_WINDOW..=MAX_HOT_WINDOW).contains(&hot.window) {
             c.push("routing.hot_prefix.window", "must be between 100ms and 1h");
         }
+        check_split("routing.split", &routing.split, c);
         for (i, model) in self.models.iter().enumerate() {
             if let Some(cost) = &model.cost_model {
                 check_cost(&format!("models[{i}].cost_model"), cost, c);
+            }
+            if let Some(split) = &model.split {
+                check_split(&format!("models[{i}].split"), split, c);
+                if model.policy.is_some() {
+                    c.push(
+                        format!("models[{i}].split"),
+                        "set either policy or split, not both",
+                    );
+                }
+                if split.is_empty() {
+                    c.push(format!("models[{i}].split"), "needs at least one policy");
+                }
             }
         }
     }
@@ -543,10 +570,12 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::time::Duration;
 
     use super::super::{
-        Config, ConfigError, ContentFormat, DnsGroupConfig, ReplicaConfig, SIM_TOKENIZER,
+        Config, ConfigError, ContentFormat, DnsGroupConfig, PolicyKind, ReplicaConfig,
+        SIM_TOKENIZER,
     };
     use super::{
         MAX_BLOCK_SIZE, MAX_CAPACITY_BLOCKS, MAX_PREFIX_BLOCKS, MAX_TOKENIZER_QUEUE,
@@ -1013,6 +1042,37 @@ discovery:
             config.health.max_ejection_percent = percent;
             assert!(config.validate().is_ok());
         }
+    }
+
+    #[test]
+    fn splits_must_add_up_and_not_fight_a_policy() {
+        let mut config = base();
+        config.routing.split =
+            BTreeMap::from([(PolicyKind::CostModel, 60), (PolicyKind::KvAware, 30)]);
+        config.models[0].split = Some(BTreeMap::from([
+            (PolicyKind::P2c, 0),
+            (PolicyKind::Random, 100),
+        ]));
+        config.models[0].policy = Some(PolicyKind::P2c);
+        let found = issues(&config);
+        for want in [
+            "routing.split: percents must add up to 100, not 90",
+            "models[0].split: each percent must be between 1 and 100",
+            "models[0].split: set either policy or split, not both",
+        ] {
+            assert!(found.iter().any(|i| i == want), "missing {want}: {found:?}");
+        }
+        let mut empty = base();
+        empty.models[0].split = Some(BTreeMap::new());
+        assert!(
+            issues(&empty)
+                .iter()
+                .any(|i| i.contains("needs at least one policy"))
+        );
+        let mut fine = base();
+        fine.routing.split =
+            BTreeMap::from([(PolicyKind::CostModel, 99), (PolicyKind::KvAware, 1)]);
+        assert!(issues(&fine).is_empty());
     }
 
     #[test]

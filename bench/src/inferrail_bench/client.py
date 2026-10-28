@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 import httpx2
 
 REPLICA_HEADER = "x-inferrail-replica"
+POLICY_HEADER = "x-inferrail-policy"
 PROMPT_HEADER = "x-inferrail-prompt-tokens"
 CACHED_HEADER = "x-inferrail-cached-tokens"
 
@@ -26,6 +27,7 @@ class Record:
     status: int = 0
     error: str | None = None
     replica: str | None = None
+    policy: str | None = None
     prompt_tokens: int = 0
     completion_tokens: int = 0
     cached_tokens: int = 0
@@ -99,6 +101,7 @@ async def stream_chat(
         async with client.stream("POST", path, json=body, headers=headers) as response:
             record.status = response.status_code
             record.replica = response.headers.get(REPLICA_HEADER)
+            record.policy = response.headers.get(POLICY_HEADER)
             record.predicted_prompt_tokens = _count(response.headers.get(PROMPT_HEADER))
             record.predicted_cached_tokens = _count(response.headers.get(CACHED_HEADER))
             if response.status_code != 200:

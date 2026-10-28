@@ -108,6 +108,25 @@ impl Config {
         model.policy.unwrap_or(self.routing.default_policy)
     }
 
+    /// The policies that share the model's traffic and the percent each
+    /// takes: the model's own split, else its own policy, else the routing
+    /// split, else the default policy.
+    pub fn arms_for(&self, model: &ModelConfig) -> Vec<(PolicyKind, u32)> {
+        let split = match (&model.split, model.policy) {
+            (Some(split), _) => split,
+            (None, Some(policy)) => return vec![(policy, 100)],
+            (None, None) => &self.routing.split,
+        };
+        if split.is_empty() {
+            vec![(self.routing.default_policy, 100)]
+        } else {
+            split
+                .iter()
+                .map(|(&kind, &percent)| (kind, percent))
+                .collect()
+        }
+    }
+
     pub fn cost_model_for(&self, model: &ModelConfig) -> CostModelConfig {
         model.cost_model.unwrap_or(self.routing.cost_model)
     }
@@ -209,6 +228,10 @@ pub struct ModelConfig {
     /// This model's measured prefill costs, replacing `routing.cost_model`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_model: Option<CostModelConfig>,
+    /// Percent of this model's traffic each policy routes, in place of
+    /// `policy` and `routing.split`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub split: Option<BTreeMap<PolicyKind, u32>>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -271,7 +294,7 @@ fn default_dns_refresh() -> Duration {
     Duration::from_secs(2)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PolicyKind {
     RoundRobin,
@@ -339,6 +362,11 @@ pub struct RoutingConfig {
     /// Keeps a conversation on its last replica, named by `x-session-id` or
     /// the request's `user` field, while that replica is not overloaded.
     pub session_affinity: bool,
+    /// An A/B split: percent of every model's traffic each policy routes,
+    /// summing to 100, for models that name no policy or split of their
+    /// own. A conversation stays with one policy.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub split: BTreeMap<PolicyKind, u32>,
 }
 
 impl Default for RoutingConfig {
@@ -354,6 +382,7 @@ impl Default for RoutingConfig {
             cost_model: CostModelConfig::default(),
             hot_prefix: HotPrefixConfig::default(),
             session_affinity: false,
+            split: BTreeMap::new(),
         }
     }
 }
@@ -865,6 +894,30 @@ replicas:
         assert_eq!(config.policy_for(model), PolicyKind::RoundRobin);
         assert_eq!(config.replicas_serving(&model.name).count(), 1);
         assert!(config.model("other").is_none());
+    }
+
+    #[test]
+    fn splits_follow_model_then_routing_then_the_default() {
+        let config = Config::from_yaml_str(
+            "models:\n  - name: a\n  - name: b\n    policy: p2c\n  - name: c\n    split: {random: 30, kv_aware: 70}\nreplicas:\n  - {id: r, url: 'http://h:1', models: [a, b, c]}\nrouting:\n  split: {cost_model: 90, least_request: 10}\n",
+        )
+        .unwrap();
+        let arms: Vec<_> = config.models.iter().map(|m| config.arms_for(m)).collect();
+        assert_eq!(
+            arms,
+            [
+                vec![(PolicyKind::LeastRequest, 10), (PolicyKind::CostModel, 90)],
+                vec![(PolicyKind::P2c, 100)],
+                vec![(PolicyKind::Random, 30), (PolicyKind::KvAware, 70)],
+            ]
+        );
+        let plain = Config::from_yaml_str(MINIMAL).unwrap();
+        assert_eq!(
+            plain.arms_for(&plain.models[0]),
+            [(PolicyKind::CostModel, 100)]
+        );
+        let again = Config::from_yaml_str(&config.to_yaml_string().unwrap()).unwrap();
+        assert_eq!(again, config);
     }
 
     #[test]

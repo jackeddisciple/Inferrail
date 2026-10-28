@@ -71,6 +71,7 @@ fn fixed(model: &ModelConfig) -> ModelConfig {
         aliases: Vec::new(),
         policy: None,
         cost_model: None,
+        split: None,
         ..model.clone()
     }
 }

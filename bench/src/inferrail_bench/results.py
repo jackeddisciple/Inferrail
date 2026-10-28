@@ -64,6 +64,7 @@ def columns(records: Sequence[Record]) -> dict:
         "e2e": [_clean(r.e2e) for r in records],
         "status": [r.status for r in records],
         "replica": [r.replica for r in records],
+        "policy": [r.policy for r in records],
         "prompt_tokens": [r.prompt_tokens for r in records],
         "cached_tokens": [r.cached_tokens for r in records],
         "completion_tokens": [r.completion_tokens for r in records],

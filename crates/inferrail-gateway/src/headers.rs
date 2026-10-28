@@ -13,6 +13,8 @@ const HOP_BY_HOP: [HeaderName; 7] = [
 ];
 
 pub const REPLICA: HeaderName = HeaderName::from_static("x-inferrail-replica");
+/// The policy that routed the request, which an A/B split makes worth knowing.
+pub const POLICY: HeaderName = HeaderName::from_static("x-inferrail-policy");
 /// The prompt's length in tokens, when the gateway tokenized it.
 pub const PROMPT_TOKENS: HeaderName = HeaderName::from_static("x-inferrail-prompt-tokens");
 /// Prompt tokens the KV index predicted the chosen replica had cached; absent

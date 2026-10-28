@@ -75,7 +75,8 @@ def sse(
     async def handler(writer: asyncio.StreamWriter) -> None:
         writer.write(
             b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n"
-            + f"x-inferrail-replica: {replica}\r\n{headers}".encode()
+            + f"x-inferrail-replica: {replica}\r\n".encode()
+            + f"x-inferrail-policy: cost_model\r\n{headers}".encode()
             + b"transfer-encoding: chunked\r\n\r\n"
         )
         await writer.drain()

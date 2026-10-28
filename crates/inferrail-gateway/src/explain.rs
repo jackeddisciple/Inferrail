@@ -7,6 +7,7 @@ use axum::body::Bytes;
 use axum::extract::Request;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
+use inferrail_core::config::PolicyKind;
 use inferrail_core::ids::{ModelId, ReplicaId};
 use inferrail_policy::{Estimate, Exclusion, Guarded, HotPrefix, Steer, Term};
 use inferrail_tokenize::Endpoint;
@@ -66,7 +67,10 @@ pub(crate) async fn handle(shared: Arc<Shared>, endpoint: Endpoint, request: Req
         read_body(&parts.headers, body, server.max_body_bytes),
     );
     let explained = match read.await {
-        Ok(Ok(body)) => report(&shared, endpoint, &parts.headers, body).await,
+        Ok(Ok(body)) => match asked_policy(parts.uri.query()) {
+            Ok(asked) => report(&shared, endpoint, &parts.headers, body, asked).await,
+            Err(err) => Err(err),
+        },
         Ok(Err(err)) => Err(err),
         Err(_) => Err(GatewayError::slow_body()),
     };
@@ -88,15 +92,41 @@ pub(crate) async fn handle(shared: Arc<Shared>, endpoint: Endpoint, request: Req
         .into_response()
 }
 
+/// The policy named by `?policy=`, to explain one arm of a split or a
+/// shadow policy rather than the one the request would get.
+fn asked_policy(query: Option<&str>) -> Result<Option<PolicyKind>, GatewayError> {
+    let Some(name) = query
+        .into_iter()
+        .flat_map(|q| q.split('&'))
+        .find_map(|pair| pair.strip_prefix("policy="))
+    else {
+        return Ok(None);
+    };
+    PolicyKind::ALL
+        .into_iter()
+        .find(|p| p.as_str() == name)
+        .map(Some)
+        .ok_or_else(|| GatewayError::bad_param(format!("unknown policy {name:?}"), "policy"))
+}
+
 async fn report(
     shared: &Shared,
     endpoint: Endpoint,
     headers: &HeaderMap,
     body: Bytes,
+    asked: Option<PolicyKind>,
 ) -> Result<Report, GatewayError> {
     let live = shared.live();
     let Resolved { model, body, user } = resolve_model(shared, &live, body)?;
-    let policy = live.policy(&model)?;
+    let session = session_key(headers, user.as_deref());
+    let routing = live.routing(&model)?;
+    let built = match asked {
+        Some(kind) => routing.find(kind).ok_or_else(|| {
+            GatewayError::bad_param(format!("`{model}` is not routed by {kind}"), "policy")
+        })?,
+        None => session.map_or_else(|| routing.main(), |key| routing.pick(key)),
+    };
+    let policy = built.policy.as_ref();
     let (prepared, _) = shared.prompts.prepare(&model, endpoint, &body).await;
     let (prompt, skipped) = match prepared {
         Ok(prompt) => (Some(prompt), None),
@@ -112,7 +142,7 @@ async fn report(
         tokens,
         prompt: prompt.as_ref(),
         index: shared.index.as_deref(),
-        session: session_key(headers, user.as_deref()),
+        session,
         cost: live.cost(&model),
         max_age: shared.config.load.max_age,
         explain: true,
