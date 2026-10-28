@@ -44,5 +44,6 @@ pub(crate) fn router(shared: Arc<Shared>) -> Router {
         .route("/admin/reload", post(control::reload))
         .route("/admin/index", get(control::index))
         .route("/admin/replicas", get(control::replicas))
+        .route("/admin/shadow", get(control::shadow))
         .with_state(shared)
 }

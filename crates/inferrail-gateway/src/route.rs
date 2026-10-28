@@ -7,6 +7,7 @@ use inferrail_index::{KvIndex, Slot};
 use inferrail_policy::{
     Candidate, Choice, CostModel, Estimate, Explanation, Hits, RouteContext, RoutingPolicy,
 };
+use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
 
 use crate::errors::GatewayError;
@@ -27,6 +28,44 @@ pub(crate) struct Selected {
     /// The cost model's estimate on the chosen replica, from what it is
     /// predicted to hold. Its prefill is what the replica's queue grew by.
     pub(crate) estimate: Estimate,
+    /// The candidates exactly as the policy saw them when it chose, when
+    /// asked for, so a shadow policy can be shown the same.
+    pub(crate) seen: Vec<Observed>,
+}
+
+/// A candidate as a policy saw it, owned so it can outlive the decision.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct Observed {
+    pub(crate) replica: ReplicaId,
+    pub(crate) in_flight: u32,
+    pub(crate) cached_tokens: u32,
+    pub(crate) queued_secs: f64,
+    pub(crate) running: u32,
+    pub(crate) kv_usage: Option<f64>,
+}
+
+impl Observed {
+    fn of(candidate: &Candidate<'_>) -> Self {
+        Self {
+            replica: candidate.id.clone(),
+            in_flight: candidate.in_flight,
+            cached_tokens: candidate.cached_tokens,
+            queued_secs: candidate.queued_secs,
+            running: candidate.running,
+            kv_usage: candidate.kv_usage,
+        }
+    }
+
+    pub(crate) fn view(&self) -> Candidate<'_> {
+        Candidate {
+            id: &self.replica,
+            in_flight: self.in_flight,
+            cached_tokens: self.cached_tokens,
+            queued_secs: self.queued_secs,
+            running: self.running,
+            kv_usage: self.kv_usage,
+        }
+    }
 }
 
 /// What a routing decision knows about the request.
@@ -44,6 +83,8 @@ pub(crate) struct Request<'a> {
     pub(crate) max_age: Duration,
     /// Whether to return every offered replica's prediction.
     pub(crate) explain: bool,
+    /// Whether to return the candidates the policy chose among.
+    pub(crate) capture: bool,
 }
 
 impl Request<'_> {
@@ -164,6 +205,11 @@ pub(crate) fn select(
                 now,
                 Duration::try_from_secs_f64(work).unwrap_or(Duration::ZERO),
             );
+            let seen = if request.capture {
+                candidates.iter().map(Observed::of).collect()
+            } else {
+                Vec::new()
+            };
             return Ok(Selected {
                 lease,
                 offered,
@@ -171,6 +217,7 @@ pub(crate) fn select(
                 predictions,
                 choice,
                 estimate,
+                seen,
             });
         }
         eligible.remove(i);
@@ -277,6 +324,7 @@ mod tests {
             cost: CostModel::default(),
             max_age: Duration::from_millis(250),
             explain: false,
+            capture: false,
         }
     }
 

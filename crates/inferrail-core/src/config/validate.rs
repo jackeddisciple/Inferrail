@@ -186,6 +186,13 @@ fn check_tokenization(path: &str, model: &ModelConfig, c: &mut Collector) {
 
 /// Every cost is a time, so finite and never negative; prefill must cost
 /// something per token or cached tokens would be worth nothing.
+fn check_shadow(path: &str, shadow: &[PolicyKind], c: &mut Collector) {
+    let distinct: HashSet<PolicyKind> = shadow.iter().copied().collect();
+    if distinct.len() != shadow.len() {
+        c.push(path, "names a policy twice");
+    }
+}
+
 /// A split's percents must each be above zero and add up to 100.
 fn check_split(path: &str, split: &BTreeMap<PolicyKind, u32>, c: &mut Collector) {
     if split.is_empty() {
@@ -463,7 +470,11 @@ impl Config {
             c.push("routing.hot_prefix.window", "must be between 100ms and 1h");
         }
         check_split("routing.split", &routing.split, c);
+        check_shadow("routing.shadow", &routing.shadow, c);
         for (i, model) in self.models.iter().enumerate() {
+            if let Some(shadow) = &model.shadow {
+                check_shadow(&format!("models[{i}].shadow"), shadow, c);
+            }
             if let Some(cost) = &model.cost_model {
                 check_cost(&format!("models[{i}].cost_model"), cost, c);
             }
@@ -1072,7 +1083,15 @@ discovery:
         let mut fine = base();
         fine.routing.split =
             BTreeMap::from([(PolicyKind::CostModel, 99), (PolicyKind::KvAware, 1)]);
+        fine.routing.shadow = vec![PolicyKind::KvAware, PolicyKind::CostModel];
         assert!(issues(&fine).is_empty());
+        let mut twice = base();
+        twice.models[0].shadow = Some(vec![PolicyKind::P2c, PolicyKind::P2c]);
+        assert!(
+            issues(&twice)
+                .iter()
+                .any(|i| i == "models[0].shadow: names a policy twice")
+        );
     }
 
     #[test]

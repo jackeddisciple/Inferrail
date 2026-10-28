@@ -35,10 +35,12 @@ mod proxy;
 pub mod request_id;
 mod route;
 mod server;
+mod shadow;
 pub mod telemetry;
 mod upstream;
 
 pub use body::ResponseBody;
+pub use shadow::{ReplayError, ReplayReport, replay as replay_shadow};
 
 #[derive(Debug, thiserror::Error)]
 pub enum BuildError {
@@ -53,6 +55,8 @@ pub enum BuildError {
     },
     #[error("cannot start the tokenizer workers: {0}")]
     Workers(std::io::Error),
+    #[error("cannot open the shadow log: {0}")]
+    ShadowLog(std::io::Error),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -104,6 +108,7 @@ pub(crate) struct Shared {
     decisions: Option<decision_log::DecisionLog>,
     prompts: prompts::Prompts,
     index: Option<Arc<KvIndex>>,
+    shadow: shadow::Shadow,
 }
 
 impl Shared {
@@ -235,7 +240,14 @@ impl Gateway {
             }
             _ => None,
         };
+        let shadow = shadow::Shadow::start(
+            config.observability.shadow_log.as_deref(),
+            seed,
+            Arc::clone(&metrics),
+        )
+        .map_err(BuildError::ShadowLog)?;
         let shared = Shared {
+            shadow,
             decisions,
             registry,
             client: upstream::client(&config.upstream),
@@ -327,7 +339,9 @@ impl Gateway {
         let generation = live.generation;
         shared.metrics.set_policies(live.policies());
         shared.metrics.set_generation(generation);
-        shared.live.store(Arc::new(live));
+        let live = Arc::new(live);
+        shared.live.store(Arc::clone(&live));
+        shared.shadow.reloaded(live);
         tracing::info!(generation, changed = ?changed, "config reloaded");
         Ok(Reloaded {
             generation,

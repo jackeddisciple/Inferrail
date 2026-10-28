@@ -23,6 +23,10 @@ struct Args {
     /// Validate the config and exit.
     #[arg(long)]
     check: bool,
+    /// Replay a shadow log offline, check every shadow pick against it and
+    /// exit, failing if any differs.
+    #[arg(long, value_name = "LOG")]
+    replay_shadow: Option<PathBuf>,
 }
 
 async fn shutdown_signal() {
@@ -71,6 +75,19 @@ async fn reload_on_hangup(gateway: Gateway, path: PathBuf) {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+    if let Some(log) = &args.replay_shadow {
+        let file =
+            std::fs::File::open(log).with_context(|| format!("cannot open {}", log.display()))?;
+        let report = inferrail_gateway::replay_shadow(std::io::BufReader::new(file))?;
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        if !report.matched() {
+            anyhow::bail!(
+                "{} shadow picks differ from the log",
+                report.mismatches.len()
+            );
+        }
+        return Ok(());
+    }
     let config = Config::load(&args.config)
         .with_context(|| format!("cannot load {}", args.config.display()))?;
     let filter = args.log.as_deref().unwrap_or(&config.logging.level);
@@ -130,5 +147,7 @@ mod tests {
         assert_eq!(args.config, PathBuf::from("x.yaml"));
         assert!(args.check);
         assert!(args.log.is_none());
+        let replay = Args::parse_from(["inferrail-gateway", "--replay-shadow", "s.jsonl"]);
+        assert_eq!(replay.replay_shadow, Some(PathBuf::from("s.jsonl")));
     }
 }

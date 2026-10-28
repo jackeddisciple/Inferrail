@@ -108,6 +108,11 @@ impl Config {
         model.policy.unwrap_or(self.routing.default_policy)
     }
 
+    /// The policies run in shadow for the model.
+    pub fn shadows_for<'a>(&'a self, model: &'a ModelConfig) -> &'a [PolicyKind] {
+        model.shadow.as_deref().unwrap_or(&self.routing.shadow)
+    }
+
     /// The policies that share the model's traffic and the percent each
     /// takes: the model's own split, else its own policy, else the routing
     /// split, else the default policy.
@@ -232,6 +237,9 @@ pub struct ModelConfig {
     /// `policy` and `routing.split`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub split: Option<BTreeMap<PolicyKind, u32>>,
+    /// Policies run in shadow for this model, in place of `routing.shadow`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow: Option<Vec<PolicyKind>>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -367,6 +375,11 @@ pub struct RoutingConfig {
     /// own. A conversation stays with one policy.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub split: BTreeMap<PolicyKind, u32>,
+    /// Policies that see every routed request and choose a replica in
+    /// shadow, so their picks and the cost model's estimate of what they
+    /// would gain are measured before any of them routes real traffic.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub shadow: Vec<PolicyKind>,
 }
 
 impl Default for RoutingConfig {
@@ -383,6 +396,7 @@ impl Default for RoutingConfig {
             hot_prefix: HotPrefixConfig::default(),
             session_affinity: false,
             split: BTreeMap::new(),
+            shadow: Vec::new(),
         }
     }
 }
@@ -569,6 +583,10 @@ pub struct ObservabilityConfig {
     pub service_name: String,
     pub trace_sample_ratio: f64,
     pub decision_log: DecisionLogConfig,
+    /// Where shadow decisions are written, one JSON object per line, for
+    /// replay with the gateway's shadow replay flag.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shadow_log: Option<PathBuf>,
 }
 
 impl Default for ObservabilityConfig {
@@ -578,6 +596,7 @@ impl Default for ObservabilityConfig {
             service_name: "inferrail-gateway".to_owned(),
             trace_sample_ratio: 1.0,
             decision_log: DecisionLogConfig::default(),
+            shadow_log: None,
         }
     }
 }

@@ -89,6 +89,13 @@ routing:
     blocks: 4
     utilization: 0.5
     window: 10s
+  # An A/B split: percent of each model's traffic every policy routes, adding
+  # up to 100. A conversation stays with one policy; a model's own policy or
+  # split wins over this one.
+  # split: {cost_model: 90, kv_aware: 10}
+  # Policies that choose a replica for every request in shadow, never
+  # routing one; their picks and estimated gains show on /admin/shadow.
+  # shadow: [kv_aware, least_request]
 
 health:
   interval: 1s
@@ -141,3 +148,6 @@ observability:
   decision_log:
     # path: /var/log/inferrail/decisions.jsonl
     sample_rate: 0.0
+  # Every shadow decision with what the shadows saw, for an offline replay
+  # with inferrail-gateway --replay-shadow.
+  # shadow_log: /var/log/inferrail/shadow.jsonl

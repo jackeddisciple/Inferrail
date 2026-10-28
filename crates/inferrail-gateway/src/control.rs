@@ -281,6 +281,45 @@ pub(crate) async fn replicas(State(shared): State<Arc<Shared>>) -> Response {
     reply(StatusCode::OK, &json!({"replicas": rows}))
 }
 
+#[derive(Debug, Serialize)]
+struct ShadowRow {
+    model: ModelId,
+    policy: &'static str,
+    decisions: u64,
+    agreement: f64,
+    /// Decisions the cost model priced faster under the shadow pick.
+    faster_share: f64,
+    slower_share: f64,
+    mean_active_ttft_ms: f64,
+    mean_shadow_ttft_ms: f64,
+    /// The active estimate minus the shadow's, on average; positive when
+    /// the shadow is predicted to be faster.
+    mean_gain_ms: f64,
+}
+
+pub(crate) async fn shadow(State(shared): State<Arc<Shared>>) -> Response {
+    let rows: Vec<ShadowRow> = shared
+        .shadow
+        .tallies()
+        .into_iter()
+        .map(|((model, policy), t)| {
+            let n = t.decisions.max(1) as f64;
+            ShadowRow {
+                model,
+                policy: policy.as_str(),
+                decisions: t.decisions,
+                agreement: t.agreed as f64 / n,
+                faster_share: t.faster as f64 / n,
+                slower_share: t.slower as f64 / n,
+                mean_active_ttft_ms: t.active_secs / n * 1e3,
+                mean_shadow_ttft_ms: t.shadow_secs / n * 1e3,
+                mean_gain_ms: (t.active_secs - t.shadow_secs) / n * 1e3,
+            }
+        })
+        .collect();
+    reply(StatusCode::OK, &json!({"policies": rows}))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

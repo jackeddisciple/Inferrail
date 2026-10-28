@@ -72,6 +72,7 @@ fn fixed(model: &ModelConfig) -> ModelConfig {
         policy: None,
         cost_model: None,
         split: None,
+        shadow: None,
         ..model.clone()
     }
 }

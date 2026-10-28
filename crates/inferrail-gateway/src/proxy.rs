@@ -26,7 +26,7 @@ use crate::metrics::Routed;
 use crate::prompts::{self, Prompt, Skip};
 use crate::request_id::REQUEST_ID;
 use crate::telemetry::{self, SPAN_TARGET};
-use crate::{Shared, models, route};
+use crate::{Shared, models, route, shadow};
 
 pub(crate) async fn handle(
     shared: Arc<Shared>,
@@ -209,7 +209,8 @@ async fn attempt(
         tracing::debug!(request_id = ?id, body = %String::from_utf8_lossy(&body), "request body");
     }
     let arm = session.unwrap_or_else(|| xxh3_64_with_seed(id.as_bytes(), 3));
-    let policy = live.policy(&model, arm)?.policy.as_ref();
+    let routing = live.routing(&model)?;
+    let policy = routing.pick(arm).policy.as_ref();
     let endpoint = if parts.uri.path() == "/v1/chat/completions" {
         Endpoint::Chat
     } else {
@@ -272,6 +273,7 @@ async fn attempt(
             cost: live.cost(&model),
             max_age: shared.config.load.max_age,
             explain: sampled.is_some(),
+            capture: attempt == 0 && routing.has_shadows(),
         };
         let started = std::time::Instant::now();
         let selected =
@@ -281,6 +283,24 @@ async fn attempt(
             Ok(selected) => selected,
             Err(err) => return last.unwrap_or(Err(err)),
         };
+        if !selected.seen.is_empty() {
+            shared.shadow.offer(shadow::Job {
+                ts_ms: decision_log::unix_ms(),
+                request_id: id.to_str().unwrap_or_default().to_owned(),
+                live: Arc::clone(&live),
+                model: model.clone(),
+                active: policy.kind(),
+                chosen: selected.choice.index,
+                now,
+                prompt_tokens: tokens,
+                block_size: prompt
+                    .as_ref()
+                    .map_or(0, |p| u32::try_from(p.block_size).unwrap_or(u32::MAX)),
+                blocks: prompt.as_ref().map_or_else(Vec::new, |p| p.hashes.clone()),
+                session,
+                seen: selected.seen,
+            });
+        }
         let (lease, candidates) = (selected.lease, selected.offered);
         let prediction = prompt.as_ref().map(|p| Prediction {
             prompt_tokens: p.tokens,

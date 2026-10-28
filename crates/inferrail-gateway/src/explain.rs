@@ -146,6 +146,7 @@ async fn report(
         cost: live.cost(&model),
         max_age: shared.config.load.max_age,
         explain: true,
+        capture: false,
     };
     let now = shared.clock.now();
     let fleet = shared.registry.load();

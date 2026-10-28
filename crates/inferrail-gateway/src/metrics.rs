@@ -149,6 +149,22 @@ struct ResultLabels {
     result: Text,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, EncodeLabelSet)]
+struct ShadowLabels {
+    model: Text,
+    policy: Text,
+    agreed: Text,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, EncodeLabelSet)]
+struct ShadowEstimateLabels {
+    model: Text,
+    policy: Text,
+    pick: Text,
+}
+
+type Seconds = Counter<f64, std::sync::atomic::AtomicU64>;
+
 /// Each model's policies and the percent of its traffic each routes, as the
 /// policy gauges report them; replaced on reload.
 pub type Policies = Arc<ArcSwap<Vec<(ModelId, PolicyKind, u32)>>>;
@@ -210,6 +226,9 @@ pub struct Metrics {
     steered: Family<SteerLabels, Counter>,
     reloads: Family<ResultLabels, Counter>,
     generation: gauge::Gauge,
+    shadow_decisions: Family<ShadowLabels, Counter>,
+    shadow_estimates: Family<ShadowEstimateLabels, Seconds>,
+    shadow_dropped: Counter,
     policies: Policies,
     series: Mutex<HashMap<ReplicaId, Vec<Series>>>,
 }
@@ -245,6 +264,9 @@ impl Metrics {
             steered: Family::default(),
             reloads: Family::default(),
             generation: gauge::Gauge::default(),
+            shadow_decisions: Family::default(),
+            shadow_estimates: Family::default(),
+            shadow_dropped: Counter::default(),
             policies: Arc::clone(&fleet.policies),
             series: Mutex::default(),
         };
@@ -378,6 +400,21 @@ impl Metrics {
             "The config generation in effect, 1 at startup and one more for every reload that changed something.",
             this.generation.clone(),
         );
+        registry.register(
+            "inferrail_shadow_decisions",
+            "Requests a shadow policy chose a replica for, by whether it agreed with the policy that routed them.",
+            this.shadow_decisions.clone(),
+        );
+        registry.register(
+            "inferrail_shadow_estimated_ttft_seconds",
+            "The cost model's estimated time to first token summed over shadowed requests, for the routing policy's pick (pick=active) and the shadow's (pick=shadow).",
+            this.shadow_estimates.clone(),
+        );
+        registry.register(
+            "inferrail_shadow_dropped",
+            "Requests no shadow policy saw because the shadow worker was behind.",
+            this.shadow_dropped.clone(),
+        );
         this.series_for(&this.policies.load());
         registry.register_collector(Box::new(fleet));
         Self { registry, ..this }
@@ -418,6 +455,36 @@ impl Metrics {
     pub(crate) fn set_generation(&self, generation: u64) {
         self.generation
             .set(i64::try_from(generation).unwrap_or(i64::MAX));
+    }
+
+    pub(crate) fn shadowed(
+        &self,
+        model: &ModelId,
+        policy: PolicyKind,
+        agreed: bool,
+        active_secs: f64,
+        shadow_secs: f64,
+    ) {
+        self.shadow_decisions
+            .get_or_create(&ShadowLabels {
+                model: Text::Model(model.clone()),
+                policy: Text::Fixed(policy.as_str()),
+                agreed: Text::Fixed(if agreed { "true" } else { "false" }),
+            })
+            .inc();
+        for (pick, secs) in [("active", active_secs), ("shadow", shadow_secs)] {
+            self.shadow_estimates
+                .get_or_create(&ShadowEstimateLabels {
+                    model: Text::Model(model.clone()),
+                    policy: Text::Fixed(policy.as_str()),
+                    pick: Text::Fixed(pick),
+                })
+                .inc_by(secs);
+        }
+    }
+
+    pub(crate) fn shadow_dropped(&self) {
+        self.shadow_dropped.inc();
     }
 
     pub(crate) fn reloaded(&self, result: &'static str) {

@@ -44,6 +44,8 @@ pub(crate) struct Arm {
 #[derive(Debug)]
 pub(crate) struct ModelRouting {
     pub(crate) arms: Vec<Arm>,
+    /// Policies that only choose in shadow, never routing a request.
+    pub(crate) shadows: Vec<Built>,
     pub(crate) cost: CostModel,
 }
 
@@ -70,6 +72,14 @@ impl ModelRouting {
 
     pub(crate) fn find(&self, kind: PolicyKind) -> Option<&Built> {
         self.arms.iter().map(|a| &a.built).find(|b| b.kind == kind)
+    }
+
+    pub(crate) fn shadow(&self, kind: PolicyKind) -> Option<&Built> {
+        self.shadows.iter().find(|b| b.kind == kind)
+    }
+
+    pub(crate) fn has_shadows(&self) -> bool {
+        !self.shadows.is_empty()
     }
 }
 
@@ -113,8 +123,25 @@ impl Live {
                     until,
                 });
             }
+            let shadows = config
+                .shadows_for(model)
+                .iter()
+                .map(|&kind| {
+                    let name = format!("{}/shadow/{kind}", model.name);
+                    let settings =
+                        Settings::new(&config, model, inferrail_policy::mix_seed(seed, &name));
+                    Built::new(kind, settings, old.and_then(|o| o.shadow(kind)))
+                })
+                .collect();
             let cost = CostModel::from(config.cost_model_for(model));
-            models.insert(model.name.clone(), ModelRouting { arms, cost });
+            models.insert(
+                model.name.clone(),
+                ModelRouting {
+                    arms,
+                    shadows,
+                    cost,
+                },
+            );
         }
         Self {
             config: Arc::new(config),
@@ -132,11 +159,6 @@ impl Live {
         self.models
             .get(model)
             .ok_or_else(|| GatewayError::unknown_model(model.as_str()))
-    }
-
-    /// The policy that routes a request with `key` for `model`.
-    pub(crate) fn policy(&self, model: &ModelId, key: u64) -> Result<&Built, GatewayError> {
-        self.routing(model).map(|r| r.pick(key))
     }
 
     pub(crate) fn cost(&self, model: &ModelId) -> CostModel {
@@ -236,9 +258,12 @@ mod tests {
         assert_eq!(live.resolve("ay").map(ModelId::as_str), Some("a"));
         assert!(live.resolve("c").is_none());
         let b = ModelId::new("b").unwrap();
-        assert_eq!(live.policy(&b, 3).unwrap().policy.kind(), PolicyKind::P2c);
+        assert_eq!(
+            live.routing(&b).unwrap().pick(3).policy.kind(),
+            PolicyKind::P2c
+        );
         assert_eq!(live.cost(&b).prefill_token_secs, 0.001);
-        assert!(live.policy(&ModelId::new("c").unwrap(), 0).is_err());
+        assert!(live.routing(&ModelId::new("c").unwrap()).is_err());
         assert_eq!(
             live.policies(),
             [
