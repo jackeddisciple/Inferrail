@@ -21,6 +21,7 @@ use xxhash_rust::xxh3::xxh3_64;
 
 mod admin;
 mod body;
+mod control;
 mod decision_log;
 pub mod errors;
 mod explain;
@@ -90,6 +91,7 @@ pub(crate) struct Shared {
     live: ArcSwap<live::Live>,
     seed: u64,
     reloading: Mutex<()>,
+    source: Mutex<Option<PathBuf>>,
     registry: Arc<Registry>,
     client: upstream::Client,
     ids: request_id::RequestIds,
@@ -107,6 +109,13 @@ pub(crate) struct Shared {
 impl Shared {
     pub(crate) fn live(&self) -> Arc<live::Live> {
         self.live.load_full()
+    }
+
+    pub(crate) fn source(&self) -> Option<PathBuf> {
+        self.source
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 }
 
@@ -241,6 +250,7 @@ impl Gateway {
             live: ArcSwap::from_pointee(live),
             seed,
             reloading: Mutex::new(()),
+            source: Mutex::new(None),
             prompts,
             index,
             config,
@@ -248,6 +258,19 @@ impl Gateway {
         Ok(Self {
             shared: Arc::new(shared),
         })
+    }
+
+    pub(crate) fn from_shared(shared: Arc<Shared>) -> Self {
+        Self { shared }
+    }
+
+    /// The file `/admin/reload` rereads.
+    pub fn set_config_path(&self, path: PathBuf) {
+        *self
+            .shared
+            .source
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(path);
     }
 
     /// The config in effect: the startup one with every reload since.

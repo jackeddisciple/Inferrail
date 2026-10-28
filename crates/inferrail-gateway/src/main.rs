@@ -104,6 +104,7 @@ async fn main() -> anyhow::Result<()> {
         replicas = gateway.registry().load().replicas().len(),
         "inferrail-gateway listening"
     );
+    gateway.set_config_path(args.config.clone());
     let interval = gateway.config().server.reload_interval;
     if !interval.is_zero() {
         tokio::spawn(gateway.clone().watch_config(args.config.clone(), interval));

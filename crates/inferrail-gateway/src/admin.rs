@@ -1,5 +1,5 @@
-//! The admin listener: Prometheus metrics, a liveness check and routing
-//! explanations, kept off the port clients use.
+//! The admin listener: Prometheus metrics, a liveness check, routing
+//! explanations and the admin API, kept off the port clients use.
 
 use std::sync::Arc;
 
@@ -10,7 +10,7 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use inferrail_tokenize::Endpoint;
 
-use crate::{Shared, explain};
+use crate::{Shared, control, explain};
 
 pub(crate) const CONTENT_TYPE: &str = "application/openmetrics-text; version=1.0.0; charset=utf-8";
 
@@ -40,4 +40,9 @@ pub(crate) fn router(shared: Arc<Shared>) -> Router {
             "/admin/explain/v1/completions",
             explains(Endpoint::Completion),
         )
+        .route("/admin/config", get(control::config).patch(control::patch))
+        .route("/admin/reload", post(control::reload))
+        .route("/admin/index", get(control::index))
+        .route("/admin/replicas", get(control::replicas))
+        .with_state(shared)
 }
